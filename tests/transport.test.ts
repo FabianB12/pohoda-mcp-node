@@ -1,9 +1,9 @@
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
-import { existsSync } from "node:fs";
+import { createWriteStream, existsSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { CliXmlTransport, defaultProcessRunner } from "../src/pohoda/transport.js";
+import { CliXmlTransport, defaultProcessRunner, waitForStreamFinished } from "../src/pohoda/transport.js";
 
 const retainedDirs: string[] = [];
 
@@ -254,6 +254,20 @@ describe("CliXmlTransport", () => {
     expect(await readFile(responseXml, "utf8")).toContain('state="ok"');
     expect(await readFile(stdoutPath, "utf8")).toContain("stdout-ready");
     expect(await readFile(stderrPath, "utf8")).toContain("stderr-ready");
+  });
+
+  it("does not hang when stream completion is observed after the writable already ended", async () => {
+    const workDir = await mkdtemp(join(tmpdir(), "pohoda-stream-"));
+    retainedDirs.push(workDir);
+    const path = join(workDir, "already-ended.log");
+    const stream = createWriteStream(path);
+    stream.end("");
+    await new Promise<void>((resolve, reject) => {
+      stream.once("close", resolve);
+      stream.once("error", reject);
+    });
+
+    await expect(waitForStreamFinished(stream)).resolves.toBeUndefined();
   });
 });
 

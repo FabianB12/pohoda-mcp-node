@@ -318,8 +318,8 @@ export async function defaultProcessRunner(context: ProcessRunnerContext): Promi
   }
   const stdout = createWriteStream(context.stdoutPath);
   const stderr = createWriteStream(context.stderrPath);
-  const stdoutDone = finished(stdout);
-  const stderrDone = finished(stderr);
+  const stdoutDone = waitForStreamFinished(stdout);
+  const stderrDone = waitForStreamFinished(stderr);
   const subprocess = spawn(context.command[0]!, context.command.slice(1), {
     cwd: context.cwd,
     stdio: ["ignore", "pipe", "pipe"],
@@ -351,6 +351,19 @@ export async function defaultProcessRunner(context: ProcessRunnerContext): Promi
     clearTimeout(timeout);
     await Promise.allSettled([stdoutDone, stderrDone]);
   }
+}
+
+export function waitForStreamFinished(stream: NodeJS.WritableStream): Promise<void> {
+  const state = stream as NodeJS.WritableStream & {
+    closed?: boolean;
+    destroyed?: boolean;
+    writableEnded?: boolean;
+    writableFinished?: boolean;
+  };
+  if (state.closed || state.destroyed || state.writableEnded || state.writableFinished) {
+    return Promise.resolve();
+  }
+  return finished(stream);
 }
 
 async function withLock<T>(path: string, timeoutMs: number, fn: () => Promise<T>): Promise<T> {
