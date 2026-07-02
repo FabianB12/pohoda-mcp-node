@@ -89,6 +89,9 @@ describe("CliXmlTransport", () => {
   it("writes request XML and decodes response XML as Windows-1250", async () => {
     const workDir = await mkdtemp(join(tmpdir(), "pohoda-xml-"));
     retainedDirs.push(workDir);
+    const iconv = await import("iconv-lite");
+    const responseNote = "Nov\u00e1k";
+    const requestText = "\u017dlu\u0165ou\u010dk\u00fd k\u016f\u0148";
     const transport = new CliXmlTransport({
       exePath: process.execPath,
       username: "Admin",
@@ -96,15 +99,14 @@ describe("CliXmlTransport", () => {
       workDir,
       keepSuccessfulJobs: true,
       processRunner: async ({ responseXml }) => {
-        const iconv = await import("iconv-lite");
-        await writeFile(responseXml, iconv.default.encode('<rsp:responsePack state="ok" xmlns:rsp="http://www.stormware.cz/schema/version_2/response.xsd"><rsp:responsePackItem id="i1" state="ok"><rsp:note>Novák</rsp:note></rsp:responsePackItem></rsp:responsePack>', "win1250"));
+        await writeFile(responseXml, iconv.default.encode(`<rsp:responsePack state="ok" xmlns:rsp="http://www.stormware.cz/schema/version_2/response.xsd"><rsp:responsePackItem id="i1" state="ok"><rsp:note>${responseNote}</rsp:note></rsp:responsePackItem></rsp:responsePack>`, "win1250"));
         return 0;
       }
     });
 
-    const result = await transport.exchange('<?xml version="1.0" encoding="Windows-1250"?><x>Žluťoučký kůň</x>', "Db");
-    expect((await readFile(join(result.jobDir, "request.xml"))).includes(Buffer.from([0x8e]))).toBe(true); // Ž in Windows-1250
-    expect(result.xml).toContain("Novák");
+    const result = await transport.exchange(`<?xml version="1.0" encoding="Windows-1250"?><x>${requestText}</x>`, "Db");
+    expect((await readFile(join(result.jobDir, "request.xml"))).includes(iconv.default.encode("\u017d", "win1250"))).toBe(true);
+    expect(result.xml).toContain(responseNote);
   });
 
   it("serializes same-database calls while allowing different databases up to the global cap", async () => {
