@@ -3,7 +3,7 @@ import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { CliXmlTransport } from "../src/pohoda/transport.js";
+import { CliXmlTransport, defaultProcessRunner } from "../src/pohoda/transport.js";
 
 const retainedDirs: string[] = [];
 
@@ -221,6 +221,39 @@ describe("CliXmlTransport", () => {
 
     await transport.exchange("<xml />", "Db");
     expect(runner).toHaveBeenCalledOnce();
+  });
+
+  it("default runner waits for spawned process and pipes stdout and stderr to files", async () => {
+    const workDir = await mkdtemp(join(tmpdir(), "pohoda-runner-"));
+    retainedDirs.push(workDir);
+    const scriptPath = join(workDir, "child.mjs");
+    const responseXml = join(workDir, "response.xml");
+    const stdoutPath = join(workDir, "stdout.log");
+    const stderrPath = join(workDir, "stderr.log");
+    await writeFile(scriptPath, [
+      "import { writeFile } from 'node:fs/promises';",
+      "await new Promise((resolve) => setTimeout(resolve, 75));",
+      "console.log('stdout-ready');",
+      "console.error('stderr-ready');",
+      `await writeFile(${JSON.stringify(responseXml)}, '<rsp:responsePack state=\"ok\" />');`
+    ].join("\n"));
+
+    const started = performance.now();
+    const exitCode = await defaultProcessRunner({
+      command: [process.execPath, scriptPath, "Admin"],
+      cwd: workDir,
+      timeoutMs: 5_000,
+      stdoutPath,
+      stderrPath,
+      responseXml,
+      database: "Db"
+    });
+
+    expect(performance.now() - started).toBeGreaterThanOrEqual(50);
+    expect(exitCode).toBe(0);
+    expect(await readFile(responseXml, "utf8")).toContain('state="ok"');
+    expect(await readFile(stdoutPath, "utf8")).toContain("stdout-ready");
+    expect(await readFile(stderrPath, "utf8")).toContain("stderr-ready");
   });
 });
 

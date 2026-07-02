@@ -1,8 +1,9 @@
 import { createHash, randomBytes } from "node:crypto";
+import { spawn } from "node:child_process";
 import { createWriteStream, existsSync, statSync } from "node:fs";
 import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
-import { execa } from "execa";
+import { finished } from "node:stream/promises";
 import iconv from "iconv-lite";
 import lockfile from "proper-lockfile";
 
@@ -317,14 +318,39 @@ export async function defaultProcessRunner(context: ProcessRunnerContext): Promi
   }
   const stdout = createWriteStream(context.stdoutPath);
   const stderr = createWriteStream(context.stderrPath);
-  const subprocess = await execa(context.command[0]!, context.command.slice(1), {
+  const stdoutDone = finished(stdout);
+  const stderrDone = finished(stderr);
+  const subprocess = spawn(context.command[0]!, context.command.slice(1), {
     cwd: context.cwd,
-    timeout: context.timeoutMs,
-    stdout,
-    stderr,
-    reject: false
+    stdio: ["ignore", "pipe", "pipe"],
+    windowsHide: true
   });
-  return subprocess.exitCode ?? 0;
+  subprocess.stdout?.pipe(stdout);
+  subprocess.stderr?.pipe(stderr);
+
+  let timedOut = false;
+  const timeout = setTimeout(() => {
+    timedOut = true;
+    subprocess.kill();
+  }, context.timeoutMs);
+
+  try {
+    const { code, signal } = await new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve, reject) => {
+      subprocess.once("error", (error) => {
+        stdout.destroy();
+        stderr.destroy();
+        reject(error);
+      });
+      subprocess.once("close", (code, signal) => resolve({ code, signal }));
+    });
+    if (timedOut) {
+      throw new Error(`Pohoda process timed out after ${context.timeoutMs} ms.`);
+    }
+    return code ?? (signal ? -1 : 0);
+  } finally {
+    clearTimeout(timeout);
+    await Promise.allSettled([stdoutDone, stderrDone]);
+  }
 }
 
 async function withLock<T>(path: string, timeoutMs: number, fn: () => Promise<T>): Promise<T> {
