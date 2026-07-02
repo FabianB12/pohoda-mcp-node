@@ -1,0 +1,16 @@
+[
+	{
+		"id": "client-a-2026",
+		"name": "Client A 2026",
+		"database": "StwPh_12345678_2026",
+		"ico": "12345678",
+		"year": 2026
+	},
+	{
+		"id": "client-b-2026",
+		"name": "Client B 2026",
+		"database": "StwPh_87654321_2026",
+		"ico": "87654321",
+		"year": 2026
+	}
+]

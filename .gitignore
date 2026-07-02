@@ -1,0 +1,8 @@
+node_modules
+dist
+coverage
+
+.env
+config/databases.json
+var/
+tests/output/

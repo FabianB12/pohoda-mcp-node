@@ -1,0 +1,39 @@
+{
+  "name": "pohoda-mcp-node",
+  "version": "1.0.0",
+  "description": "MCP server for Stormware POHODA through Pohoda.exe /XML.",
+  "type": "module",
+  "private": true,
+  "bin": {
+    "pohoda-mcp-node": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "check": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "test:integration:utm": "POHODA_UTM_VM=Windows vitest run tests/pohoda-utm.integration.test.ts",
+    "benchmark:utm": "POHODA_UTM_VM=Windows tsx scripts/benchmark-utm.ts",
+    "benchmark:utm:invoices": "POHODA_UTM_VM=Windows tsx scripts/benchmark-invoices-utm.ts",
+    "test:watch": "vitest",
+    "start": "node dist/index.js",
+    "dev": "tsx src/index.ts"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "execa": "^9.6.1",
+    "fast-xml-parser": "^5.3.2",
+    "iconv-lite": "^0.7.2",
+    "proper-lockfile": "^4.1.2",
+    "zod": "^4.1.13"
+  },
+  "devDependencies": {
+    "@types/node": "^22.19.0",
+    "@types/proper-lockfile": "^4.1.4",
+    "tsx": "^4.22.4",
+    "typescript": "^6.0.3",
+    "vitest": "^4.1.9"
+  },
+  "engines": {
+    "node": ">=22.0.0"
+  }
+}
