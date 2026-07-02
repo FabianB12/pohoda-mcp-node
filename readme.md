@@ -205,6 +205,12 @@ For datasets that may be too large for model context, use the persisted export f
 exports are just `kind="documents"`, `agenda="invoice"`, and `invoiceType` set to
 `issuedInvoice` or `receivedInvoice`.
 
+Invoice export summaries keep home and foreign currency separate. `summary.total`,
+`summary.byCurrency`, `summary.byPartner`, and `summary.byMonth` are home-currency totals,
+normally CZK. Foreign totals are exposed separately as `summary.foreignCurrency`, keyed
+by the foreign currency code. Compact records include `homeCurrency` and `foreignCurrency`
+when POHODA returns them.
+
 Use `create_data_export_bundle` when several related datasets are needed at once, such
 as issued invoices, received invoices, stock, and contacts. The MCP batches each page
 round into shared POHODA `/XML` runs and persists each dataset as its own export

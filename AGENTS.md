@@ -57,6 +57,11 @@ For large datasets, use persisted exports:
 - `summarize_export` for totals without loading all records.
 - `cleanup_export` when the export snapshot is no longer needed.
 
+For invoice exports, treat `summary.total`, `summary.byCurrency`, `summary.byPartner`,
+and `summary.byMonth` as home-currency totals, normally CZK. If invoices have foreign
+currency, use `summary.foreignCurrency` for foreign totals keyed by currency code; compact
+records also include `homeCurrency` and `foreignCurrency` fields when available.
+
 Do not request thousands of full records directly into chat unless truly necessary.
 
 ## Efficient Writes

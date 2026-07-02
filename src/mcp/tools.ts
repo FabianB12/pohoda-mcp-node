@@ -1025,7 +1025,7 @@ function registerResources(server: McpServer, context: PohodaServerContext): voi
       largeExports: {
         use: "Use create_data_export for one large dataset or create_data_export_bundle for several related datasets. They return compact preview rows, summary totals, opaque nextCursor values, and resource links to full JSON/NDJSON data.",
         paging: "Use read_export_page with the returned exportId and nextCursor. Cursors are opaque and expire with the export snapshot.",
-        summaries: "Use summarize_export for totals without loading full records into model context.",
+        summaries: "Use summarize_export for totals without loading full records into model context. For invoice exports, summary.total/byCurrency/byPartner/byMonth are home-currency totals, normally CZK; foreign invoice totals are separate in summary.foreignCurrency keyed by currency code.",
         cleanup: "Use cleanup_export when the snapshot is no longer needed."
       }
     }) }]
