@@ -239,6 +239,7 @@ export class CliXmlTransport implements XmlTransport {
       processError = error instanceof Error ? error.message : String(error);
     }
     const durationMs = Math.round(performance.now() - started);
+    await waitForNonEmptyFile(responseXml, Math.min(5000, timeoutSeconds * 1000));
     const response = existsSync(responseXml) ? iconv.decode(await readFile(responseXml), "win1250") : "";
     const metadata = {
       jobId,
@@ -410,4 +411,17 @@ function timestamp(): string {
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function waitForNonEmptyFile(path: string, timeoutMs: number): Promise<void> {
+  const deadline = Date.now() + Math.max(0, timeoutMs);
+  while (Date.now() <= deadline) {
+    if (existsSync(path) && statSync(path).size > 0) {
+      return;
+    }
+    if (timeoutMs <= 0) {
+      return;
+    }
+    await sleep(100);
+  }
 }

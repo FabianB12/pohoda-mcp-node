@@ -3,9 +3,28 @@ export const namespaces = {
   typ: "http://www.stormware.cz/schema/version_2/type.xsd",
   ftr: "http://www.stormware.cz/schema/version_2/filter.xsd",
   inv: "http://www.stormware.cz/schema/version_2/invoice.xsd",
+  vch: "http://www.stormware.cz/schema/version_2/voucher.xsd",
+  bnk: "http://www.stormware.cz/schema/version_2/bank.xsd",
+  int: "http://www.stormware.cz/schema/version_2/intDoc.xsd",
+  vyd: "http://www.stormware.cz/schema/version_2/vydejka.xsd",
+  pri: "http://www.stormware.cz/schema/version_2/prijemka.xsd",
+  pro: "http://www.stormware.cz/schema/version_2/prodejka.xsd",
+  pre: "http://www.stormware.cz/schema/version_2/prevodka.xsd",
+  vyr: "http://www.stormware.cz/schema/version_2/vyroba.xsd",
+  ofr: "http://www.stormware.cz/schema/version_2/offer.xsd",
+  enq: "http://www.stormware.cz/schema/version_2/enquiry.xsd",
+  con: "http://www.stormware.cz/schema/version_2/contract.xsd",
+  cen: "http://www.stormware.cz/schema/version_2/centre.xsd",
+  acv: "http://www.stormware.cz/schema/version_2/activity.xsd",
   ord: "http://www.stormware.cz/schema/version_2/order.xsd",
   adb: "http://www.stormware.cz/schema/version_2/addressbook.xsd",
   stk: "http://www.stormware.cz/schema/version_2/stock.xsd",
+  sto: "http://www.stormware.cz/schema/version_2/store.xsd",
+  str: "http://www.stormware.cz/schema/version_2/storage.xsd",
+  bka: "http://www.stormware.cz/schema/version_2/bankAccount.xsd",
+  prm: "http://www.stormware.cz/schema/version_2/parameter.xsd",
+  sup: "http://www.stormware.cz/schema/version_2/supplier.xsd",
+  bal: "http://www.stormware.cz/schema/version_2/balance.xsd",
   prn: "http://www.stormware.cz/schema/version_2/print.xsd",
   lst: "http://www.stormware.cz/schema/version_2/list.xsd",
   lStk: "http://www.stormware.cz/schema/version_2/list_stock.xsd",
@@ -31,6 +50,18 @@ export const namespaces = {
 } as const;
 
 export const vatRates = ["none", "low", "high"] as const;
+export const voucherTypes = ["receipt", "expense"] as const;
+export const activityActions = ["add", "update", "delete"] as const;
+export const sphereTypes = [
+  "business", "loan", "specificRegulations", "other", "cheques",
+  "exchangeRateDifference", "penalty", "labourLaw"
+] as const;
+export const invoiceTypes = [
+  "issuedInvoice", "issuedCreditNotice", "issuedDebitNote", "issuedAdvanceInvoice",
+  "receivable", "issuedProformaInvoice", "penalty", "issuedCorrectiveTax",
+  "receivedInvoice", "receivedCreditNotice", "receivedDebitNote", "receivedAdvanceInvoice",
+  "commitment", "receivedProformaInvoice", "receivedCorrectiveTax"
+] as const;
 
 export const documentAgendas = [
   "invoice", "order", "voucher", "bank", "contract", "intDoc", "offer", "enquiry",

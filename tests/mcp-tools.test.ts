@@ -111,8 +111,13 @@ describe("MCP tool helpers", () => {
 
     expect([...fakeServer.tools.keys()]).toEqual([
       "status", "list_xml_databases", "current_database", "list_accounting_units",
-      "list_documents", "list_stock", "list_contacts", "list_export_agenda", "batch_list_records", "create_invoice",
-      "create_address", "batch_create_invoices", "batch_write", "create_stock", "create_order", "print", "raw_xml", "raw_xml_batch",
+      "list_documents", "list_stock", "list_contacts", "list_export_agenda", "batch_list_records", "list_balance", "create_invoice",
+      "create_other_liability", "create_other_receivable", "create_address", "create_cash_voucher", "manage_activity",
+      "batch_create_invoices", "batch_write", "create_stock", "create_order", "manage_address", "manage_stock",
+      "create_bank_document", "create_internal_document", "create_stock_receipt", "create_stock_issue", "create_stock_transfer",
+      "create_production_document", "create_sales_receipt", "create_offer", "create_enquiry", "manage_contract",
+      "manage_centre", "manage_store", "manage_storage", "manage_bank_account", "manage_group_stock",
+      "manage_parameter_definition", "print", "raw_xml", "raw_xml_batch",
       "create_data_export", "create_data_export_bundle", "read_export_page", "summarize_export", "cleanup_export"
     ]);
     expect([...fakeServer.resources.keys()]).toContain("guide");
@@ -131,6 +136,8 @@ describe("MCP tool helpers", () => {
     expect(transport.calls.at(-1)?.database).toBe("12345678_2026.mdb");
     expect(transport.calls.at(-1)?.xml).toContain('ico="12345678"');
     expect(transport.calls.at(-1)?.xml).not.toContain('ico="00000000"');
+    await fakeServer.call("list_documents", { agenda: "invoice", invoiceType: "commitment", documentType: "", limit: 1, databaseId: "demo" });
+    expect(transport.calls.at(-1)?.xml).toContain('invoiceType="commitment"');
 
     const units = await fakeServer.call("list_accounting_units", {
       query: "novak",
@@ -609,6 +616,68 @@ describe("MCP tool helpers", () => {
     expect(transport.calls[0]?.xml).toContain('id="write-3"');
     expect(transport.calls[0]?.xml).toContain('note="order:create_order"');
     expect(transport.calls[0]?.xml).toContain("<ord:order");
+  });
+
+  it("maps batch_write responses for cash vouchers, other documents, and activities", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "pohoda-mcp-new-batch-write-"));
+    tempDirs.push(dir);
+    const registryPath = join(dir, "databases.json");
+    await writeFile(registryPath, JSON.stringify([
+      { id: "demo", name: "Demo", database: "12345678_2026.mdb", ico: "12345678" }
+    ]));
+
+    const fakeServer = new CapturingServer();
+    const transport = new HandlerTransport(() =>
+      '<rsp:responsePack state="ok" xmlns:rsp="http://www.stormware.cz/schema/version_2/response.xsd"><rsp:responsePackItem id="write-1" state="ok"><vch:voucherResponse><rdc:producedDetails><rdc:id>1001</rdc:id><rdc:actionType>add</rdc:actionType></rdc:producedDetails></vch:voucherResponse></rsp:responsePackItem><rsp:responsePackItem id="write-2" state="ok"><inv:invoiceResponse><rdc:producedDetails><rdc:id>1002</rdc:id><rdc:actionType>add</rdc:actionType></rdc:producedDetails></inv:invoiceResponse></rsp:responsePackItem><rsp:responsePackItem id="write-3" state="ok"><inv:invoiceResponse><rdc:producedDetails><rdc:id>1003</rdc:id><rdc:actionType>add</rdc:actionType></rdc:producedDetails></inv:invoiceResponse></rsp:responsePackItem><rsp:responsePackItem id="write-4" state="ok"><acv:activityResponse><rdc:producedDetails><rdc:id>1004</rdc:id><rdc:actionType>add</rdc:actionType></rdc:producedDetails></acv:activityResponse></rsp:responsePackItem></rsp:responsePack>'
+    );
+    const client = new PohodaClient({ transport, ico: "00000000", database: "" });
+    const registry = new XmlDatabaseRegistry({ registryPath });
+    registerPohodaTools(fakeServer as any, { client, databaseRegistry: registry });
+
+    const result = await fakeServer.call("batch_write", {
+      databaseId: "demo",
+      dataPackId: "write-new",
+      operations: [
+        {
+          requestId: "voucher",
+          tool: "create_cash_voucher",
+          data: { type: "receipt", cashAccount: "HLAVNI", date: "2026-07-02", text: "Cash receipt", items: [{ text: "Paid", quantity: 1, unit: "ks", unitPrice: 121, vatRate: "high", stockCode: "" }] }
+        },
+        {
+          requestId: "liability",
+          tool: "create_other_liability",
+          data: { partnerName: "Supplier", date: "2026-07-02", text: "Other liability", sphereType: "business", paymentAccountNumber: "123456", paymentBankCode: "0100", items: [{ text: "Fee", quantity: 1, unit: "ks", unitPrice: 200, vatRate: "none", stockCode: "" }] }
+        },
+        {
+          requestId: "receivable",
+          tool: "create_other_receivable",
+          data: { partnerName: "Customer", date: "2026-07-02", text: "Other receivable", sphereType: "business", items: [{ text: "Charge", quantity: 1, unit: "ks", unitPrice: 300, vatRate: "none", stockCode: "" }] }
+        },
+        {
+          requestId: "activity",
+          tool: "manage_activity",
+          data: { action: "add", id: 0, matchId: 0, code: "CONSULT", name: "Consulting", taxType: "", note: "" }
+        }
+      ]
+    });
+
+    expect(result.structuredContent.ok).toBe(true);
+    expect(result.structuredContent.operationCount).toBe(4);
+    expect(result.structuredContent.results.map((row: any) => row.tool)).toEqual(["create_cash_voucher", "create_other_liability", "create_other_receivable", "manage_activity"]);
+    expect(transport.calls).toHaveLength(1);
+    expect(transport.calls[0]?.database).toBe("12345678_2026.mdb");
+    expect(transport.calls[0]?.xml).toContain('ico="12345678"');
+    expect(transport.calls[0]?.xml).toContain('note="voucher:create_cash_voucher"');
+    expect(transport.calls[0]?.xml).toContain("<vch:voucher");
+    expect(transport.calls[0]?.xml).toContain("<vch:voucherType>receipt</vch:voucherType>");
+    expect(transport.calls[0]?.xml).toContain('note="liability:create_other_liability"');
+    expect(transport.calls[0]?.xml).toContain("<inv:invoiceType>commitment</inv:invoiceType>");
+    expect(transport.calls[0]?.xml).toContain("<typ:accountNo>123456</typ:accountNo>");
+    expect(transport.calls[0]?.xml).toContain('note="receivable:create_other_receivable"');
+    expect(transport.calls[0]?.xml).toContain("<inv:invoiceType>receivable</inv:invoiceType>");
+    expect(transport.calls[0]?.xml).toContain('note="activity:manage_activity"');
+    expect(transport.calls[0]?.xml).toContain("<acv:activity");
+    expect(transport.calls[0]?.xml).toContain("<acv:code>CONSULT</acv:code>");
   });
 
   it("batches export bundle page rounds and preserves independent snapshots", async () => {

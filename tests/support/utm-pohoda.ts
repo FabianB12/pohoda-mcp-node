@@ -123,14 +123,20 @@ export function createUtmProcessRunner(options: UtmPohodaOptions): UtmProcessRun
 
     await writeFile(localIni, ini);
     await writeFile(localRun, `@echo off\r\ncd /d "${dirnameWin(options.exePath)}"\r\n"${options.exePath}" /XML "${options.username}" "${options.password}" "${guestIni}" > "${guestDir}\\stdout.log" 2> "${guestDir}\\stderr.log"\r\necho %ERRORLEVEL% > "${guestDir}\\exitcode.txt"\r\n`);
-    await execa(options.utmctl, ["exec", options.vm, "--cmd", "cmd.exe", "/c", `if not exist ${guestDir} mkdir ${guestDir} & del /Q ${guestDir}\\* 2>NUL`], { timeout: 30_000 });
+    await utm(options.utmctl, ["exec", options.vm, "--cmd", "cmd.exe", "/c", `mkdir ${guestDir} 2>NUL`], "create guest job dir");
     await push(options.utmctl, options.vm, localRequest, guestRequest);
     await push(options.utmctl, options.vm, localIni, guestIni);
     await push(options.utmctl, options.vm, localRun, guestRun);
-    await execa(options.utmctl, ["exec", options.vm, "--cmd", "cmd.exe", "/c", guestRun], { timeout: context.timeoutMs });
+    await execa(options.utmctl, ["exec", options.vm, "--cmd", "cmd.exe", "/c", guestRun], { reject: false, timeout: context.timeoutMs });
     await waitForGuestFile(options.utmctl, options.vm, `${guestDir}\\exitcode.txt`, context.timeoutMs);
     await waitForGuestFile(options.utmctl, options.vm, guestResponse, context.timeoutMs);
-    await pullToFile(options.utmctl, options.vm, guestResponse, context.responseXml);
+    await pullToFile(options.utmctl, options.vm, guestResponse, context.responseXml, {
+      utmctl: options.utmctl,
+      vm: options.vm,
+      stdoutPath: `${guestDir}\\stdout.log`,
+      stderrPath: `${guestDir}\\stderr.log`,
+      exitCodePath: `${guestDir}\\exitcode.txt`
+    });
     return 0;
   }) as UtmProcessRunner;
   runner.cleanup = async () => {
@@ -169,14 +175,20 @@ export async function runPohodaJob(options: UtmPohodaOptions & {
   }));
   await writeFile(runPath, `@echo off\r\ncd /d "${dirnameWin(options.exePath)}"\r\n"${options.exePath}" /XML "${options.username}" "${options.password}" "${guestIni}" > "${options.guestDir}\\stdout.log" 2> "${options.guestDir}\\stderr.log"\r\necho %ERRORLEVEL% > "${options.guestDir}\\exitcode.txt"\r\n`);
 
-  await execa(options.utmctl, ["exec", options.vm, "--cmd", "cmd.exe", "/c", `if not exist ${options.guestDir} mkdir ${options.guestDir} & del /Q ${options.guestDir}\\* 2>NUL`], { timeout: 30_000 });
+  await utm(options.utmctl, ["exec", options.vm, "--cmd", "cmd.exe", "/c", `mkdir ${options.guestDir} 2>NUL`], "create guest job dir");
   await push(options.utmctl, options.vm, requestPath, guestRequest);
   await push(options.utmctl, options.vm, iniPath, guestIni);
   await push(options.utmctl, options.vm, runPath, `${options.guestDir}\\run.cmd`);
-  await execa(options.utmctl, ["exec", options.vm, "--cmd", "cmd.exe", "/c", `${options.guestDir}\\run.cmd`], { timeout: timeoutMs });
+  await execa(options.utmctl, ["exec", options.vm, "--cmd", "cmd.exe", "/c", `${options.guestDir}\\run.cmd`], { reject: false, timeout: timeoutMs });
   await waitForGuestFile(options.utmctl, options.vm, `${options.guestDir}\\exitcode.txt`, timeoutMs);
   await waitForGuestFile(options.utmctl, options.vm, guestResponse, timeoutMs);
-  await pullToFile(options.utmctl, options.vm, guestResponse, responsePath);
+  await pullToFile(options.utmctl, options.vm, guestResponse, responsePath, {
+    utmctl: options.utmctl,
+    vm: options.vm,
+    stdoutPath: `${options.guestDir}\\stdout.log`,
+    stderrPath: `${options.guestDir}\\stderr.log`,
+    exitCodePath: `${options.guestDir}\\exitcode.txt`
+  });
   return iconv.decode(await readFile(responsePath), "win1250");
 }
 
@@ -184,36 +196,88 @@ async function waitForGuestFile(utmctl: string, vm: string, guestPath: string, t
   const deadline = Date.now() + timeoutMs;
   let lastError = "";
   while (Date.now() < deadline) {
-    try {
-      await execa(utmctl, ["file", "pull", vm, guestPath], { encoding: "buffer", timeout: 10_000 });
+    const result = await execa(utmctl, ["file", "pull", vm, guestPath], { encoding: "buffer", reject: false, timeout: 10_000 });
+    const error = utmError(result.stderr) || utmError(result.stdout);
+    if (!error) {
       return;
-    } catch (error) {
-      lastError = error instanceof Error ? error.message : String(error);
-      await new Promise((resolve) => setTimeout(resolve, 500));
     }
+    lastError = error;
+    await new Promise((resolve) => setTimeout(resolve, 500));
   }
   throw new Error(`Timed out waiting for guest file ${guestPath}: ${lastError}`);
 }
 
 async function push(utmctl: string, vm: string, localPath: string, guestPath: string): Promise<void> {
-  await execa(utmctl, ["file", "push", vm, guestPath], {
+  const result = await execa(utmctl, ["file", "push", vm, guestPath], {
     input: await readFile(localPath),
     encoding: "buffer",
+    reject: false,
     timeout: 30_000
   });
+  const error = utmError(result.stderr) || utmError(result.stdout);
+  if (result.exitCode !== 0 || error) {
+    throw new Error(`utmctl file push failed for ${guestPath}: ${error || result.stderr.toString()}`);
+  }
 }
 
-async function pullToFile(utmctl: string, vm: string, guestPath: string, localPath: string): Promise<void> {
+async function pullToFile(utmctl: string, vm: string, guestPath: string, localPath: string, diagnostics?: {
+  utmctl: string;
+  vm: string;
+  stdoutPath: string;
+  stderrPath: string;
+  exitCodePath: string;
+}): Promise<void> {
   let lastSize = 0;
-  for (let attempt = 0; attempt < 10; attempt++) {
-    await execa("bash", ["-lc", `${shellQuote(utmctl)} file pull ${shellQuote(vm)} ${shellQuote(guestPath)} > ${shellQuote(localPath)}`], { timeout: 30_000 });
+  let lastError = "";
+  for (let attempt = 0; attempt < 60; attempt++) {
+    const result = await execa("bash", ["-lc", `${shellQuote(utmctl)} file pull ${shellQuote(vm)} ${shellQuote(guestPath)} > ${shellQuote(localPath)}`], { reject: false, timeout: 30_000 });
+    lastError = utmError(result.stderr) || utmError(result.stdout) || (result.exitCode === 0 ? "" : result.stderr);
     lastSize = statSync(localPath).size;
-    if (lastSize > 0) {
+    if (!lastError && lastSize > 0) {
       return;
     }
     await new Promise((resolve) => setTimeout(resolve, 500));
   }
-  throw new Error(`Pulled empty guest file ${guestPath} after retries (lastSize=${lastSize}).`);
+  const stdout = diagnostics ? await pullOptionalText(diagnostics.utmctl, diagnostics.vm, diagnostics.stdoutPath) : "";
+  const stderr = diagnostics ? await pullOptionalText(diagnostics.utmctl, diagnostics.vm, diagnostics.stderrPath) : "";
+  const exitCode = diagnostics ? await pullOptionalText(diagnostics.utmctl, diagnostics.vm, diagnostics.exitCodePath) : "";
+  throw new Error(`Pulled empty guest file ${guestPath} after retries (lastSize=${lastSize}).`
+    + (lastError ? ` pullError=${lastError}` : "")
+    + (exitCode.trim() ? ` exitCode=${exitCode.trim()}` : "")
+    + (stderr.trim() ? ` stderr=${stderr.trim()}` : "")
+    + (stdout.trim() ? ` stdout=${stdout.trim()}` : ""));
+}
+
+async function pullOptionalText(utmctl: string, vm: string, guestPath: string): Promise<string> {
+  const result = await execa(utmctl, ["file", "pull", vm, guestPath], { encoding: "buffer", reject: false, timeout: 30_000 });
+  if (result.exitCode !== 0 || utmError(result.stderr) || utmError(result.stdout)) {
+    return "";
+  }
+  return iconv.decode(result.stdout, "win1250");
+}
+
+async function utm(utmctl: string, args: string[], action: string, timeout = 30_000): Promise<void> {
+  const attempts = action === "create guest job dir" ? 5 : 1;
+  let lastError = "";
+  for (let attempt = 0; attempt < attempts; attempt++) {
+    const result = await execa(utmctl, args, { encoding: "buffer", reject: false, timeout });
+    const error = utmError(result.stderr) || utmError(result.stdout);
+    if (result.exitCode === 0 && !error) {
+      return;
+    }
+    lastError = error || outputText(result.stderr) || outputText(result.stdout);
+    await new Promise((resolve) => setTimeout(resolve, 500 * (attempt + 1)));
+  }
+  throw new Error(`utmctl ${action} failed: ${lastError}`);
+}
+
+function utmError(stderr: Buffer | Uint8Array | string): string {
+  const text = outputText(stderr);
+  return /Error from event|failed to |cannot find|cannot be found|The system cannot find|Access is denied/i.test(text) ? text.trim() : "";
+}
+
+function outputText(value: Buffer | Uint8Array | string): string {
+  return typeof value === "string" ? value : Buffer.from(value).toString();
 }
 
 function dirnameWin(path: string): string {

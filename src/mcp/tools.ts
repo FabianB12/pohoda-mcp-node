@@ -8,8 +8,12 @@ import {
   exportAgendasWithLastChanges,
   exportAgendasWithoutFilters,
   exportAgendasWithoutServerLimit,
+  activityActions,
+  invoiceTypes,
   printAgendas,
-  vatRates
+  sphereTypes,
+  vatRates,
+  voucherTypes
 } from "../pohoda/constants.js";
 import type { PohodaClient } from "../pohoda/client.js";
 import type { XmlDatabase, XmlDatabaseRegistry } from "../pohoda/database-registry.js";
@@ -33,13 +37,37 @@ const itemSchema = z.object({
   unit: z.string().default("ks"),
   unitPrice: z.number(),
   vatRate: z.enum(vatRates).default("high"),
-  stockCode: z.string().default("")
+  stockCode: z.string().default(""),
+  coefficient: z.number().optional(),
+  payVAT: z.boolean().optional(),
+  percentVAT: z.number().optional(),
+  discountPercentage: z.number().optional(),
+  price: z.number().optional(),
+  priceVAT: z.number().optional(),
+  priceSum: z.number().optional(),
+  note: z.string().default(""),
+  code: z.string().default(""),
+  symPar: z.string().default(""),
+  accounting: z.string().default(""),
+  classificationVAT: z.string().default(""),
+  classificationKVDPH: z.string().default(""),
+  centre: z.string().default(""),
+  activity: z.string().default(""),
+  contract: z.string().default(""),
+  linkToStock: z.string().default(""),
+  PDP: z.boolean().optional(),
+  CodePDP: z.string().default("")
 });
 
 const invoiceCreateSchema = z.object({
-  type: z.enum(["issuedInvoice", "receivedInvoice"]),
+  type: z.enum(invoiceTypes),
   items: z.array(itemSchema).min(1),
+  extId: z.string().default(""),
+  extSystemName: z.string().default(""),
+  sphereType: z.enum(["", ...sphereTypes]).default(""),
   number: z.string().default(""),
+  originalDocument: z.string().default(""),
+  originalDocumentNumber: z.string().default(""),
   partnerName: z.string().default(""),
   date: z.string().default(""),
   partnerIco: z.string().default(""),
@@ -49,13 +77,26 @@ const invoiceCreateSchema = z.object({
   partnerId: z.number().int().default(0),
   text: z.string().default(""),
   symVar: z.string().default(""),
+  symPar: z.string().default(""),
+  symConst: z.string().default(""),
+  symSpec: z.string().default(""),
   dateDue: z.string().default(""),
   dateTax: z.string().default(""),
   dateAccounting: z.string().default(""),
+  dateApplicationVAT: z.string().default(""),
+  dateKHDPH: z.string().default(""),
+  dateDelivery: z.string().default(""),
   paymentType: z.string().default(""),
   accountIds: z.string().default(""),
   accounting: z.string().default(""),
   classificationVAT: z.string().default(""),
+  classificationKVDPH: z.string().default(""),
+  numberKHDPH: z.string().default(""),
+  numberKVDPH: z.string().default(""),
+  paymentAccountNumber: z.string().default(""),
+  paymentBankCode: z.string().default(""),
+  messageForRecipient: z.string().default(""),
+  paymentTerminal: z.boolean().optional(),
   centre: z.string().default(""),
   activity: z.string().default(""),
   contract: z.string().default(""),
@@ -63,6 +104,73 @@ const invoiceCreateSchema = z.object({
   currencyRate: z.number().default(0),
   note: z.string().default(""),
   intNote: z.string().default("")
+});
+
+const otherLiabilityCreateSchema = invoiceCreateSchema.omit({ type: true }).extend({
+  sphereType: z.enum(["", ...sphereTypes]).default("business")
+});
+
+const cashVoucherCreateSchema = z.object({
+  type: z.enum(voucherTypes),
+  cashAccount: z.string(),
+  items: z.array(itemSchema.extend({ vatRate: z.enum(vatRates).default("none") })).min(1),
+  extId: z.string().default(""),
+  extSystemName: z.string().default(""),
+  number: z.string().default(""),
+  originalDocument: z.string().default(""),
+  date: z.string(),
+  datePayment: z.string().default(""),
+  dateTax: z.string().default(""),
+  dateKHDPH: z.string().default(""),
+  accounting: z.string().default(""),
+  classificationVAT: z.string().default(""),
+  classificationKVDPH: z.string().default(""),
+  text: z.string(),
+  partnerName: z.string().default(""),
+  partnerIco: z.string().default(""),
+  partnerStreet: z.string().default(""),
+  partnerCity: z.string().default(""),
+  partnerZip: z.string().default(""),
+  partnerId: z.number().int().default(0),
+  symPar: z.string().default(""),
+  priceLevel: z.string().default(""),
+  centre: z.string().default(""),
+  activity: z.string().default(""),
+  contract: z.string().default(""),
+  currency: z.string().default(""),
+  currencyRate: z.number().default(0),
+  currencyAmount: z.number().default(0),
+  currencyPriceSum: z.number().optional(),
+  roundingDocument: z.string().default(""),
+  roundingVAT: z.string().default(""),
+  calculateVAT: z.boolean().optional(),
+  typeCalculateVATInclusivePrice: z.string().default(""),
+  priceNone: z.number().optional(),
+  priceLow: z.number().optional(),
+  priceLowVAT: z.number().optional(),
+  priceLowSum: z.number().optional(),
+  priceHigh: z.number().optional(),
+  priceHighVAT: z.number().optional(),
+  priceHighSum: z.number().optional(),
+  price3: z.number().optional(),
+  price3VAT: z.number().optional(),
+  price3Sum: z.number().optional(),
+  note: z.string().default(""),
+  intNote: z.string().default(""),
+  markRecord: z.boolean().optional()
+});
+
+const activityManageSchema = z.object({
+  action: z.enum(activityActions),
+  id: z.number().int().default(0),
+  extId: z.string().default(""),
+  extSystemName: z.string().default(""),
+  code: z.string().default(""),
+  name: z.string().default(""),
+  taxType: z.string().default(""),
+  note: z.string().default(""),
+  markRecord: z.boolean().optional(),
+  matchId: z.number().int().default(0)
 });
 
 const emptyAddressInput = {
@@ -100,6 +208,8 @@ const stockCreateSchema = z.object({
   sellingPrice: z.number(),
   unit: z.string().default("ks"),
   storage: z.string().default(""),
+  typePrice: z.string().default(""),
+  priceGroup: z.string().default(""),
   vatRate: z.enum(vatRates).default("high"),
   purchasingPrice: z.number().default(0),
   EAN: z.string().default(""),
@@ -125,6 +235,259 @@ const orderCreateSchema = z.object({
   date: z.string(),
   items: z.array(itemSchema).min(1),
   partnerIco: z.string().default("")
+});
+
+const xmlObjectSchema = z.record(z.string(), z.any()).default({});
+
+const documentItemSchema = itemSchema.extend({
+  stockId: z.number().int().default(0),
+  stockIds: z.string().default(""),
+  store: z.string().default(""),
+  sourceStore: z.string().default(""),
+  destinationStore: z.string().default(""),
+  transferred: z.number().optional(),
+  guarantee: z.number().int().optional(),
+  guaranteeType: z.string().default(""),
+  acc: z.string().default(""),
+  extraItem: xmlObjectSchema
+});
+
+const documentHeaderSchema = z.object({
+  type: z.string().default(""),
+  id: z.number().int().default(0),
+  extId: z.string().default(""),
+  extSystemName: z.string().default(""),
+  number: z.string().default(""),
+  statementNumber: z.string().default(""),
+  originalDocument: z.string().default(""),
+  originalDocumentNumber: z.string().default(""),
+  date: z.string().default(""),
+  datePayment: z.string().default(""),
+  dateStatement: z.string().default(""),
+  dateTax: z.string().default(""),
+  dateAccounting: z.string().default(""),
+  dateDelivery: z.string().default(""),
+  dateOrder: z.string().default(""),
+  dateOfReceipt: z.string().default(""),
+  validTill: z.string().default(""),
+  dateKHDPH: z.string().default(""),
+  dateKVDPH: z.string().default(""),
+  numberOrder: z.string().default(""),
+  text: z.string().default(""),
+  partnerName: z.string().default(""),
+  partnerIco: z.string().default(""),
+  partnerStreet: z.string().default(""),
+  partnerCity: z.string().default(""),
+  partnerZip: z.string().default(""),
+  partnerId: z.number().int().default(0),
+  account: z.string().default(""),
+  bankAccount: z.string().default(""),
+  cashAccount: z.string().default(""),
+  kasa: z.string().default(""),
+  symVar: z.string().default(""),
+  symPar: z.string().default(""),
+  symConst: z.string().default(""),
+  symSpec: z.string().default(""),
+  accounting: z.string().default(""),
+  classificationVAT: z.string().default(""),
+  classificationKVDPH: z.string().default(""),
+  paymentType: z.string().default(""),
+  paymentAccountNumber: z.string().default(""),
+  paymentBankCode: z.string().default(""),
+  priceLevel: z.string().default(""),
+  isExecuted: z.boolean().optional(),
+  isDelivered: z.boolean().optional(),
+  regVATinEU: z.string().default(""),
+  MOSS: xmlObjectSchema,
+  evidentiaryResourcesMOSS: xmlObjectSchema,
+  accountingPeriodMOSS: z.string().default(""),
+  permanentDocument: z.boolean().optional(),
+  centre: z.string().default(""),
+  activity: z.string().default(""),
+  contract: z.string().default(""),
+  carrier: z.string().default(""),
+  details: z.string().default(""),
+  currency: z.string().default(""),
+  currencyRate: z.number().default(0),
+  currencyAmount: z.number().default(0),
+  currencyPriceSum: z.number().optional(),
+  note: z.string().default(""),
+  intNote: z.string().default(""),
+  histRate: z.boolean().optional(),
+  lock1: z.boolean().optional(),
+  lock2: z.boolean().optional(),
+  markRecord: z.boolean().optional(),
+  parameters: z.union([z.record(z.string(), z.any()), z.array(z.record(z.string(), z.any()))]).default({}),
+  labels: z.union([z.string(), z.array(z.string())]).default(""),
+  extraHeader: xmlObjectSchema,
+  extraData: xmlObjectSchema
+});
+
+const genericDocumentCreateSchema = documentHeaderSchema.extend({
+  items: z.array(documentItemSchema).default([])
+});
+
+const salesReceiptCreateSchema = genericDocumentCreateSchema.extend({
+  payments: z.array(z.object({
+    type: z.string().default(""),
+    paymentType: z.string().default(""),
+    text: z.string().default(""),
+    received: z.number().optional(),
+    price: z.number().optional(),
+    currency: z.string().default(""),
+    currencyRate: z.number().default(0),
+    currencyAmount: z.number().default(0),
+    currencyPriceSum: z.number().optional(),
+    rate: z.number().optional(),
+    amount: z.number().optional(),
+    paymentTerminal: z.boolean().optional(),
+    symVar: z.string().default(""),
+    account: z.string().default(""),
+    note: z.string().default(""),
+    extraPayment: xmlObjectSchema
+  })).default([])
+});
+
+const manageActionSchema = z.enum(["add", "update", "delete"]);
+const simpleMatchSchema = z.object({
+  id: z.number().int().default(0),
+  extId: z.string().default(""),
+  extSystemName: z.string().default(""),
+  code: z.string().default(""),
+  name: z.string().default("")
+}).default({ id: 0, extId: "", extSystemName: "", code: "", name: "" });
+
+const addressManageSchema = addressCreateSchema.extend({
+  action: manageActionSchema,
+  id: z.number().int().default(0),
+  extId: z.string().default(""),
+  extSystemName: z.string().default(""),
+  match: simpleMatchSchema,
+  extraHeader: xmlObjectSchema
+});
+
+const stockManageSchema = stockCreateSchema.partial({ code: true, name: true, sellingPrice: true }).extend({
+  action: manageActionSchema,
+  id: z.number().int().default(0),
+  extId: z.string().default(""),
+  extSystemName: z.string().default(""),
+  match: simpleMatchSchema,
+  extraHeader: xmlObjectSchema
+});
+
+const contractManageSchema = documentHeaderSchema.extend({
+  responsiblePerson: z.string().default(""),
+  status: z.string().default(""),
+  ost1: z.string().default(""),
+  ost2: z.string().default(""),
+  planItems: z.array(z.record(z.string(), z.any())).default([])
+});
+
+const centreManageSchema = z.object({
+  action: manageActionSchema,
+  id: z.number().int().default(0),
+  extId: z.string().default(""),
+  extSystemName: z.string().default(""),
+  code: z.string().default(""),
+  name: z.string().default(""),
+  establishment: z.string().default(""),
+  note: z.string().default(""),
+  markRecord: z.boolean().optional(),
+  match: simpleMatchSchema,
+  extraHeader: xmlObjectSchema
+});
+
+const storeManageSchema = z.object({
+  id: z.number().int().default(0),
+  name: z.string(),
+  text: z.string(),
+  allowNegInvBalance: z.boolean().optional(),
+  storekeeper: z.string().default(""),
+  PLU: z.number().int().optional(),
+  note: z.string().default(""),
+  markRecord: z.boolean().optional(),
+  sourceStore: z.boolean().optional(),
+  destinationStore: z.boolean().optional(),
+  createInventoryCard: z.boolean().optional(),
+  unitPZD: z.string().default(""),
+  usePLU: z.boolean().optional(),
+  lowerLimit: z.number().optional(),
+  upperLimit: z.number().optional(),
+  parameters: z.union([z.record(z.string(), z.any()), z.array(z.record(z.string(), z.any()))]).default({}),
+  extraData: xmlObjectSchema
+});
+
+const storageManageSchema = z.object({
+  storages: z.array(z.record(z.string(), z.any())).default([]),
+  code: z.string().default(""),
+  idStore: z.number().int().default(0),
+  name: z.string().default(""),
+  note: z.string().default(""),
+  offerTo: z.string().default(""),
+  subStorages: z.array(z.record(z.string(), z.any())).default([]),
+  extraItem: xmlObjectSchema
+});
+
+const bankAccountManageSchema = z.object({
+  action: z.literal("add"),
+  ids: z.string(),
+  numberAccount: z.string(),
+  codeBank: z.string(),
+  nameBank: z.string().default(""),
+  id: z.number().int().default(0),
+  extId: z.string().default(""),
+  extSystemName: z.string().default(""),
+  symSpec: z.string().default(""),
+  IBAN: z.string().default(""),
+  SWIFT: z.string().default(""),
+  analyticAccount: z.string().default(""),
+  currency: z.string().default(""),
+  currencyRate: z.number().default(0),
+  cancelled: z.string().default(""),
+  homebanking: z.string().default(""),
+  payTerminal: z.string().default(""),
+  note: z.string().default(""),
+  match: simpleMatchSchema,
+  extraHeader: xmlObjectSchema
+});
+
+const groupStockManageSchema = z.object({
+  action: manageActionSchema,
+  id: z.number().int().default(0),
+  code: z.string().default(""),
+  name: z.string().default(""),
+  description: z.string().default(""),
+  internet: z.boolean().optional(),
+  picture: z.string().default(""),
+  note: z.string().default(""),
+  markRecord: z.boolean().optional(),
+  variants: z.array(z.record(z.string(), z.any())).default([]),
+  match: simpleMatchSchema,
+  extraHeader: xmlObjectSchema
+});
+
+const parameterDefinitionManageSchema = z.object({
+  idsAgenda: z.string(),
+  userAgendaDef: xmlObjectSchema,
+  formParameters: z.array(z.record(z.string(), z.any())).default([]),
+  itemParameters: z.array(z.record(z.string(), z.any())).default([]),
+  item2Parameters: z.array(z.record(z.string(), z.any())).default([]),
+  userForm: xmlObjectSchema,
+  userCode: z.string().default(""),
+  userCodePart: xmlObjectSchema,
+  extraData: xmlObjectSchema
+});
+
+const balanceListSchema = z.object({
+  dateTo: z.string().default(""),
+  adjustTo: z.number().optional(),
+  groupByDoc: z.boolean().optional(),
+  removeBalancedRec: z.boolean().optional(),
+  pairing: z.enum(["PairingSymbol", "PairingSymbolIC"]).default("PairingSymbol"),
+  userFilterName: z.string().default(""),
+  idFrom: z.number().int().default(0),
+  count: z.number().int().default(0),
+  limit: z.number().int().min(1).max(10_000).default(defaultListLimit)
 });
 
 const printSchema = z.object({
@@ -157,9 +520,31 @@ const printSchema = z.object({
 
 const batchWriteOperationSchema = z.discriminatedUnion("tool", [
   z.object({ requestId: z.string().default(""), tool: z.literal("create_address"), data: addressCreateSchema.extend({ company: z.string() }) }),
+  z.object({ requestId: z.string().default(""), tool: z.literal("manage_address"), data: addressManageSchema }),
   z.object({ requestId: z.string().default(""), tool: z.literal("create_invoice"), data: invoiceCreateSchema }),
+  z.object({ requestId: z.string().default(""), tool: z.literal("create_other_liability"), data: otherLiabilityCreateSchema }),
+  z.object({ requestId: z.string().default(""), tool: z.literal("create_other_receivable"), data: otherLiabilityCreateSchema }),
+  z.object({ requestId: z.string().default(""), tool: z.literal("create_cash_voucher"), data: cashVoucherCreateSchema }),
   z.object({ requestId: z.string().default(""), tool: z.literal("create_stock"), data: stockCreateSchema }),
+  z.object({ requestId: z.string().default(""), tool: z.literal("manage_stock"), data: stockManageSchema }),
   z.object({ requestId: z.string().default(""), tool: z.literal("create_order"), data: orderCreateSchema }),
+  z.object({ requestId: z.string().default(""), tool: z.literal("create_bank_document"), data: genericDocumentCreateSchema }),
+  z.object({ requestId: z.string().default(""), tool: z.literal("create_internal_document"), data: genericDocumentCreateSchema }),
+  z.object({ requestId: z.string().default(""), tool: z.literal("create_stock_receipt"), data: genericDocumentCreateSchema }),
+  z.object({ requestId: z.string().default(""), tool: z.literal("create_stock_issue"), data: genericDocumentCreateSchema }),
+  z.object({ requestId: z.string().default(""), tool: z.literal("create_stock_transfer"), data: genericDocumentCreateSchema }),
+  z.object({ requestId: z.string().default(""), tool: z.literal("create_production_document"), data: genericDocumentCreateSchema }),
+  z.object({ requestId: z.string().default(""), tool: z.literal("create_sales_receipt"), data: salesReceiptCreateSchema }),
+  z.object({ requestId: z.string().default(""), tool: z.literal("create_offer"), data: genericDocumentCreateSchema }),
+  z.object({ requestId: z.string().default(""), tool: z.literal("create_enquiry"), data: genericDocumentCreateSchema }),
+  z.object({ requestId: z.string().default(""), tool: z.literal("manage_contract"), data: contractManageSchema }),
+  z.object({ requestId: z.string().default(""), tool: z.literal("manage_centre"), data: centreManageSchema }),
+  z.object({ requestId: z.string().default(""), tool: z.literal("manage_activity"), data: activityManageSchema }),
+  z.object({ requestId: z.string().default(""), tool: z.literal("manage_store"), data: storeManageSchema }),
+  z.object({ requestId: z.string().default(""), tool: z.literal("manage_storage"), data: storageManageSchema }),
+  z.object({ requestId: z.string().default(""), tool: z.literal("manage_bank_account"), data: bankAccountManageSchema }),
+  z.object({ requestId: z.string().default(""), tool: z.literal("manage_group_stock"), data: groupStockManageSchema }),
+  z.object({ requestId: z.string().default(""), tool: z.literal("manage_parameter_definition"), data: parameterDefinitionManageSchema }),
   z.object({ requestId: z.string().default(""), tool: z.literal("print"), data: printSchema })
 ]);
 
@@ -167,7 +552,7 @@ const batchListOperationSchema = z.object({
   requestId: z.string().default(""),
   tool: z.enum(["list_documents", "list_stock", "list_contacts", "list_export_agenda"]),
   agenda: z.string().default("invoice"),
-  invoiceType: z.enum(["", "issuedInvoice", "receivedInvoice"]).default(""),
+  invoiceType: z.enum(["", ...invoiceTypes]).default(""),
   documentType: z.enum(["", "receivedOrder", "issuedOrder", "receivedOffer", "issuedOffer", "receivedEnquiry", "issuedEnquiry"]).default(""),
   id: z.number().int().default(0),
   extId: z.string().default(""),
@@ -216,7 +601,7 @@ const dataExportSpecSchema = z.object({
   requestId: z.string().default(""),
   kind: z.enum(["documents", "stock", "contacts", "export_agenda"]).default("documents"),
   agenda: z.string().default("invoice"),
-  invoiceType: z.enum(["", "issuedInvoice", "receivedInvoice"]).default(""),
+  invoiceType: z.enum(["", ...invoiceTypes]).default(""),
   documentType: z.enum(["", "receivedOrder", "issuedOrder", "receivedOffer", "issuedOffer", "receivedEnquiry", "issuedEnquiry"]).default(""),
   id: z.number().int().default(0),
   dateFrom: z.string().default(""),
@@ -312,7 +697,7 @@ export function registerPohodaTools(server: McpServer, context: PohodaServerCont
     title: "List Pohoda documents",
     inputSchema: {
       agenda: z.enum(documentAgendas),
-      invoiceType: z.enum(["", "issuedInvoice", "receivedInvoice"]).default(""),
+      invoiceType: z.enum(["", ...invoiceTypes]).default(""),
       documentType: z.enum(["", "receivedOrder", "issuedOrder", "receivedOffer", "issuedOffer", "receivedEnquiry", "issuedEnquiry"]).default(""),
       id: z.number().int().default(0),
       extId: z.string().default(""),
@@ -492,21 +877,51 @@ export function registerPohodaTools(server: McpServer, context: PohodaServerCont
     };
   });
 
+  server.registerTool("list_balance", {
+    title: "List Pohoda balance / saldo",
+    description: "Exports POHODA saldo (balance) through lst:listBalanceRequest. Use for open receivables/payables by date; this is read-only and not part of batch_write.",
+    inputSchema: {
+      ...balanceListSchema.shape,
+      databaseId: databaseIdSchema
+    },
+    annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true }
+  }, async ({ databaseId, ...options }) => {
+    const target = await databaseTarget(databaseId);
+    return jsonText(jsonList(assertOk(await client.listBalance(options, "", targetOptions(target))), options.limit));
+  });
+
   server.registerTool("create_invoice", {
     title: "Create Pohoda invoice",
+    description: "Creates one POHODA invoice document. Supports the official invoiceType enum including issued/received invoices, other receivables (receivable), and other liabilities (commitment).",
     inputSchema: {
-      type: z.enum(["issuedInvoice", "receivedInvoice"]), items: z.array(itemSchema).min(1), number: z.string().default(""),
-      partnerName: z.string().default(""), date: z.string().default(""), partnerIco: z.string().default(""), partnerStreet: z.string().default(""),
-      partnerCity: z.string().default(""), partnerZip: z.string().default(""), partnerId: z.number().int().default(0), text: z.string().default(""),
-      symVar: z.string().default(""), dateDue: z.string().default(""), dateTax: z.string().default(""), dateAccounting: z.string().default(""),
-      paymentType: z.string().default(""), accountIds: z.string().default(""), accounting: z.string().default(""),
-      classificationVAT: z.string().default(""), centre: z.string().default(""), activity: z.string().default(""), contract: z.string().default(""),
-      currency: z.string().default(""), currencyRate: z.number().default(0), note: z.string().default(""), intNote: z.string().default(""),
+      ...invoiceCreateSchema.shape,
       dataPackId: z.string().default(""), databaseId: databaseIdSchema
     },
     annotations: { destructiveHint: false, idempotentHint: false, openWorldHint: true }
   }, async ({ items, dataPackId, databaseId, ...header }) =>
     jsonResult(assertOk(await client.createInvoice(header, items, dataPackId, targetOptions(await databaseTarget(databaseId))))));
+
+  server.registerTool("create_other_liability", {
+    title: "Create Pohoda other liability",
+    description: "Creates one Ostatni zavazek using inv:invoice with invoiceType=commitment. Use this for other payables/liabilities instead of raw XML.",
+    inputSchema: {
+      ...otherLiabilityCreateSchema.shape,
+      dataPackId: z.string().default(""), databaseId: databaseIdSchema
+    },
+    annotations: { destructiveHint: false, idempotentHint: false, openWorldHint: true }
+  }, async ({ items, dataPackId, databaseId, ...header }) =>
+    jsonResult(assertOk(await client.createOtherLiability(header, items, dataPackId, targetOptions(await databaseTarget(databaseId))))));
+
+  server.registerTool("create_other_receivable", {
+    title: "Create Pohoda other receivable",
+    description: "Creates one Ostatni pohledavka using inv:invoice with invoiceType=receivable. Use this for other receivables instead of raw XML.",
+    inputSchema: {
+      ...otherLiabilityCreateSchema.shape,
+      dataPackId: z.string().default(""), databaseId: databaseIdSchema
+    },
+    annotations: { destructiveHint: false, idempotentHint: false, openWorldHint: true }
+  }, async ({ items, dataPackId, databaseId, ...header }) =>
+    jsonResult(assertOk(await client.createOtherReceivable(header, items, dataPackId, targetOptions(await databaseTarget(databaseId))))));
 
   server.registerTool("create_address", {
     title: "Create Pohoda contact",
@@ -517,6 +932,28 @@ export function registerPohodaTools(server: McpServer, context: PohodaServerCont
     annotations: { destructiveHint: false, idempotentHint: false, openWorldHint: true }
   }, async ({ dataPackId, databaseId, ...data }) =>
     jsonResult(assertOk(await client.createAddress(data, dataPackId, targetOptions(await databaseTarget(databaseId))))));
+
+  server.registerTool("create_cash_voucher", {
+    title: "Create Pohoda cash voucher",
+    description: "Creates one cash register document (Pokladna) using vch:voucher. Use type=receipt for income cash receipts and type=expense for cash expenses.",
+    inputSchema: {
+      ...cashVoucherCreateSchema.shape,
+      dataPackId: z.string().default(""), databaseId: databaseIdSchema
+    },
+    annotations: { destructiveHint: false, idempotentHint: false, openWorldHint: true }
+  }, async ({ items, dataPackId, databaseId, ...header }) =>
+    jsonResult(assertOk(await client.createCashVoucher(header, items, dataPackId, targetOptions(await databaseTarget(databaseId))))));
+
+  server.registerTool("manage_activity", {
+    title: "Manage Pohoda activity",
+    description: "Adds, updates, or deletes a Cinnost/Activity record. POHODA update/delete filters for activities support numeric id, so use list_export_agenda(agenda=activity) first when you only know the code/name.",
+    inputSchema: {
+      ...activityManageSchema.shape,
+      dataPackId: z.string().default(""), databaseId: databaseIdSchema
+    },
+    annotations: { destructiveHint: true, idempotentHint: false, openWorldHint: true }
+  }, async ({ action, matchId, dataPackId, databaseId, ...data }) =>
+    jsonResult(assertOk(await client.manageActivity(action, data, { id: matchId || data.id }, dataPackId, targetOptions(await databaseTarget(databaseId))))));
 
   server.registerTool("batch_create_invoices", {
     title: "Batch create Pohoda invoices with optional contacts",
@@ -555,7 +992,7 @@ export function registerPohodaTools(server: McpServer, context: PohodaServerCont
 
   server.registerTool("batch_write", {
     title: "Batch multiple Pohoda write/output operations",
-    description: "Runs multiple typed write/output operations for one accounting unit in a single POHODA /XML process by packing them into one dataPack. Use this for mixed creates such as contacts, invoices, stock, orders, and print jobs instead of repeated single-write calls.",
+    description: "Runs multiple typed write/output operations for one accounting unit in a single POHODA /XML process by packing them into one dataPack. Use this for mixed creates such as contacts, invoices, other liabilities/receivables, cash vouchers, activities, stock, orders, and print jobs instead of repeated single-write calls.",
     inputSchema: {
       operations: z.array(batchWriteOperationSchema).min(1).max(100),
       dataPackId: z.string().default(""),
@@ -606,6 +1043,156 @@ export function registerPohodaTools(server: McpServer, context: PohodaServerCont
   }, async ({ items, dataPackId, databaseId, ...header }) =>
     jsonResult(assertOk(await client.createOrder(header, items, dataPackId, targetOptions(await databaseTarget(databaseId))))));
 
+  server.registerTool("manage_address", {
+    title: "Manage Pohoda contact",
+    description: "Adds, updates, or deletes an addressbook contact. Use create_address for simple adds; use this when updating/deleting by id, extId, ICO, company, or code-like filters.",
+    inputSchema: {
+      ...addressManageSchema.shape,
+      dataPackId: z.string().default(""), databaseId: databaseIdSchema
+    },
+    annotations: { destructiveHint: true, idempotentHint: false, openWorldHint: true }
+  }, async ({ action, match, dataPackId, databaseId, ...data }) =>
+    jsonResult(assertOk(await client.manageAddress(action, data, match, dataPackId, targetOptions(await databaseTarget(databaseId))))));
+
+  server.registerTool("manage_stock", {
+    title: "Manage Pohoda stock item",
+    description: "Adds, updates, or deletes one stock card. Use action=update/delete with match.id, match.extId+extSystemName, or match.code after listing stock.",
+    inputSchema: {
+      ...stockManageSchema.shape,
+      dataPackId: z.string().default(""), databaseId: databaseIdSchema
+    },
+    annotations: { destructiveHint: true, idempotentHint: false, openWorldHint: true }
+  }, async ({ action, match, dataPackId, databaseId, ...data }) =>
+    jsonResult(assertOk(await client.manageStock(action, data, match, dataPackId, targetOptions(await databaseTarget(databaseId))))));
+
+  server.registerTool("create_bank_document", {
+    title: "Create Pohoda bank document",
+    description: "Creates one Banka document (bnk:bank) with header, items, VAT/accounting fields, partner, symbols, and optional schema-specific extraHeader/extraItem fields.",
+    inputSchema: { ...genericDocumentCreateSchema.shape, dataPackId: z.string().default(""), databaseId: databaseIdSchema },
+    annotations: { destructiveHint: false, idempotentHint: false, openWorldHint: true }
+  }, async ({ items, dataPackId, databaseId, ...header }) =>
+    jsonResult(assertOk(await client.createBankDocument(header, items, dataPackId, targetOptions(await databaseTarget(databaseId))))));
+
+  server.registerTool("create_internal_document", {
+    title: "Create Pohoda internal document",
+    description: "Creates one Interni doklad (int:intDoc) with accounting, VAT, activity/centre/contract, partner, summary, and optional parameters.",
+    inputSchema: { ...genericDocumentCreateSchema.shape, dataPackId: z.string().default(""), databaseId: databaseIdSchema },
+    annotations: { destructiveHint: false, idempotentHint: false, openWorldHint: true }
+  }, async ({ items, dataPackId, databaseId, ...header }) =>
+    jsonResult(assertOk(await client.createInternalDocument(header, items, dataPackId, targetOptions(await databaseTarget(databaseId))))));
+
+  server.registerTool("create_stock_receipt", {
+    title: "Create Pohoda stock receipt",
+    description: "Creates one Prijemka (pri:prijemka) stock receipt. Use stockCode/stockId on items and batch it with address/stock setup when needed.",
+    inputSchema: { ...genericDocumentCreateSchema.shape, dataPackId: z.string().default(""), databaseId: databaseIdSchema },
+    annotations: { destructiveHint: false, idempotentHint: false, openWorldHint: true }
+  }, async ({ items, dataPackId, databaseId, ...header }) =>
+    jsonResult(assertOk(await client.createStockReceipt(header, items, dataPackId, targetOptions(await databaseTarget(databaseId))))));
+
+  server.registerTool("create_stock_issue", {
+    title: "Create Pohoda stock issue",
+    description: "Creates one Vydejka (vyd:vydejka) stock issue. Use stockCode/stockId on items; stock availability is validated by POHODA.",
+    inputSchema: { ...genericDocumentCreateSchema.shape, dataPackId: z.string().default(""), databaseId: databaseIdSchema },
+    annotations: { destructiveHint: false, idempotentHint: false, openWorldHint: true }
+  }, async ({ items, dataPackId, databaseId, ...header }) =>
+    jsonResult(assertOk(await client.createStockIssue(header, items, dataPackId, targetOptions(await databaseTarget(databaseId))))));
+
+  server.registerTool("create_stock_transfer", {
+    title: "Create Pohoda stock transfer",
+    description: "Creates one Prevodka (pre:prevodka) transfer between stores/storage. Use sourceStore/destinationStore or extraHeader/extraItem for agenda-specific fields.",
+    inputSchema: { ...genericDocumentCreateSchema.shape, dataPackId: z.string().default(""), databaseId: databaseIdSchema },
+    annotations: { destructiveHint: false, idempotentHint: false, openWorldHint: true }
+  }, async ({ items, dataPackId, databaseId, ...header }) =>
+    jsonResult(assertOk(await client.createStockTransfer(header, items, dataPackId, targetOptions(await databaseTarget(databaseId))))));
+
+  server.registerTool("create_production_document", {
+    title: "Create Pohoda production document",
+    description: "Creates one Vyroba (vyr:vyroba) production document. Use stockCode/stockId items and extraItem for production-list details when needed.",
+    inputSchema: { ...genericDocumentCreateSchema.shape, dataPackId: z.string().default(""), databaseId: databaseIdSchema },
+    annotations: { destructiveHint: false, idempotentHint: false, openWorldHint: true }
+  }, async ({ items, dataPackId, databaseId, ...header }) =>
+    jsonResult(assertOk(await client.createProductionDocument(header, items, dataPackId, targetOptions(await databaseTarget(databaseId))))));
+
+  server.registerTool("create_sales_receipt", {
+    title: "Create Pohoda sales receipt",
+    description: "Creates one Prodejka (pro:prodejka) POS/sales receipt, including receipt items and optional payment items.",
+    inputSchema: { ...salesReceiptCreateSchema.shape, dataPackId: z.string().default(""), databaseId: databaseIdSchema },
+    annotations: { destructiveHint: false, idempotentHint: false, openWorldHint: true }
+  }, async ({ items, payments, dataPackId, databaseId, ...header }) =>
+    jsonResult(assertOk(await client.createSalesReceipt(header, items, payments, dataPackId, targetOptions(await databaseTarget(databaseId))))));
+
+  server.registerTool("create_offer", {
+    title: "Create Pohoda offer",
+    description: "Creates one Nabidka (ofr:offer). Set type to issuedOffer/receivedOffer when needed; supports items, partner, validity, summary, activity/centre/contract.",
+    inputSchema: { ...genericDocumentCreateSchema.shape, dataPackId: z.string().default(""), databaseId: databaseIdSchema },
+    annotations: { destructiveHint: false, idempotentHint: false, openWorldHint: true }
+  }, async ({ items, dataPackId, databaseId, ...header }) =>
+    jsonResult(assertOk(await client.createOffer(header, items, dataPackId, targetOptions(await databaseTarget(databaseId))))));
+
+  server.registerTool("create_enquiry", {
+    title: "Create Pohoda enquiry",
+    description: "Creates one Poptavka (enq:enquiry). Set type to issuedEnquiry/receivedEnquiry when needed; supports items, partner, validity, activity/centre/contract.",
+    inputSchema: { ...genericDocumentCreateSchema.shape, dataPackId: z.string().default(""), databaseId: databaseIdSchema },
+    annotations: { destructiveHint: false, idempotentHint: false, openWorldHint: true }
+  }, async ({ items, dataPackId, databaseId, ...header }) =>
+    jsonResult(assertOk(await client.createEnquiry(header, items, dataPackId, targetOptions(await databaseTarget(databaseId))))));
+
+  server.registerTool("manage_contract", {
+    title: "Manage Pohoda contract",
+    description: "Creates one Zakazka/contract (con:contract) with contractDesc and optional contractPlan items. Use before documents that reference a contract.",
+    inputSchema: { ...contractManageSchema.shape, dataPackId: z.string().default(""), databaseId: databaseIdSchema },
+    annotations: { destructiveHint: false, idempotentHint: false, openWorldHint: true }
+  }, async ({ planItems, dataPackId, databaseId, ...data }) =>
+    jsonResult(assertOk(await client.manageContract(data, planItems, dataPackId, targetOptions(await databaseTarget(databaseId))))));
+
+  server.registerTool("manage_centre", {
+    title: "Manage Pohoda centre",
+    description: "Adds, updates, or deletes one Stredisko/Centre codebook record. Update/delete should use match.id when possible.",
+    inputSchema: { ...centreManageSchema.shape, dataPackId: z.string().default(""), databaseId: databaseIdSchema },
+    annotations: { destructiveHint: true, idempotentHint: false, openWorldHint: true }
+  }, async ({ action, match, dataPackId, databaseId, ...data }) =>
+    jsonResult(assertOk(await client.manageCentre(action, data, match, dataPackId, targetOptions(await databaseTarget(databaseId))))));
+
+  server.registerTool("manage_store", {
+    title: "Manage Pohoda store",
+    description: "Creates/imports one POHODA store/warehouse setup record (sto:store). This is an administrative setup tool and can be batched with other setup writes.",
+    inputSchema: { ...storeManageSchema.shape, dataPackId: z.string().default(""), databaseId: databaseIdSchema },
+    annotations: { destructiveHint: false, idempotentHint: false, openWorldHint: true }
+  }, async ({ dataPackId, databaseId, ...data }) =>
+    jsonResult(assertOk(await client.manageStore(data, dataPackId, targetOptions(await databaseTarget(databaseId))))));
+
+  server.registerTool("manage_storage", {
+    title: "Manage Pohoda storage tree",
+    description: "Imports POHODA storage classification/tree entries (str:storage). Pass storages for multiple roots or code/name/subStorages for one root.",
+    inputSchema: { ...storageManageSchema.shape, dataPackId: z.string().default(""), databaseId: databaseIdSchema },
+    annotations: { destructiveHint: false, idempotentHint: false, openWorldHint: true }
+  }, async ({ dataPackId, databaseId, ...data }) =>
+    jsonResult(assertOk(await client.manageStorage(data, dataPackId, targetOptions(await databaseTarget(databaseId))))));
+
+  server.registerTool("manage_bank_account", {
+    title: "Manage Pohoda bank account",
+    description: "Adds a POHODA bank account (bka:bankAccount). The current official schema exposes add; ids, numberAccount, and codeBank are required.",
+    inputSchema: { ...bankAccountManageSchema.shape, dataPackId: z.string().default(""), databaseId: databaseIdSchema },
+    annotations: { destructiveHint: true, idempotentHint: false, openWorldHint: true }
+  }, async ({ action, match, dataPackId, databaseId, ...data }) =>
+    jsonResult(assertOk(await client.manageBankAccount(action, data, match, dataPackId, targetOptions(await databaseTarget(databaseId))))));
+
+  server.registerTool("manage_group_stock", {
+    title: "Manage Pohoda stock group",
+    description: "Adds, updates, or deletes a stock group (grs:groupStocks), optionally with stock variants. Batch after creating referenced stock cards.",
+    inputSchema: { ...groupStockManageSchema.shape, dataPackId: z.string().default(""), databaseId: databaseIdSchema },
+    annotations: { destructiveHint: true, idempotentHint: false, openWorldHint: true }
+  }, async ({ action, variants, match, dataPackId, databaseId, ...data }) =>
+    jsonResult(assertOk(await client.manageGroupStock(action, data, variants, match, dataPackId, targetOptions(await databaseTarget(databaseId))))));
+
+  server.registerTool("manage_parameter_definition", {
+    title: "Manage Pohoda optional parameter definition",
+    description: "Imports optional parameter definitions (prm:parameter) for a POHODA agenda. This is advanced setup; prefer typed fields unless defining custom agenda parameters.",
+    inputSchema: { ...parameterDefinitionManageSchema.shape, dataPackId: z.string().default(""), databaseId: databaseIdSchema },
+    annotations: { destructiveHint: true, idempotentHint: false, openWorldHint: true }
+  }, async ({ dataPackId, databaseId, ...data }) =>
+    jsonResult(assertOk(await client.manageParameterDefinition(data, dataPackId, targetOptions(await databaseTarget(databaseId))))));
+
   server.registerTool("print", {
     title: "Print Pohoda record",
     inputSchema: {
@@ -643,7 +1230,7 @@ export function registerPohodaTools(server: McpServer, context: PohodaServerCont
     inputSchema: {
       kind: z.enum(["documents", "stock", "contacts", "export_agenda"]).default("documents"),
       agenda: z.string().default("invoice"),
-      invoiceType: z.enum(["", "issuedInvoice", "receivedInvoice"]).default(""),
+      invoiceType: z.enum(["", ...invoiceTypes]).default(""),
       documentType: z.enum(["", "receivedOrder", "issuedOrder", "receivedOffer", "issuedOffer", "receivedEnquiry", "issuedEnquiry"]).default(""),
       id: z.number().int().default(0),
       dateFrom: z.string().default(""),
@@ -839,23 +1426,7 @@ export function registerPohodaTools(server: McpServer, context: PohodaServerCont
    * Tools should target accounting units with explicit databaseId values; the client
    * default is now only a configured fallback for simple single-company setups.
    */
-  async function createExportSnapshot(args: {
-    kind: "documents" | "stock" | "contacts" | "export_agenda";
-    agenda: string;
-    invoiceType: "" | "issuedInvoice" | "receivedInvoice";
-    documentType: "" | "receivedOrder" | "issuedOrder" | "receivedOffer" | "issuedOffer" | "receivedEnquiry" | "issuedEnquiry";
-    id: number;
-    dateFrom: string;
-    dateTill: string;
-    company: string;
-    ico: string;
-    number: string;
-    lastChanges: string;
-    queryFilter: string;
-    userFilterName: string;
-    pageSize: number;
-    maxRecords: number;
-  }, target: DatabaseTarget): Promise<ExportSnapshot> {
+  async function createExportSnapshot(args: Omit<z.infer<typeof dataExportSpecSchema>, "requestId" | "previewLimit"> & Partial<Pick<z.infer<typeof dataExportSpecSchema>, "requestId" | "previewLimit">>, target: DatabaseTarget): Promise<ExportSnapshot> {
     const plan = exportPlan(args);
     if (args.kind === "export_agenda") {
       assertExportAgendaFilters(args.agenda, {
@@ -1036,11 +1607,12 @@ function registerResources(server: McpServer, context: PohodaServerContext): voi
       listing: {
         targetDatabase: "For accounting-unit-specific tools, pass databaseId explicitly using a registry id or exact POHODA database name. POHODA validates dat:dataPack ico against the selected unit, so prefer registry/live discovery rows that include ICO; direct database filenames must contain an 8-digit ICO or match live discovery. current_database only shows the configured fallback; there is no select_database step. If databaseId is omitted and no default database is configured, the tool fails before running POHODA.",
         use: {
-          list_documents: "Transactional documents; invoice requires invoiceType, order requires documentType.",
+          list_documents: "Transactional documents; invoice requires invoiceType, order requires documentType. Use invoiceType=commitment for Ostatni zavazky, invoiceType=receivable for Ostatni pohledavky, and agenda=voucher for Pokladna cash documents.",
           list_stock: "Stock cards and inventory items.",
           list_contacts: "Address book records.",
-          list_export_agenda: "Read-only codebooks/reference lists.",
-          batch_list_records: "Several read/list requests for one accounting unit in a single POHODA /XML run."
+          list_export_agenda: "Read-only codebooks/reference lists. Use agenda=activity to find Cinnosti ids before update/delete.",
+          batch_list_records: "Several read/list requests for one accounting unit in a single POHODA /XML run.",
+          list_balance: "Saldo/balance export for open receivables/payables by date and pairing mode."
         },
         efficiency: "Tools default server-side count to limit. Increase count only when needed; use idFrom for paging.",
         filters: "Prefer explicit filters first. extId requires extSystemName."
@@ -1048,16 +1620,39 @@ function registerResources(server: McpServer, context: PohodaServerContext): voi
       writing: {
         use: {
           create_invoice: "One invoice.",
+          create_other_liability: "One Ostatni zavazek; typed invoice XML with invoiceType=commitment.",
+          create_other_receivable: "One Ostatni pohledavka; typed invoice XML with invoiceType=receivable.",
+          create_cash_voucher: "One Pokladna cash receipt/expense; type=receipt or expense, cashAccount is required.",
+          manage_activity: "Add/update/delete one Cinnost. Update/delete require numeric POHODA id as matchId/id.",
           create_address: "One addressbook contact.",
+          manage_address: "Add/update/delete one addressbook contact with action filters.",
           create_stock: "One stock card.",
+          manage_stock: "Add/update/delete one stock card with id/extId/code matching.",
           create_order: "One order.",
+          create_bank_document: "One Banka document.",
+          create_internal_document: "One Interni doklad.",
+          create_stock_receipt: "One Prijemka warehouse receipt.",
+          create_stock_issue: "One Vydejka warehouse issue.",
+          create_stock_transfer: "One Prevodka warehouse transfer.",
+          create_production_document: "One Vyroba production document.",
+          create_sales_receipt: "One Prodejka sales/POS receipt.",
+          create_offer: "One Nabidka.",
+          create_enquiry: "One Poptavka.",
+          manage_contract: "One Zakazka/contract with optional plan items.",
+          manage_centre: "Add/update/delete one Stredisko/Centre.",
+          manage_store: "Create/import one store/warehouse setup record.",
+          manage_storage: "Import storage classification/tree nodes.",
+          manage_bank_account: "Add one bank account setup record; delete is not exposed by the current official schema.",
+          manage_group_stock: "Add/update/delete stock groups and variants.",
+          manage_parameter_definition: "Advanced optional parameter definitions for an agenda.",
           print: "One print/PDF/email output job.",
           batch_write: "Several typed write/output operations for one accounting unit in a single POHODA /XML run.",
           batch_create_invoices: "Convenience tool for several invoices, optionally with one addressbook contact before each invoice, in a single POHODA /XML run."
         },
-        efficiency: "Use batch_write whenever you need more than one write/output operation in the same accounting unit. Use batch_create_invoices for repeated contact+invoice workflows. Both avoid paying Pohoda.exe startup once per item while preserving per-operation results.",
+        efficiency: "Use batch_write whenever you need more than one write/output operation in the same accounting unit, including mixed contacts, invoices, cash vouchers, activities, stock/order management, bank/internal/warehouse/production/sales receipt documents, offers, enquiries, contracts, centres, stores/storage, bank accounts, stock groups, parameter definitions, and print jobs. Use batch_create_invoices for repeated contact+invoice workflows. Both avoid paying Pohoda.exe startup once per item while preserving per-operation results.",
         ordering: "Operations run in the order supplied inside one dataPack. For batch_create_invoices, when createAddress is true, each contact is placed immediately before its invoice.",
-        parallelism: "Do not mix accounting units in one batch. Send one batch per database; different database batches can run in parallel through the transport queue."
+        parallelism: "Do not mix accounting units in one batch. Send one batch per database; different database batches can run in parallel through the transport queue.",
+        extras: "Broad document/setup tools expose typed common fields plus extraHeader, extraItem, extraData, or similar advanced fragments. Prefer typed fields; use extra fragments only with already-prefixed XML-object keys from the official POHODA schema."
       },
       xmlTransport: {
         queueing: "Same-database calls are serialized with a per-database lock. Different databases run in parallel up to the process cap.",
@@ -1598,7 +2193,10 @@ function batchWriteOperationPlan(args: z.infer<typeof batchWriteOperationSchema>
   operation: Parameters<PohodaClient["writeBatch"]>[0][number];
 } {
   const requestId = args.requestId !== "" ? args.requestId : `${args.tool}-${index + 1}`;
-  if (args.tool === "create_invoice") {
+  if (args.tool === "create_address" || args.tool === "create_stock") {
+    return { requestId, tool: args.tool, operation: { requestId, tool: args.tool, data: args.data } };
+  }
+  if (args.tool === "create_invoice" || args.tool === "create_cash_voucher" || args.tool === "create_other_liability" || args.tool === "create_other_receivable") {
     const { items, ...header } = args.data;
     return { requestId, tool: args.tool, operation: { requestId, tool: args.tool, header, items } };
   }
@@ -1606,10 +2204,58 @@ function batchWriteOperationPlan(args: z.infer<typeof batchWriteOperationSchema>
     const { items, ...header } = args.data;
     return { requestId, tool: args.tool, operation: { requestId, tool: args.tool, header, items } };
   }
+  if ([
+    "create_bank_document",
+    "create_internal_document",
+    "create_stock_receipt",
+    "create_stock_issue",
+    "create_stock_transfer",
+    "create_production_document",
+    "create_offer",
+    "create_enquiry"
+  ].includes(args.tool)) {
+    const { items, ...header } = args.data as z.infer<typeof genericDocumentCreateSchema>;
+    return { requestId, tool: args.tool, operation: { requestId, tool: args.tool as any, header, items } };
+  }
+  if (args.tool === "create_sales_receipt") {
+    const { items, payments, ...header } = args.data;
+    return { requestId, tool: args.tool, operation: { requestId, tool: args.tool, header, items, payments } };
+  }
+  if (args.tool === "manage_address") {
+    const { action, match, ...data } = args.data;
+    return { requestId, tool: args.tool, operation: { requestId, tool: args.tool, action, data, match } };
+  }
+  if (args.tool === "manage_stock") {
+    const { action, match, ...data } = args.data;
+    return { requestId, tool: args.tool, operation: { requestId, tool: args.tool, action, data, match } };
+  }
+  if (args.tool === "manage_contract") {
+    const { planItems, ...data } = args.data;
+    return { requestId, tool: args.tool, operation: { requestId, tool: args.tool, data, planItems } };
+  }
+  if (args.tool === "manage_centre") {
+    const { action, match, ...data } = args.data;
+    return { requestId, tool: args.tool, operation: { requestId, tool: args.tool, action, data, match } };
+  }
   if (args.tool === "print") {
     return { requestId, tool: args.tool, operation: { requestId, tool: args.tool, options: args.data } };
   }
-  return { requestId, tool: args.tool, operation: { requestId, tool: args.tool, data: args.data } };
+  if (args.tool === "manage_activity") {
+    const { action, matchId, ...data } = args.data;
+    return { requestId, tool: args.tool, operation: { requestId, tool: args.tool, action, data, match: { id: matchId || data.id } } };
+  }
+  if (args.tool === "manage_bank_account") {
+    const { action, match, ...data } = args.data;
+    return { requestId, tool: args.tool, operation: { requestId, tool: args.tool, action, data, match } };
+  }
+  if (args.tool === "manage_group_stock") {
+    const { action, variants, match, ...data } = args.data;
+    return { requestId, tool: args.tool, operation: { requestId, tool: args.tool, action, data, variants, match } };
+  }
+  if (args.tool === "manage_store" || args.tool === "manage_storage" || args.tool === "manage_parameter_definition") {
+    return { requestId, tool: args.tool, operation: { requestId, tool: args.tool, data: args.data } };
+  }
+  throw new Error(`Unsupported batch_write operation: ${args.tool}`);
 }
 
 function compactBatchWriteResult(plan: ReturnType<typeof batchWriteOperationPlan>, item: Record<string, any> | undefined): Record<string, any> {

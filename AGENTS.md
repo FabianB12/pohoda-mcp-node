@@ -47,6 +47,11 @@ Use the smallest useful query:
 
 - For invoices and documents, use `list_documents` with `invoiceType`, dates, number,
   ICO, company, or id filters.
+- For cash register documents, use `list_documents` with `agenda: "voucher"`; create
+  them with `create_cash_voucher` instead of raw XML.
+- For other receivables/liabilities, use `list_documents` with `agenda: "invoice"` and
+  `invoiceType: "receivable"` or `invoiceType: "commitment"`.
+- For activities (Cinnosti), use `list_export_agenda` with `agenda: "activity"`.
 - For contacts, use `list_contacts`.
 - For stock, use `list_stock`.
 - For reference/codebook data, use `list_export_agenda`.
@@ -76,8 +81,29 @@ When doing more than one write/output operation in the same accounting unit, use
 
 - `create_address`
 - `create_invoice`
+- `create_other_liability`
+- `create_other_receivable`
+- `create_cash_voucher`
+- `manage_activity`
 - `create_stock`
+- `manage_stock`
 - `create_order`
+- `create_bank_document`
+- `create_internal_document`
+- `create_stock_receipt`
+- `create_stock_issue`
+- `create_stock_transfer`
+- `create_production_document`
+- `create_sales_receipt`
+- `create_offer`
+- `create_enquiry`
+- `manage_contract`
+- `manage_centre`
+- `manage_store`
+- `manage_storage`
+- `manage_bank_account`
+- `manage_group_stock`
+- `manage_parameter_definition`
 - `print`
 
 For repeated invoice creation where each invoice may need a new contact, prefer
@@ -90,6 +116,37 @@ but same-unit operations are intentionally serialized to avoid unsafe POHODA con
 After important writes, verify with fresh list calls or a compact export. Treat POHODA
 warnings as important: an `ok` response may still include adjusted fields such as default
 accounting, VAT classification, payment type, or account.
+
+Use `create_cash_voucher` for normal Pokladna receipts/expenses. Set `type` to `receipt`
+for cash income and `expense` for cash expense, pass the POHODA cash register in
+`cashAccount`, and include activity/centre/contract/accounting/VAT fields when needed.
+
+Use `create_other_liability` for Ostatni zavazky and `create_other_receivable` for
+Ostatni pohledavky. These are invoice XML documents with fixed `invoiceType`
+`commitment`/`receivable`, so they support the same item, partner, activity, centre,
+contract, payment, VAT, and foreign-currency fields as `create_invoice`.
+
+Use `manage_activity` for Cinnosti. `action: "add"` creates an activity. For
+`update`/`delete`, first list activities and pass the numeric POHODA `id` as `matchId`
+or `id`; the official POHODA action filter for activities is id-based.
+
+Use native tools instead of raw XML for the common POHODA agendas: bank documents,
+internal documents, warehouse receipts/issues/transfers/production, sales receipts,
+offers, enquiries, contracts, centres, stores/storage, bank accounts, stock groups,
+and optional parameter definitions. These tools support batching through
+`batch_write`; keep dependencies in order inside the batch, e.g. contact/stock setup
+before documents that reference them.
+
+For stock creation, POHODA company settings may require both `storage` and `typePrice`
+(`stk:storage` and `stk:typePrice`). Prefer copying these from an existing stock card
+when creating test/demo stock.
+
+Most broad document tools expose normal header/item fields plus `extraHeader`,
+`extraItem`, and `extraData` for rare POHODA XSD fields. Use those only with
+already-prefixed XML-object keys from the official schema; prefer the typed fields first.
+
+Use `list_balance` for Saldo/balance exports. It is read-only and separate from
+`batch_write`.
 
 ## Printing, PDFs, and Email
 

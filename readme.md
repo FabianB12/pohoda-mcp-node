@@ -144,6 +144,7 @@ Read tools:
 - `list_contacts`
 - `list_export_agenda`
 - `batch_list_records`
+- `list_balance`
 
 Large/export tools:
 
@@ -156,11 +157,33 @@ Large/export tools:
 Write tools:
 
 - `create_invoice`
+- `create_other_liability`
+- `create_other_receivable`
+- `create_cash_voucher`
+- `manage_activity`
 - `batch_write`
 - `batch_create_invoices`
 - `create_order`
 - `create_address`
+- `manage_address`
 - `create_stock`
+- `manage_stock`
+- `create_bank_document`
+- `create_internal_document`
+- `create_stock_receipt`
+- `create_stock_issue`
+- `create_stock_transfer`
+- `create_production_document`
+- `create_sales_receipt`
+- `create_offer`
+- `create_enquiry`
+- `manage_contract`
+- `manage_centre`
+- `manage_store`
+- `manage_storage`
+- `manage_bank_account`
+- `manage_group_stock`
+- `manage_parameter_definition`
 
 Print/output:
 
@@ -179,8 +202,40 @@ requests from the same accounting unit. The MCP packs them into one POHODA `data
 runs one `/XML` process, and returns per-operation results.
 
 Use `batch_write` when doing several typed write/output operations in the same accounting
-unit. It supports `create_address`, `create_invoice`, `create_stock`, `create_order`,
-and `print` operations in one POHODA `dataPack`, returning per-operation results.
+unit. It supports `create_address`, `create_invoice`, `create_other_liability`,
+`create_other_receivable`, `create_cash_voucher`, `manage_activity`, `create_stock`,
+`manage_stock`, `create_order`, bank/internal/warehouse/production/sales receipt
+documents, offers, enquiries, contracts, centres, stores/storage, bank accounts, stock
+groups, parameter definitions, and `print` operations in one POHODA
+`dataPack`, returning per-operation results.
+
+For stock creation, some POHODA company settings require `storage` and `typePrice`.
+Use values from an existing stock card when unsure.
+
+Use `create_cash_voucher` for Pokladna cash receipts/expenses. Set `type` to `receipt`
+or `expense`, pass the target POHODA cash register as `cashAccount`, and use item/header
+fields such as accounting, VAT classification, centre, activity, contract, partner, and
+foreign currency when needed.
+
+Use `create_other_liability` for Ostatni zavazky and `create_other_receivable` for
+Ostatni pohledavky. They are typed wrappers around POHODA invoice XML with fixed
+`invoiceType` values `commitment` and `receivable`.
+
+Use `manage_activity` for Cinnosti. `add` creates a record; `update` and `delete`
+require the numeric POHODA activity id, so list `activity` first when you only know a
+code or name.
+
+Use the native agenda tools instead of `raw_xml` for common POHODA work: `create_bank_document`
+for Banka, `create_internal_document` for Interni doklady, `create_stock_receipt`/`create_stock_issue`/
+`create_stock_transfer`/`create_production_document` for warehouse flows, `create_sales_receipt`
+for Prodejky, `create_offer`, `create_enquiry`, `manage_contract`, `manage_centre`,
+`manage_store`, `manage_storage`, `manage_bank_account`, `manage_group_stock`,
+and `manage_parameter_definition`. Broad document tools accept
+normal header/item fields plus `extraHeader`, `extraItem`, and `extraData` for rare
+schema-specific fields using already-prefixed XML-object keys.
+
+Use `list_balance` for Saldo/balance exports with `dateTo`, `pairing`, paging limits,
+and optional user filters.
 
 Use `batch_create_invoices` for the common invoice-heavy workflow. It can place an
 addressbook item immediately before each invoice in one POHODA `dataPack`, so a workflow
@@ -273,10 +328,20 @@ installation.
 ### UTM POHODA Validation
 
 When POHODA runs in a UTM Windows VM, the opt-in integration test can execute real
-`Pohoda.exe /XML` jobs through `utmctl`:
+`Pohoda.exe /XML` jobs through `utmctl`. The default UTM run is intentionally a
+small smoke test so normal validation stays fast:
 
 ```bash
-POHODA_UTM_VM=Windows npm run test:integration:utm
+npm run test:integration:utm
+```
+
+Use the larger suites only when changing agenda coverage, XML transport behavior, or
+POHODA-specific schemas:
+
+```bash
+npm run test:integration:utm:mutation
+npm run test:integration:utm:full
+npm run test:integration:utm:full:mutation
 ```
 
 Optional variables:
@@ -288,12 +353,16 @@ Optional variables:
 | `POHODA_UTM_USERNAME` / `POHODA_UTM_PASSWORD` | POHODA credentials in the VM | `Admin` / empty |
 | `POHODA_UTM_ICO` | Demo/company ICO | `12345678` |
 | `POHODA_UTM_DATABASE` | Explicit database selector; otherwise discovered live | empty |
-| `POHODA_UTM_MUTATION` | Also run demo-marked create tests | `0` |
+| `POHODA_UTM_MUTATION` | Also run the demo-marked write smoke test | `0` |
+| `POHODA_UTM_FULL` | Run the exhaustive live suite instead of only smoke coverage | `0` |
 
-The safe integration pass covers accounting-unit discovery, every supported read/list
-agenda, safe raw XML, safe raw XML batch, and same-database queue serialization. With
-`POHODA_UTM_MUTATION=1`, it also creates uniquely marked demo address, stock, order,
-and invoice records.
+The default safe pass covers accounting-unit discovery, a core stock read,
+batched stock/contact reads, and persisted invoice export paging. With
+`POHODA_UTM_MUTATION=1`, it creates uniquely marked demo address, stock, order,
+and invoice records in one batch. The full pass adds every supported read/list
+agenda, safe raw XML, safe raw XML batch, export resource checks, same-database queue
+serialization, broad native writes, setup/admin writes, operational stock/cash/bank
+documents, production, sales receipts, and print probing.
 
 Run a real benchmark with:
 

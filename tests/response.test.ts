@@ -38,6 +38,21 @@ describe("PohodaResponse", () => {
     expect(response.items[0]?.data.importDetails.detail.errno).toBe("123");
   });
 
+  it("treats nested agenda response errors as failed items", () => {
+    const xml = '<?xml version="1.0" encoding="Windows-1250"?>'
+      + '<rsp:responsePack version="2.0" id="t1" state="ok" xmlns:rsp="http://www.stormware.cz/schema/version_2/response.xsd" xmlns:str="http://www.stormware.cz/schema/version_2/storage.xsd" xmlns:rdc="http://www.stormware.cz/schema/version_2/documentresponse.xsd">'
+      + '<rsp:responsePackItem version="2.0" id="storage" state="ok">'
+      + '<str:storageResponse version="2.0" state="error">'
+      + '<rdc:importDetails><rdc:detail><rdc:state>error</rdc:state><rdc:note>Nested failure</rdc:note></rdc:detail></rdc:importDetails>'
+      + '</str:storageResponse>'
+      + '</rsp:responsePackItem>'
+      + '</rsp:responsePack>';
+
+    const response = new PohodaResponse(xml);
+    expect(response.items[0]?.isOk()).toBe(false);
+    expect(response.isOk()).toBe(false);
+  });
+
   it("parses primary list payloads without wrapping them under responsePackItem", () => {
     const xml = '<?xml version="1.0" encoding="Windows-1250"?>'
       + '<rsp:responsePack version="2.0" id="t1" state="ok" xmlns:rsp="http://www.stormware.cz/schema/version_2/response.xsd" xmlns:lst="http://www.stormware.cz/schema/version_2/list.xsd" xmlns:inv="http://www.stormware.cz/schema/version_2/invoice.xsd">'

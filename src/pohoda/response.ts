@@ -85,7 +85,7 @@ export class PohodaResponseItem {
   }
 
   public isOk(): boolean {
-    return this.state === "ok";
+    return this.state === "ok" && nestedState(this.data) !== "error";
   }
 
   public toArray(): ResponseItemArray {
@@ -138,6 +138,20 @@ function normalizeParsed(value: any): any {
     append(result, key, normalizeParsed(child));
   }
   return result;
+}
+
+function nestedState(value: unknown): string {
+  if (!value || typeof value !== "object") {
+    return "";
+  }
+  if (Array.isArray(value)) {
+    return value.some((item) => nestedState(item) === "error") ? "error" : "";
+  }
+  const object = value as Record<string, unknown>;
+  if (String(object.state ?? "") === "error") {
+    return "error";
+  }
+  return Object.values(object).some((child) => nestedState(child) === "error") ? "error" : "";
 }
 
 function append(target: Record<string, any>, key: string, value: any): void {
