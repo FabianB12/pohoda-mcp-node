@@ -1034,7 +1034,7 @@ function registerResources(server: McpServer, context: PohodaServerContext): voi
   server.registerResource("guide", "pohoda://guide", { mimeType: "application/json" }, async (uri) => ({
     contents: [{ uri: uri.href, mimeType: "application/json", text: stringify({
       listing: {
-        targetDatabase: "For accounting-unit-specific tools, pass databaseId explicitly using a registry id or exact POHODA database name. current_database only shows the configured fallback; there is no select_database step. If databaseId is omitted and no default database is configured, the tool fails before running POHODA.",
+        targetDatabase: "For accounting-unit-specific tools, pass databaseId explicitly using a registry id or exact POHODA database name. POHODA validates dat:dataPack ico against the selected unit, so prefer registry/live discovery rows that include ICO; direct database filenames must contain an 8-digit ICO or match live discovery. current_database only shows the configured fallback; there is no select_database step. If databaseId is omitted and no default database is configured, the tool fails before running POHODA.",
         use: {
           list_documents: "Transactional documents; invoice requires invoiceType, order requires documentType.",
           list_stock: "Stock cards and inventory items.",

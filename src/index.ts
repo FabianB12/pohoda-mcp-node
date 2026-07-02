@@ -23,7 +23,7 @@ const server = new McpServer({
 }, {
   instructions: [
     'Pohoda XML MCP server interacts with POHODA through the official command-line XML API: Pohoda.exe /XML "user" "password" "xml_imp.ini".',
-    "Target accounting units explicitly: discover them with list_accounting_units or list_xml_databases, then pass databaseId on accounting-unit-specific calls. current_database only shows the configured fallback; there is no mutable select_database workflow.",
+    "Target accounting units explicitly: discover them with list_accounting_units or list_xml_databases, then pass databaseId on accounting-unit-specific calls. POHODA validates the dataPack ICO against the selected accounting unit, so use registry/live rows that include ICO or database filenames containing the 8-digit ICO. current_database only shows the configured fallback; there is no mutable select_database workflow.",
     "Same-database calls are serialized with a per-database lock. Different databases may run in parallel, capped by POHODA_XML_MAX_PARALLEL_PROCESSES.",
     "Prefer filters, idFrom/count, and limit on list tools. When you already know you need several reads from one accounting unit, use batch_list_records or create_data_export_bundle to avoid repeated Pohoda.exe startup. When doing more than one write/output operation for one accounting unit, use batch_write; for repeated contact+invoice creation, use batch_create_invoices. Use raw_xml_batch only for advanced schema-specific dataPacks not covered by typed tools.",
     "Reference data and usage guidance are exposed as resources under pohoda://enums/*, pohoda://xml-databases, and pohoda://guide."
