@@ -12,11 +12,20 @@ export type ExportRecord = {
   text: string;
   total: number;
   currency: string;
+  homeCurrency?: CurrencyTotal;
+  foreignCurrency?: CurrencyTotal;
   raw: Record<string, any>;
+};
+
+export type CurrencyTotal = {
+  currency: string;
+  total: number;
 };
 
 export type ExportSummary = {
   count: number;
+  homeCurrency: CurrencyTotal;
+  foreignCurrency: Record<string, { count: number; total: number }>;
   total: number;
   byCurrency: Record<string, { count: number; total: number }>;
   byPartner: Record<string, { count: number; total: number }>;
@@ -172,15 +181,30 @@ export function resourcesFor(exportId: string): ExportResources {
 }
 
 export function summarizeRecords(records: ExportRecord[]): ExportSummary {
-  const summary: ExportSummary = { count: records.length, total: 0, byCurrency: {}, byPartner: {}, byMonth: {} };
+  const summary: ExportSummary = {
+    count: records.length,
+    homeCurrency: { currency: "CZK", total: 0 },
+    foreignCurrency: {},
+    total: 0,
+    byCurrency: {},
+    byPartner: {},
+    byMonth: {}
+  };
   for (const record of records) {
-    const total = Number.isFinite(record.total) ? record.total : 0;
-    summary.total += total;
-    addBucket(summary.byCurrency, record.currency || "CZK", total);
-    addBucket(summary.byPartner, record.partner || "(unknown)", total);
-    addBucket(summary.byMonth, monthOf(record.date), total);
+    const home = record.homeCurrency ?? { currency: record.currency || "CZK", total: Number.isFinite(record.total) ? record.total : 0 };
+    const homeTotal = Number.isFinite(home.total) ? home.total : 0;
+    summary.homeCurrency.currency = home.currency || summary.homeCurrency.currency || "CZK";
+    summary.homeCurrency.total += homeTotal;
+    summary.total += homeTotal;
+    addBucket(summary.byCurrency, home.currency || "CZK", homeTotal);
+    addBucket(summary.byPartner, record.partner || "(unknown)", homeTotal);
+    addBucket(summary.byMonth, monthOf(record.date), homeTotal);
+    if (record.foreignCurrency && record.foreignCurrency.currency !== "") {
+      addBucket(summary.foreignCurrency, record.foreignCurrency.currency, record.foreignCurrency.total);
+    }
   }
   summary.total = round2(summary.total);
+  summary.homeCurrency.total = round2(summary.homeCurrency.total);
   return summary;
 }
 

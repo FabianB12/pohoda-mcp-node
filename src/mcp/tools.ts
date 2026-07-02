@@ -14,7 +14,7 @@ import {
 import type { PohodaClient } from "../pohoda/client.js";
 import type { XmlDatabase, XmlDatabaseRegistry } from "../pohoda/database-registry.js";
 import type { PohodaResponse } from "../pohoda/response.js";
-import { ExportStore, type ExportRecord, type ExportSnapshot, summarizeRecords } from "./export-store.js";
+import { ExportStore, type CurrencyTotal, type ExportRecord, type ExportSnapshot, summarizeRecords } from "./export-store.js";
 
 export type PohodaServerContext = {
   client: PohodaClient;
@@ -1147,7 +1147,8 @@ function normalizeExportRecord(raw: Record<string, any>, index: number): ExportR
   const identity = firstRecord(header.partnerIdentity, header.identity, header.accountingUnitIdentity, {});
   const address = firstRecord(identity.address, header.address, {});
   const summary = firstRecord(raw.invoiceSummary, raw.orderSummary, raw.summary, {});
-  return {
+  const amounts = extractCurrencyAmounts(summary, raw, header);
+  return clean({
     index,
     id: numberOrString(header.id ?? raw.id ?? ""),
     number: asText(firstRecord(header.number, raw.number, {}).numberRequested ?? header.code ?? header.number ?? raw.number),
@@ -1155,14 +1156,16 @@ function normalizeExportRecord(raw: Record<string, any>, index: number): ExportR
     partner: asText(address.company ?? header.company ?? header.name ?? raw.name ?? ""),
     ico: asText(address.ico ?? header.ico ?? raw.ico ?? ""),
     text: asText(header.text ?? raw.text ?? ""),
-    total: extractTotal(summary, raw, header),
-    currency: asText(firstRecord(summary.foreignCurrency, {}).currency?.ids ?? firstRecord(summary.homeCurrency, {}).currency?.ids ?? "CZK"),
+    total: amounts.homeCurrency.total,
+    currency: amounts.homeCurrency.currency,
+    homeCurrency: amounts.homeCurrency,
+    foreignCurrency: amounts.foreignCurrency,
     raw
-  };
+  }) as ExportRecord;
 }
 
 function compactRecord(record: ExportRecord): Record<string, unknown> {
-  return {
+  return clean({
     index: record.index,
     id: record.id,
     number: record.number,
@@ -1171,8 +1174,10 @@ function compactRecord(record: ExportRecord): Record<string, unknown> {
     ico: record.ico,
     text: record.text,
     total: record.total,
-    currency: record.currency
-  };
+    currency: record.currency,
+    homeCurrency: record.homeCurrency,
+    foreignCurrency: record.foreignCurrency
+  });
 }
 
 function maxNumericId(records: ExportRecord[]): number {
@@ -1184,21 +1189,77 @@ function extractTotal(summary: Record<string, any>, raw: Record<string, any>, he
     summary.homeCurrency?.priceHighSum,
     summary.homeCurrency?.priceSum,
     summary.homeCurrency?.priceNone,
-    summary.foreignCurrency?.priceSum,
-    summary.foreignCurrency?.amount,
+    findDeepNumber(raw, "amountHome"),
     header.sellingPrice,
     header.price,
     header.weightedPurchasePrice,
     raw.total,
     raw.price
   ];
-  for (const value of candidates) {
+  return firstNumber(...candidates);
+}
+
+function extractCurrencyAmounts(summary: Record<string, any>, raw: Record<string, any>, header: Record<string, any>): { homeCurrency: CurrencyTotal; foreignCurrency?: CurrencyTotal } {
+  const home = firstRecord(summary.homeCurrency, {});
+  const foreign = firstRecord(summary.foreignCurrency, {});
+  const homeCurrency = asText(home.currency?.ids ?? home.currency?.id ?? "CZK") || "CZK";
+  const homeTotal = firstNumber(
+    home.priceHighSum,
+    home.priceSum,
+    home.priceNone,
+    findDeepNumber(raw, "amountHome"),
+    extractTotal(summary, raw, header)
+  );
+  const foreignCurrency = asText(foreign.currency?.ids ?? foreign.currency?.id ?? "");
+  const foreignTotal = firstNumber(
+    foreign.priceSum,
+    foreign.amount,
+    findDeepNumber(raw, "amountForeign")
+  );
+  return clean({
+    homeCurrency: { currency: homeCurrency, total: round2(homeTotal) },
+    foreignCurrency: foreignCurrency !== "" && foreignTotal !== 0 ? { currency: foreignCurrency, total: round2(foreignTotal) } : undefined
+  }) as { homeCurrency: CurrencyTotal; foreignCurrency?: CurrencyTotal };
+}
+
+function firstNumber(...values: unknown[]): number {
+  for (const value of values) {
     const number = Number(String(value ?? "").replace(",", "."));
     if (Number.isFinite(number) && number !== 0) {
-      return Math.round(number * 100) / 100;
+      return round2(number);
     }
   }
   return 0;
+}
+
+function findDeepNumber(value: unknown, key: string): unknown {
+  if (!value || typeof value !== "object") {
+    return undefined;
+  }
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const found = findDeepNumber(item, key);
+      if (found !== undefined) {
+        return found;
+      }
+    }
+    return undefined;
+  }
+  const record = value as Record<string, unknown>;
+  if (record[key] !== undefined) {
+    return record[key];
+  }
+  for (const child of Object.values(record)) {
+    const found = findDeepNumber(child, key);
+    if (found !== undefined) {
+      return found;
+    }
+  }
+  return undefined;
+}
+
+function round2(value: number): number {
+  return Math.round(value * 100) / 100;
 }
 
 function firstRecord(...values: unknown[]): Record<string, any> {

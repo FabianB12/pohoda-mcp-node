@@ -335,6 +335,50 @@ describe("MCP tool helpers", () => {
     expect(recordsResource.contents[0].text).toContain("FV001");
   });
 
+  it("keeps invoice export home and foreign currency totals separate", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "pohoda-mcp-currency-export-"));
+    tempDirs.push(dir);
+    const fakeServer = new CapturingServer();
+    const transport = new HandlerTransport(() =>
+      '<rsp:responsePack state="ok" xmlns:rsp="http://www.stormware.cz/schema/version_2/response.xsd"><rsp:responsePackItem id="i1" state="ok"><lst:listInvoice><lst:invoice><inv:invoiceHeader><inv:id>20</inv:id><inv:number><typ:numberRequested>FV-EUR-1</typ:numberRequested></inv:number><inv:date>2026-01-15</inv:date><inv:partnerIdentity><typ:address><typ:company>Martin Bolf</typ:company><typ:ico>999</typ:ico></typ:address></inv:partnerIdentity><inv:text>Foreign invoice</inv:text></inv:invoiceHeader><inv:invoiceSummary><inv:homeCurrency><typ:priceSum>711723.60</typ:priceSum></inv:homeCurrency><inv:foreignCurrency><typ:currency><typ:ids>EUR</typ:ids></typ:currency><typ:priceSum>29232</typ:priceSum></inv:foreignCurrency></inv:invoiceSummary></lst:invoice><lst:invoice><inv:invoiceHeader><inv:id>21</inv:id><inv:number><typ:numberRequested>FV-EUR-2</typ:numberRequested></inv:number><inv:date>2026-01-20</inv:date><inv:partnerIdentity><typ:address><typ:company>Martin Bolf</typ:company><typ:ico>999</typ:ico></typ:address></inv:partnerIdentity><inv:text>Liquidation fallback</inv:text></inv:invoiceHeader><inv:invoiceSummary><inv:foreignCurrency><typ:currency><typ:ids>EUR</typ:ids></typ:currency></inv:foreignCurrency></inv:invoiceSummary><inv:liquidations><typ:liquidation><typ:amountHome>100</typ:amountHome><typ:amountForeign>4</typ:amountForeign></typ:liquidation></inv:liquidations></lst:invoice></lst:listInvoice></rsp:responsePackItem></rsp:responsePack>'
+    );
+    const client = new PohodaClient({ transport, ico: "12345678", database: "Db" });
+    registerPohodaTools(fakeServer as any, { client, exportStore: new ExportStore(join(dir, "exports")) });
+
+    const created = await fakeServer.call("create_data_export", {
+      kind: "documents",
+      agenda: "invoice",
+      invoiceType: "issuedInvoice",
+      documentType: "",
+      pageSize: 10,
+      maxRecords: 10,
+      previewLimit: 1,
+      databaseId: ""
+    });
+
+    expect(created.structuredContent.summary.count).toBe(2);
+    expect(created.structuredContent.summary.total).toBe(711823.6);
+    expect(created.structuredContent.summary.byCurrency.CZK).toEqual({ count: 2, total: 711823.6 });
+    expect(created.structuredContent.summary.homeCurrency).toEqual({ currency: "CZK", total: 711823.6 });
+    expect(created.structuredContent.summary.foreignCurrency.EUR).toEqual({ count: 2, total: 29236 });
+    expect(created.structuredContent.preview[0].currency).toBe("CZK");
+    expect(created.structuredContent.preview[0].homeCurrency).toEqual({ currency: "CZK", total: 711723.6 });
+    expect(created.structuredContent.preview[0].foreignCurrency).toEqual({ currency: "EUR", total: 29232 });
+
+    const page = await fakeServer.call("read_export_page", {
+      exportId: created.structuredContent.exportId,
+      limit: 10
+    });
+    expect(page.structuredContent.records[0].currency).toBe("CZK");
+    expect(page.structuredContent.records[0].foreignCurrency).toEqual({ currency: "EUR", total: 29232 });
+    expect(page.structuredContent.records[1].homeCurrency).toEqual({ currency: "CZK", total: 100 });
+    expect(page.structuredContent.records[1].foreignCurrency).toEqual({ currency: "EUR", total: 4 });
+
+    const summary = await fakeServer.call("summarize_export", { exportId: created.structuredContent.exportId });
+    expect(summary.structuredContent.summary.homeCurrency).toEqual({ currency: "CZK", total: 711823.6 });
+    expect(summary.structuredContent.summary.foreignCurrency.EUR).toEqual({ count: 2, total: 29236 });
+  });
+
   it("refreshes XML database discovery without restarting the MCP server", async () => {
     const dir = await mkdtemp(join(tmpdir(), "pohoda-mcp-refresh-"));
     tempDirs.push(dir);
