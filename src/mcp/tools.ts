@@ -227,6 +227,10 @@ const dataExportSpecSchema = z.object({
   previewLimit: z.number().int().min(0).max(100).default(10)
 });
 
+const databaseIdSchema = z.string().default("").describe(
+  "Registry id or exact POHODA database name. Prefer passing this explicitly on every accounting-unit-specific call; omit only when a configured default database is intentionally used."
+);
+
 export function registerPohodaTools(server: McpServer, context: PohodaServerContext): void {
   const { client, databaseRegistry } = context;
   const exportStore = context.exportStore ?? new ExportStore(process.env.POHODA_XML_EXPORT_DIR ?? join(process.cwd(), "var", "exports"));
@@ -256,24 +260,15 @@ export function registerPohodaTools(server: McpServer, context: PohodaServerCont
   });
 
   server.registerTool("current_database", {
-    title: "Show current Pohoda XML database",
+    title: "Show configured default Pohoda XML database",
+    description: "Diagnostic helper for the configured fallback database and ICO. Normal work should pass databaseId directly on each tool call.",
     inputSchema: { includeStatus: z.boolean().default(true) },
-    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true }
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true }
   }, async ({ includeStatus }) => jsonResult({
     database: client.getDatabase(),
     ico: client.getIco(),
     ...(includeStatus ? { status: client.getStatusNoStart(true) } : {})
   }));
-
-  server.registerTool("select_database", {
-    title: "Select Pohoda XML database",
-    inputSchema: { idOrDatabase: z.string().min(1) },
-    annotations: { destructiveHint: false, idempotentHint: true, openWorldHint: false }
-  }, async ({ idOrDatabase }) => {
-    const item = await databaseByName(idOrDatabase);
-    client.setContext(item.database, item.ico);
-    return jsonResult({ selected: item });
-  });
 
   server.registerTool("list_accounting_units", {
     title: "List Pohoda accounting units",
@@ -332,7 +327,7 @@ export function registerPohodaTools(server: McpServer, context: PohodaServerCont
       includeParameters: z.boolean().optional(),
       includeLiquidations: z.boolean().optional(),
       limit: z.number().int().min(1).max(10_000).default(defaultListLimit),
-      databaseId: z.string().default("")
+      databaseId: databaseIdSchema
     },
     annotations: { readOnlyHint: true, openWorldHint: true }
   }, async (args) => {
@@ -376,7 +371,7 @@ export function registerPohodaTools(server: McpServer, context: PohodaServerCont
       includeCategories: z.boolean().optional(), includeRelatedStocks: z.boolean().optional(), includeAlternativeStocks: z.boolean().optional(),
       includeIntParameters: z.boolean().optional(), includeStockItem: z.boolean().optional(), includeStockAttach: z.boolean().optional(),
       includeStockSerialNumber: z.boolean().optional(), includeStockPriceItem: z.boolean().optional(), includeStockParameters: z.boolean().optional(),
-      includeAttachments: z.boolean().optional(), limit: z.number().int().min(1).default(defaultListLimit), databaseId: z.string().default("")
+      includeAttachments: z.boolean().optional(), limit: z.number().int().min(1).default(defaultListLimit), databaseId: databaseIdSchema
     },
     annotations: { readOnlyHint: true, openWorldHint: true }
   }, async (args) => {
@@ -409,7 +404,7 @@ export function registerPohodaTools(server: McpServer, context: PohodaServerCont
       street: z.string().default(""), zip: z.string().default(""), dic: z.string().default(""), number: z.string().default(""),
       lastChanges: z.string().default(""), userFilterName: z.string().default(""), queryFilter: z.string().default(""),
       idFrom: z.number().int().default(0), count: z.number().int().default(0), includeAttachments: z.boolean().optional(),
-      limit: z.number().int().min(1).default(defaultListLimit), databaseId: z.string().default("")
+      limit: z.number().int().min(1).default(defaultListLimit), databaseId: databaseIdSchema
     },
     annotations: { readOnlyHint: true, openWorldHint: true }
   }, async (args) => {
@@ -431,7 +426,7 @@ export function registerPohodaTools(server: McpServer, context: PohodaServerCont
     inputSchema: {
       agenda: z.enum(exportAgendas), id: z.number().int().default(0), lastChanges: z.string().default(""),
       userFilterName: z.string().default(""), queryFilter: z.string().default(""), idFrom: z.number().int().default(0),
-      count: z.number().int().default(0), limit: z.number().int().min(1).default(defaultListLimit), databaseId: z.string().default("")
+      count: z.number().int().default(0), limit: z.number().int().min(1).default(defaultListLimit), databaseId: databaseIdSchema
     },
     annotations: { readOnlyHint: true, openWorldHint: true }
   }, async (args) => {
@@ -450,7 +445,7 @@ export function registerPohodaTools(server: McpServer, context: PohodaServerCont
     description: "Runs multiple compatible read/list requests for the same accounting unit in one POHODA /XML process by packing them into a single dataPack. Use this when an agent knows it needs several lists or summaries at once.",
     inputSchema: {
       operations: z.array(batchListOperationSchema).min(1).max(25),
-      databaseId: z.string().default(""),
+      databaseId: databaseIdSchema,
       dataPackId: z.string().default("")
     },
     outputSchema: {
@@ -477,7 +472,7 @@ export function registerPohodaTools(server: McpServer, context: PohodaServerCont
     const structuredContent = {
       ok: data.state === "ok" && results.every((result) => result.ok),
       state: data.state,
-      database: database || client.getDatabase(),
+      database: activeDatabase(database),
       operationCount: plans.length,
       transport: data.transport,
       results
@@ -498,7 +493,7 @@ export function registerPohodaTools(server: McpServer, context: PohodaServerCont
       paymentType: z.string().default(""), accountIds: z.string().default(""), accounting: z.string().default(""),
       classificationVAT: z.string().default(""), centre: z.string().default(""), activity: z.string().default(""), contract: z.string().default(""),
       currency: z.string().default(""), currencyRate: z.number().default(0), note: z.string().default(""), intNote: z.string().default(""),
-      dataPackId: z.string().default(""), databaseId: z.string().default("")
+      dataPackId: z.string().default(""), databaseId: databaseIdSchema
     },
     annotations: { destructiveHint: false, idempotentHint: false, openWorldHint: true }
   }, async ({ items, dataPackId, databaseId, ...header }) =>
@@ -508,7 +503,7 @@ export function registerPohodaTools(server: McpServer, context: PohodaServerCont
     title: "Create Pohoda contact",
     inputSchema: {
       company: z.string(), ico: z.string().default(""), dic: z.string().default(""), street: z.string().default(""), city: z.string().default(""),
-      zip: z.string().default(""), phone: z.string().default(""), email: z.string().default(""), dataPackId: z.string().default(""), databaseId: z.string().default("")
+      zip: z.string().default(""), phone: z.string().default(""), email: z.string().default(""), dataPackId: z.string().default(""), databaseId: databaseIdSchema
     },
     annotations: { destructiveHint: false, idempotentHint: false, openWorldHint: true }
   }, async ({ dataPackId, databaseId, ...data }) =>
@@ -520,7 +515,7 @@ export function registerPohodaTools(server: McpServer, context: PohodaServerCont
     inputSchema: {
       invoices: z.array(batchInvoiceCreateSchema).min(1).max(50),
       dataPackId: z.string().default(""),
-      databaseId: z.string().default("")
+      databaseId: databaseIdSchema
     },
     annotations: { destructiveHint: false, idempotentHint: false, openWorldHint: true }
   }, async ({ invoices, dataPackId, databaseId }) => {
@@ -537,7 +532,7 @@ export function registerPohodaTools(server: McpServer, context: PohodaServerCont
     const structuredContent = {
       ok: data.state === "ok" && results.every((result) => result.ok),
       state: data.state,
-      database: database || client.getDatabase(),
+      database: activeDatabase(database),
       invoiceCount: plans.length,
       dataPackItemCount: data.items.length,
       transport: data.transport,
@@ -555,7 +550,7 @@ export function registerPohodaTools(server: McpServer, context: PohodaServerCont
     inputSchema: {
       operations: z.array(batchWriteOperationSchema).min(1).max(100),
       dataPackId: z.string().default(""),
-      databaseId: z.string().default("")
+      databaseId: databaseIdSchema
     },
     annotations: { destructiveHint: false, idempotentHint: false, openWorldHint: true }
   }, async ({ operations, dataPackId, databaseId }) => {
@@ -567,7 +562,7 @@ export function registerPohodaTools(server: McpServer, context: PohodaServerCont
     const structuredContent = {
       ok: data.state === "ok" && results.every((result) => result.ok),
       state: data.state,
-      database: database || client.getDatabase(),
+      database: activeDatabase(database),
       operationCount: plans.length,
       transport: data.transport,
       results
@@ -586,7 +581,7 @@ export function registerPohodaTools(server: McpServer, context: PohodaServerCont
       isSales: z.boolean().default(true), isInternet: z.boolean().default(false), description: z.string().default(""), description2: z.string().default(""),
       limitMin: z.number().default(0), limitMax: z.number().default(0), mass: z.number().default(0), supplierId: z.number().int().default(0),
       guarantee: z.number().int().default(0), guaranteeType: z.string().default("year"), shortName: z.string().default(""), nameComplement: z.string().default(""),
-      note: z.string().default(""), dataPackId: z.string().default(""), databaseId: z.string().default("")
+      note: z.string().default(""), dataPackId: z.string().default(""), databaseId: databaseIdSchema
     },
     annotations: { destructiveHint: false, idempotentHint: false, openWorldHint: true }
   }, async ({ dataPackId, databaseId, ...data }) =>
@@ -596,7 +591,7 @@ export function registerPohodaTools(server: McpServer, context: PohodaServerCont
     title: "Create Pohoda order",
     inputSchema: {
       type: z.enum(["receivedOrder", "issuedOrder"]), partnerName: z.string(), date: z.string(),
-      items: z.array(itemSchema).min(1), partnerIco: z.string().default(""), dataPackId: z.string().default(""), databaseId: z.string().default("")
+      items: z.array(itemSchema).min(1), partnerIco: z.string().default(""), dataPackId: z.string().default(""), databaseId: databaseIdSchema
     },
     annotations: { destructiveHint: false, idempotentHint: false, openWorldHint: true }
   }, async ({ items, dataPackId, databaseId, ...header }) =>
@@ -613,7 +608,7 @@ export function registerPohodaTools(server: McpServer, context: PohodaServerCont
       emailPriority: z.enum(["", "normal", "low", "high"]).default(""), emailReturnReceipt: z.boolean().default(false),
       emailReadReceipt: z.boolean().default(false), removeFile: z.boolean().default(false), includeIsdoc: z.boolean().default(false),
       isdocGraphicNote: z.enum(["", "topRight", "topLeft", "bottomRight", "bottomLeft"]).default(""),
-      parameters: z.record(z.string(), z.any()).default({}), databaseId: z.string().default("")
+      parameters: z.record(z.string(), z.any()).default({}), databaseId: databaseIdSchema
     },
     annotations: { destructiveHint: false, idempotentHint: false, openWorldHint: true }
   }, async ({ databaseId, ...options }) =>
@@ -621,14 +616,14 @@ export function registerPohodaTools(server: McpServer, context: PohodaServerCont
 
   server.registerTool("raw_xml", {
     title: "Send raw Pohoda XML",
-    inputSchema: { xml: z.string().min(1), note: z.string().default(""), dataPackId: z.string().default(""), databaseId: z.string().default("") },
+    inputSchema: { xml: z.string().min(1), note: z.string().default(""), dataPackId: z.string().default(""), databaseId: databaseIdSchema },
     annotations: { destructiveHint: true, idempotentHint: false, openWorldHint: true }
   }, async ({ xml, note, dataPackId, databaseId }) =>
     jsonResult(assertOk(await client.sendRawXml(xml, note, dataPackId, clean({ databaseOverride: await databaseName(databaseId) })))));
 
   server.registerTool("raw_xml_batch", {
     title: "Send raw Pohoda XML batch",
-    inputSchema: { items: z.array(z.string().min(1)).min(1), note: z.string().default(""), dataPackId: z.string().default(""), databaseId: z.string().default("") },
+    inputSchema: { items: z.array(z.string().min(1)).min(1), note: z.string().default(""), dataPackId: z.string().default(""), databaseId: databaseIdSchema },
     annotations: { destructiveHint: true, idempotentHint: false, openWorldHint: true }
   }, async ({ items, note, dataPackId, databaseId }) =>
     jsonResult(assertOk(await client.sendRawXmlBatch(items, note, dataPackId, clean({ databaseOverride: await databaseName(databaseId) })))));
@@ -653,7 +648,7 @@ export function registerPohodaTools(server: McpServer, context: PohodaServerCont
       pageSize: z.number().int().min(1).max(1_000).default(100),
       maxRecords: z.number().int().min(1).max(100_000).default(1_000),
       previewLimit: z.number().int().min(0).max(100).default(10),
-      databaseId: z.string().default("")
+      databaseId: databaseIdSchema
     },
     outputSchema: exportOutputSchema(),
     annotations: { readOnlyHint: true, idempotentHint: false, openWorldHint: true }
@@ -670,7 +665,7 @@ export function registerPohodaTools(server: McpServer, context: PohodaServerCont
     description: "Creates several persisted export snapshots for the same accounting unit. Page rounds are batched into shared POHODA /XML runs, so agents can fetch related datasets without paying startup cost per dataset.",
     inputSchema: {
       exports: z.array(dataExportSpecSchema).min(1).max(10),
-      databaseId: z.string().default(""),
+      databaseId: databaseIdSchema,
       dataPackId: z.string().default("")
     },
     outputSchema: {
@@ -692,7 +687,7 @@ export function registerPohodaTools(server: McpServer, context: PohodaServerCont
     }));
     const structuredContent = {
       ok: true,
-      database: database || client.getDatabase(),
+      database: activeDatabase(database),
       exportCount: exportResults.length,
       exports: exportResults
     };
@@ -764,7 +759,10 @@ export function registerPohodaTools(server: McpServer, context: PohodaServerCont
   async function databaseName(databaseId: string): Promise<string> {
     const trimmed = databaseId.trim();
     if (trimmed === "") {
-      return "";
+      if (client.getDatabase().trim() !== "") {
+        return "";
+      }
+      throw new Error("databaseId is required for this tool because no default POHODA database is configured. Use list_accounting_units or list_xml_databases, then pass the registry id or exact database name as databaseId.");
     }
     if (!databaseRegistry) {
       return trimmed;
@@ -776,26 +774,15 @@ export function registerPohodaTools(server: McpServer, context: PohodaServerCont
     }
   }
 
-  async function databaseByName(idOrDatabase: string): Promise<XmlDatabase> {
-    if (databaseRegistry) {
-      try {
-        return await databaseRegistry.get(idOrDatabase);
-      } catch {
-        // fall through to live lookup/direct mode
-      }
-    }
-    try {
-      for (const item of extractAccountingUnits(assertOk(await client.listAccountingUnits()), 10_000)) {
-        if (item.id === idOrDatabase || item.database === idOrDatabase || item.path === idOrDatabase) {
-          return item;
-        }
-      }
-    } catch {
-      // live lookup is best-effort
-    }
-    return { id: idOrDatabase, name: idOrDatabase, database: idOrDatabase, ico: client.getIco(), source: "direct" };
+  function activeDatabase(databaseOverride: string): string {
+    return databaseOverride || client.getDatabase();
   }
 
+  /*
+   * Current database mutation was intentionally removed from the MCP tool surface.
+   * Tools should target accounting units with explicit databaseId values; the client
+   * default is now only a configured fallback for simple single-company setups.
+   */
   async function createExportSnapshot(args: {
     kind: "documents" | "stock" | "contacts" | "export_agenda";
     agenda: string;
@@ -858,7 +845,7 @@ export function registerPohodaTools(server: McpServer, context: PohodaServerCont
       kind: args.kind,
       agenda: plan.agenda,
       subtype: plan.subtype,
-      database: database || client.getDatabase(),
+      database: activeDatabase(database),
       ico: client.getIco(),
       filters,
       paging: {
@@ -950,7 +937,7 @@ export function registerPohodaTools(server: McpServer, context: PohodaServerCont
         kind: state.spec.kind,
         agenda: state.plan.agenda,
         subtype: state.plan.subtype,
-        database: database || client.getDatabase(),
+        database: activeDatabase(database),
         ico: client.getIco(),
         filters: state.filters,
         paging: {
@@ -991,6 +978,7 @@ function registerResources(server: McpServer, context: PohodaServerContext): voi
   server.registerResource("guide", "pohoda://guide", { mimeType: "application/json" }, async (uri) => ({
     contents: [{ uri: uri.href, mimeType: "application/json", text: stringify({
       listing: {
+        targetDatabase: "For accounting-unit-specific tools, pass databaseId explicitly using a registry id or exact POHODA database name. current_database only shows the configured fallback; there is no select_database step. If databaseId is omitted and no default database is configured, the tool fails before running POHODA.",
         use: {
           list_documents: "Transactional documents; invoice requires invoiceType, order requires documentType.",
           list_stock: "Stock cards and inventory items.",

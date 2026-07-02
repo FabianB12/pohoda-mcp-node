@@ -11,7 +11,7 @@ the intended operational path.
 ## Core Rules
 
 - Always target the correct accounting unit. Use `list_accounting_units` to discover
-  available units and pass `databaseId` on calls whenever possible.
+  available units and pass `databaseId` on every accounting-unit-specific call.
 - Do not rely on stale cached assumptions. If the POHODA UI may have changed data,
   list/export the data fresh before acting.
 - Prefer typed MCP tools over `raw_xml`. Use `raw_xml` or `raw_xml_batch` only when a
@@ -33,8 +33,10 @@ Use filters when the list may be large:
 - `ico`, `dic`, `city`, `year`, or `database` when known.
 - `limit` and `cursor` for pagination.
 
-Use `current_database` only to inspect the shared default. For reliable multi-client work,
-prefer explicit `databaseId` on every tool call.
+There is no mutable database selection step. Use `current_database` only to inspect the
+configured fallback. For normal work, pass explicit `databaseId`; if neither `databaseId`
+nor a configured default exists, accounting-unit-specific tools will fail before running
+POHODA.
 
 ## Efficient Reads
 

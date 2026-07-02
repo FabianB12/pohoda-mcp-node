@@ -110,7 +110,7 @@ describe("MCP tool helpers", () => {
     registerPohodaTools(fakeServer as any, { client, databaseRegistry: registry, exportStore });
 
     expect([...fakeServer.tools.keys()]).toEqual([
-      "status", "list_xml_databases", "current_database", "select_database", "list_accounting_units",
+      "status", "list_xml_databases", "current_database", "list_accounting_units",
       "list_documents", "list_stock", "list_contacts", "list_export_agenda", "batch_list_records", "create_invoice",
       "create_address", "batch_create_invoices", "batch_write", "create_stock", "create_order", "print", "raw_xml", "raw_xml_batch",
       "create_data_export", "create_data_export_bundle", "read_export_page", "summarize_export", "cleanup_export"
@@ -118,16 +118,15 @@ describe("MCP tool helpers", () => {
     expect([...fakeServer.resources.keys()]).toContain("guide");
     expect(fakeServer.tools.get("list_export_agenda")?.config.inputSchema.agenda.options).not.toContain("userAgenda");
     expect(fakeServer.tools.get("list_export_agenda")?.config.inputSchema.agenda.options).not.toContain("measureUnit");
-
-    await fakeServer.call("select_database", { idOrDatabase: "demo" });
-    expect(client.getDatabase()).toBe("12345678_2026.mdb");
-    expect(client.getIco()).toBe("12345678");
+    expect(fakeServer.tools.has("select_database")).toBe(false);
 
     const current = await fakeServer.call("current_database", { includeStatus: true });
-    expect(JSON.parse(current.content[0].text).database).toBe("12345678_2026.mdb");
+    expect(JSON.parse(current.content[0].text).database).toBe("");
 
     await expect(fakeServer.call("list_documents", { agenda: "invoice", invoiceType: "", documentType: "", limit: 1 }))
       .rejects.toThrow(/invoiceType is required/);
+    await expect(fakeServer.call("list_stock", { limit: 1, databaseId: "" }))
+      .rejects.toThrow(/databaseId is required/);
     await fakeServer.call("list_stock", { limit: 1, databaseId: "demo" });
     expect(transport.calls.at(-1)?.database).toBe("12345678_2026.mdb");
 

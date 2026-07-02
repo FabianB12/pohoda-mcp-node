@@ -35,7 +35,7 @@ and then starts `dist/index.js`.
 | `POHODA_USERNAME` | POHODA user name | required |
 | `POHODA_PASSWORD` | POHODA password | empty |
 | `POHODA_ICO` | Company ICO for `dat:dataPack` | empty |
-| `POHODA_DATABASE` / `POHODA_DEFAULT_DATABASE` | Initial POHODA database name | empty |
+| `POHODA_DATABASE` / `POHODA_DEFAULT_DATABASE` | Optional fallback POHODA database name when a tool call omits `databaseId` | empty |
 | `POHODA_XML_WORK_DIR` | Job, lock, and diagnostics directory | `XML/var/xml` |
 | `POHODA_XML_TIMEOUT` | Per-job process timeout in seconds | `120` |
 | `POHODA_XML_QUEUE_TIMEOUT` | Max seconds to wait for the same-database queue lock | `300` |
@@ -130,7 +130,6 @@ Database and transport:
 - `status`
 - `current_database`
 - `list_xml_databases`
-- `select_database`
 - `list_accounting_units`
 
 Read tools:
@@ -218,10 +217,12 @@ snapshot with normal `read_export_page`, `summarize_export`, and resource suppor
 
 ## Agent Guidance
 
-- Call `current_database` before writes.
-- Prefer passing `databaseId` directly to tools in multi-agent or concurrent workflows.
+- Discover the target accounting unit with `list_accounting_units` or
+  `list_xml_databases`, then pass `databaseId` directly to accounting-unit-specific tools.
   `databaseId` may be a registry id or an exact POHODA database name.
-- Use `select_database` only as a convenience default for simple single-session workflows.
+- There is no mutable database selection workflow. `current_database` is only a
+  diagnostic for the configured fallback database. If a tool needs an accounting unit and
+  neither `databaseId` nor a configured default exists, it fails before running POHODA.
 - Prefer explicit filters and server-side `count`/`idFrom` over large exports.
 - If the task clearly needs several reads from the same accounting unit, plan them first
   and call `batch_list_records` instead of making separate list calls.
