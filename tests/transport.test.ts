@@ -115,6 +115,9 @@ describe("CliXmlTransport", () => {
     let activeTotal = 0;
     let maxActiveTotal = 0;
     let maxActiveSame = 0;
+    const releaseFirstSame = deferred<void>();
+    const releaseDifferentDatabase = deferred<void>();
+    let firstSameStarted = false;
 
     const transport = new CliXmlTransport({
       exePath: process.execPath,
@@ -129,7 +132,12 @@ describe("CliXmlTransport", () => {
         activeByDatabase.set(database, (activeByDatabase.get(database) ?? 0) + 1);
         maxActiveTotal = Math.max(maxActiveTotal, activeTotal);
         maxActiveSame = Math.max(maxActiveSame, activeByDatabase.get("Same") ?? 0);
-        await new Promise((resolve) => setTimeout(resolve, 30));
+        if (database === "Same" && !firstSameStarted) {
+          firstSameStarted = true;
+          await releaseFirstSame.promise;
+        } else if (database !== "Same") {
+          await releaseDifferentDatabase.promise;
+        }
         activeByDatabase.set(database, (activeByDatabase.get(database) ?? 1) - 1);
         activeTotal -= 1;
         events.push(`end:${database}`);
@@ -138,12 +146,26 @@ describe("CliXmlTransport", () => {
       }
     });
 
-    await Promise.all([
-      transport.exchange("<a />", "Same"),
-      transport.exchange("<b />", "Same"),
-      transport.exchange("<c />", "Other"),
-      transport.exchange("<d />", "Third")
-    ]);
+    const firstSame = transport.exchange("<a />", "Same");
+    let other: Promise<unknown> | undefined;
+    let secondSame: Promise<unknown> | undefined;
+    let third: Promise<unknown> | undefined;
+    try {
+      await waitFor(() => events.includes("start:Same"));
+      other = transport.exchange("<c />", "Other");
+      await waitFor(() => activeTotal === 2);
+
+      secondSame = transport.exchange("<b />", "Same");
+      third = transport.exchange("<d />", "Third");
+      releaseFirstSame.resolve();
+      releaseDifferentDatabase.resolve();
+      await Promise.all([firstSame, secondSame, other, third]);
+    } catch (error) {
+      releaseFirstSame.resolve();
+      releaseDifferentDatabase.resolve();
+      await Promise.allSettled([firstSame, other, secondSame, third].filter(Boolean) as Promise<unknown>[]);
+      throw error;
+    }
 
     expect(events.indexOf("end:Same")).toBeLessThan(events.lastIndexOf("start:Same"));
     expect(events).toContain("start:Other");
@@ -199,3 +221,24 @@ describe("CliXmlTransport", () => {
     expect(runner).toHaveBeenCalledOnce();
   });
 });
+
+function deferred<T>(): { promise: Promise<T>; resolve: (value: T | PromiseLike<T>) => void; reject: (error: unknown) => void } {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (error: unknown) => void;
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}
+
+async function waitFor(predicate: () => boolean, timeoutMs = 2_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (predicate()) {
+      return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error(`Timed out waiting for transport test condition. Events did not reach expected state.`);
+}
