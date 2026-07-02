@@ -78,6 +78,25 @@ describe("PohodaClient", () => {
     expect(transport.calls[1]?.xml).toContain('id="raw-1-2"');
   });
 
+  it("uses per-call dataPack ICO override with database overrides", async () => {
+    const transport = new FakeTransport();
+    const client = new PohodaClient({ transport, ico: "12345678", database: "Default" });
+
+    await client.listRecords("stock", {}, "", { database: "OtherDb", dataPackIco: "87654321", count: 1 });
+    await client.createInvoice({ type: "issuedInvoice", partnerName: "Firma", date: "2026-07-01" }, [
+      { text: "Work", unitPrice: 100, quantity: 1 }
+    ], "invoice-ico", { database: "InvoiceDb", dataPackIco: "11111111" });
+    await client.sendRawXmlBatch(["<x:first />"], "raw", "raw-ico", { databaseOverride: "RawDb", dataPackIco: "22222222" });
+
+    expect(transport.calls[0]?.database).toBe("OtherDb");
+    expect(transport.calls[0]?.xml).toContain('ico="87654321"');
+    expect(transport.calls[0]?.xml).not.toContain('ico="12345678"');
+    expect(transport.calls[1]?.database).toBe("InvoiceDb");
+    expect(transport.calls[1]?.xml).toContain('ico="11111111"');
+    expect(transport.calls[2]?.database).toBe("RawDb");
+    expect(transport.calls[2]?.xml).toContain('ico="22222222"');
+  });
+
   it("builds typed batch list XML in a single transport call", async () => {
     const transport = new FakeTransport();
     const client = new PohodaClient({ transport, ico: "12345678", database: "Default" });

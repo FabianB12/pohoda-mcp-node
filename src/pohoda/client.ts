@@ -32,6 +32,8 @@ export type WriteBatchOperation =
   | { requestId?: string; tool: "create_order"; header: Record<string, any>; items: Record<string, any>[] }
   | { requestId?: string; tool: "print"; options: Record<string, any> };
 
+type DatabaseTarget = string | TransportOptions;
+
 export class PohodaClient {
   private readonly transport: XmlTransport;
   private readonly application: string;
@@ -138,15 +140,15 @@ export class PohodaClient {
     };
   }
 
-  public async createInvoice(header: Record<string, any>, items: Record<string, any>[] = [], dataPackId = "", database = ""): Promise<PohodaResponse> {
-    return this.send("inv:invoice", "2.0", buildInvoiceData(header, items), "Create invoice", {}, dataPackId, databaseOption({ database }));
+  public async createInvoice(header: Record<string, any>, items: Record<string, any>[] = [], dataPackId = "", target: DatabaseTarget = ""): Promise<PohodaResponse> {
+    return this.send("inv:invoice", "2.0", buildInvoiceData(header, items), "Create invoice", {}, dataPackId, databaseOption(target));
   }
 
-  public async createAddress(data: Record<string, any>, dataPackId = "", database = ""): Promise<PohodaResponse> {
-    return this.send("adb:addressbook", "2.0", buildAddressData(data), "Create address", {}, dataPackId, databaseOption({ database }));
+  public async createAddress(data: Record<string, any>, dataPackId = "", target: DatabaseTarget = ""): Promise<PohodaResponse> {
+    return this.send("adb:addressbook", "2.0", buildAddressData(data), "Create address", {}, dataPackId, databaseOption(target));
   }
 
-  public async createInvoiceBatch(entries: CreateInvoiceBatchEntry[], dataPackId = "", database = ""): Promise<PohodaResponse> {
+  public async createInvoiceBatch(entries: CreateInvoiceBatchEntry[], dataPackId = "", target: DatabaseTarget = ""): Promise<PohodaResponse> {
     if (entries.length === 0) {
       throw new Error("At least one invoice batch entry is required.");
     }
@@ -168,39 +170,39 @@ export class PohodaClient {
         note: `${requestId}:invoice`
       });
     });
-    return this.sendDataPackItems(items, "Batch create invoices", dataPackId, databaseOption({ database }));
+    return this.sendDataPackItems(items, "Batch create invoices", dataPackId, databaseOption(target));
   }
 
-  public async createStock(data: Record<string, any>, dataPackId = "", database = ""): Promise<PohodaResponse> {
-    return this.send("stk:stock", "2.0", buildStockData(data), "Create stock", {}, dataPackId, databaseOption({ database }));
+  public async createStock(data: Record<string, any>, dataPackId = "", target: DatabaseTarget = ""): Promise<PohodaResponse> {
+    return this.send("stk:stock", "2.0", buildStockData(data), "Create stock", {}, dataPackId, databaseOption(target));
   }
 
-  public async createOrder(header: Record<string, any>, items: Record<string, any>[], dataPackId = "", database = ""): Promise<PohodaResponse> {
-    return this.send("ord:order", "2.0", buildOrderData(header, items), "Create order", {}, dataPackId, databaseOption({ database }));
+  public async createOrder(header: Record<string, any>, items: Record<string, any>[], dataPackId = "", target: DatabaseTarget = ""): Promise<PohodaResponse> {
+    return this.send("ord:order", "2.0", buildOrderData(header, items), "Create order", {}, dataPackId, databaseOption(target));
   }
 
   public printRecord(options: Record<string, any>): Promise<PohodaResponse> {
     return this.send("prn:print", "1.0", buildPrintData(options), `Print ${options.agenda}`, {}, "", { checkDuplicity: false, ...databaseOption(options) });
   }
 
-  public async writeBatch(operations: WriteBatchOperation[], dataPackId = "", database = ""): Promise<PohodaResponse> {
+  public async writeBatch(operations: WriteBatchOperation[], dataPackId = "", target: DatabaseTarget = ""): Promise<PohodaResponse> {
     if (operations.length === 0) {
       throw new Error("At least one write batch operation is required.");
     }
     const items = operations.map((operation, index) => writeBatchItem(operation, index));
-    return this.sendDataPackItems(items, "Batch write", dataPackId, databaseOption({ database }));
+    return this.sendDataPackItems(items, "Batch write", dataPackId, databaseOption(target));
   }
 
   public async sendRawXml(innerXml: string, note = "", dataPackId = "", transportOptions: TransportOptions = {}): Promise<PohodaResponse> {
-    return this.exchange(this.xml.buildRawMany([innerXml], note, dataPackId), transportOptions);
+    return this.exchange(this.builderFor(transportOptions).buildRawMany([innerXml], note, dataPackId), transportOptions);
   }
 
   public async sendRawXmlBatch(innerXmlItems: string[], note = "", dataPackId = "", transportOptions: TransportOptions = {}): Promise<PohodaResponse> {
-    return this.exchange(this.xml.buildRawMany(innerXmlItems, note, dataPackId), transportOptions);
+    return this.exchange(this.builderFor(transportOptions).buildRawMany(innerXmlItems, note, dataPackId), transportOptions);
   }
 
   public async sendDataPackItems(items: DataPackItem[], note = "", dataPackId = "", transportOptions: TransportOptions = {}): Promise<PohodaResponse> {
-    return this.exchange(this.xml.buildMany(items, note, dataPackId), transportOptions);
+    return this.exchange(this.builderFor(transportOptions).buildMany(items, note, dataPackId), transportOptions);
   }
 
   public async listAccountingUnits(): Promise<PohodaResponse> {
@@ -212,13 +214,18 @@ export class PohodaClient {
   }
 
   private async send(rootElement: string, version: string, data: XmlObject, note: string, rootAttrs: Record<string, string> = {}, dataPackId = "", options: TransportOptions = {}): Promise<PohodaResponse> {
-    return this.exchange(this.xml.build(rootElement, version, data, note, rootAttrs, dataPackId), options);
+    return this.exchange(this.builderFor(options).build(rootElement, version, data, note, rootAttrs, dataPackId), options);
   }
 
   private async exchange(xml: string, options: TransportOptions = {}): Promise<PohodaResponse> {
     const database = options.omitDatabase ? "" : String(options.databaseOverride ?? this.database);
     const result = await this.transport.exchange(xml, database, options);
     return new PohodaResponse(result.xml, result);
+  }
+
+  private builderFor(options: TransportOptions = {}): XmlBuilder {
+    const ico = String(options.dataPackIco ?? this.ico).trim();
+    return ico === this.ico ? this.xml : new XmlBuilder(ico, this.application);
   }
 }
 
@@ -277,9 +284,18 @@ function buildPrintData(options: Record<string, any>): XmlObject {
     };
 }
 
-function databaseOption(options: Record<string, unknown>): TransportOptions {
-  const database = String(options.database ?? options.databaseId ?? options.databaseOverride ?? "").trim();
-  return database !== "" ? { databaseOverride: database } : {};
+function databaseOption(options: DatabaseTarget | Record<string, unknown>): TransportOptions {
+  const raw = typeof options === "string" ? { database: options } : options;
+  const database = String(raw.database ?? raw.databaseId ?? raw.databaseOverride ?? "").trim();
+  const dataPackIco = String(raw.dataPackIco ?? raw.ico ?? "").trim();
+  const result: TransportOptions = {};
+  if (database !== "") {
+    result.databaseOverride = database;
+  }
+  if (dataPackIco !== "") {
+    result.dataPackIco = dataPackIco;
+  }
+  return result;
 }
 
 function buildInvoiceData(header: Record<string, any>, items: Record<string, any>[]): XmlObject {

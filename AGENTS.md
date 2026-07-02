@@ -12,6 +12,9 @@ the intended operational path.
 
 - Always target the correct accounting unit. Use `list_accounting_units` to discover
   available units and pass `databaseId` on every accounting-unit-specific call.
+- POHODA validates the `dat:dataPack` ICO against the selected unit. Prefer database
+  discovery rows or registry ids that include the unit ICO; direct database filenames
+  must contain an 8-digit ICO or match live discovery.
 - Do not rely on stale cached assumptions. If the POHODA UI may have changed data,
   list/export the data fresh before acting.
 - Prefer typed MCP tools over `raw_xml`. Use `raw_xml` or `raw_xml_batch` only when a

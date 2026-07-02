@@ -85,6 +85,11 @@ Database registry example:
 ]
 ```
 
+Registry entries should include `ico`. POHODA validates the `dat:dataPack ico` against
+the selected accounting unit; if a direct database name is used without a registry ICO,
+the MCP can only infer the ICO when the filename contains an 8-digit ICO or when live
+accounting-unit discovery can match the database.
+
 ## Runtime Model
 
 For each MCP tool call, the backend creates a unique job directory:
@@ -219,7 +224,9 @@ snapshot with normal `read_export_page`, `summarize_export`, and resource suppor
 
 - Discover the target accounting unit with `list_accounting_units` or
   `list_xml_databases`, then pass `databaseId` directly to accounting-unit-specific tools.
-  `databaseId` may be a registry id or an exact POHODA database name.
+  `databaseId` may be a registry id or an exact POHODA database name. The MCP also needs
+  the target unit ICO to build POHODA's `dat:dataPack` wrapper; prefer registry/live
+  discovery rows that include ICO.
 - There is no mutable database selection workflow. `current_database` is only a
   diagnostic for the configured fallback database. If a tool needs an accounting unit and
   neither `databaseId` nor a configured default exists, it fails before running POHODA.

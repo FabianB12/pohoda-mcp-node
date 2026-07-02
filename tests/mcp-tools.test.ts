@@ -129,6 +129,8 @@ describe("MCP tool helpers", () => {
       .rejects.toThrow(/databaseId is required/);
     await fakeServer.call("list_stock", { limit: 1, databaseId: "demo" });
     expect(transport.calls.at(-1)?.database).toBe("12345678_2026.mdb");
+    expect(transport.calls.at(-1)?.xml).toContain('ico="12345678"');
+    expect(transport.calls.at(-1)?.xml).not.toContain('ico="00000000"');
 
     const units = await fakeServer.call("list_accounting_units", {
       query: "novak",
@@ -284,6 +286,8 @@ describe("MCP tool helpers", () => {
     expect(created.structuredContent.count).toBe(2);
     expect(created.structuredContent.preview).toHaveLength(1);
     expect(created.structuredContent.summary.total).toBe(3630);
+    expect(transport.calls.at(-1)?.database).toBe("12345678_2026.mdb");
+    expect(transport.calls.at(-1)?.xml).toContain('ico="12345678"');
     expect(created.content.some((item: any) => item.type === "resource_link")).toBe(true);
 
     const exportDefaults = {
@@ -332,6 +336,37 @@ describe("MCP tool helpers", () => {
       file: "records.ndjson"
     });
     expect(recordsResource.contents[0].text).toContain("FV001");
+  });
+
+  it("infers dataPack ICO from direct database names when no registry is configured", async () => {
+    const fakeServer = new CapturingServer();
+    const transport = new FakeTransport();
+    const client = new PohodaClient({ transport, ico: "00000000", database: "" });
+    registerPohodaTools(fakeServer as any, { client });
+
+    await fakeServer.call("list_stock", {
+      limit: 1,
+      databaseId: "StwPh_87654321_2026.mdb"
+    });
+
+    expect(transport.calls.at(-1)?.database).toBe("StwPh_87654321_2026.mdb");
+    expect(transport.calls.at(-1)?.xml).toContain('ico="87654321"');
+    expect(transport.calls.at(-1)?.xml).not.toContain('ico="00000000"');
+  });
+
+  it("does not use the default ICO for explicit databases whose ICO is unknown", async () => {
+    const fakeServer = new CapturingServer();
+    const transport = new FakeTransport();
+    const client = new PohodaClient({ transport, ico: "00000000", database: "" });
+    registerPohodaTools(fakeServer as any, { client });
+
+    await expect(fakeServer.call("list_stock", {
+      limit: 1,
+      databaseId: "UnknownCompany.mdb"
+    })).rejects.toThrow(/ICO is unknown/);
+
+    expect(transport.calls.at(-1)?.xml).toContain("listAccountingUnitRequest");
+    expect(transport.calls.some((call) => call.database === "UnknownCompany.mdb")).toBe(false);
   });
 
   it("keeps invoice export home and foreign currency totals separate", async () => {

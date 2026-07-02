@@ -39,6 +39,7 @@ export type TransportOptions = {
   xsltOutput?: string;
   timeoutSeconds?: number;
   databaseOverride?: string;
+  dataPackIco?: string;
   omitDatabase?: boolean;
   [key: string]: unknown;
 };

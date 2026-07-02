@@ -22,6 +22,11 @@ export type PohodaServerContext = {
   exportStore?: ExportStore | undefined;
 };
 
+type DatabaseTarget = {
+  database: string;
+  ico: string;
+};
+
 const itemSchema = z.object({
   text: z.string(),
   quantity: z.number().default(1),
@@ -228,7 +233,7 @@ const dataExportSpecSchema = z.object({
 });
 
 const databaseIdSchema = z.string().default("").describe(
-  "Registry id or exact POHODA database name. Prefer passing this explicitly on every accounting-unit-specific call; omit only when a configured default database is intentionally used."
+  "Registry id or exact POHODA database name. Prefer passing this explicitly on every accounting-unit-specific call. The MCP must also know the unit ICO for the dataPack wrapper, from registry/live discovery or an 8-digit ICO in the database filename."
 );
 
 export function registerPohodaTools(server: McpServer, context: PohodaServerContext): void {
@@ -338,6 +343,7 @@ export function registerPohodaTools(server: McpServer, context: PohodaServerCont
       throw new Error("documentType is required for order exports (receivedOrder or issuedOrder).");
     }
     assertExtId(args.extId, args.extSystemName);
+    const target = await databaseTarget(args.databaseId);
     const filter = clean({
       id: args.id || undefined,
       extId: args.extId ? { ids: args.extId, exSystemName: args.extSystemName } : undefined,
@@ -355,7 +361,7 @@ export function registerPohodaTools(server: McpServer, context: PohodaServerCont
       idFrom: args.idFrom,
       count: args.count || args.limit,
       restrictions: documentRestrictions(args.agenda, args),
-      database: await databaseName(args.databaseId)
+      ...targetOptions(target)
     })), args.limit));
   });
 
@@ -375,6 +381,7 @@ export function registerPohodaTools(server: McpServer, context: PohodaServerCont
     },
     annotations: { readOnlyHint: true, openWorldHint: true }
   }, async (args) => {
+    const target = await databaseTarget(args.databaseId);
     assertExtId(args.extId, args.extSystemName);
     return jsonText(jsonList(assertOk(await client.listRecords("stock", clean({
       id: args.id || undefined,
@@ -392,7 +399,7 @@ export function registerPohodaTools(server: McpServer, context: PohodaServerCont
         "lStk:stockSerialNumber": args.includeStockSerialNumber, "lStk:stockPriceItem": args.includeStockPriceItem, "lStk:stockParameters": args.includeStockParameters,
         "lStk:attachments": args.includeAttachments
       }),
-      database: await databaseName(args.databaseId)
+      ...targetOptions(target)
     })), args.limit));
   });
 
@@ -408,6 +415,7 @@ export function registerPohodaTools(server: McpServer, context: PohodaServerCont
     },
     annotations: { readOnlyHint: true, openWorldHint: true }
   }, async (args) => {
+    const target = await databaseTarget(args.databaseId);
     assertExtId(args.extId, args.extSystemName);
     return jsonText(jsonList(assertOk(await client.listRecords("addressbook", clean({
       id: args.id || undefined,
@@ -417,7 +425,7 @@ export function registerPohodaTools(server: McpServer, context: PohodaServerCont
     }), "", {
       idFrom: args.idFrom, count: args.count || args.limit,
       restrictions: clean({ "lAdb:attachments": args.includeAttachments }),
-      database: await databaseName(args.databaseId)
+      ...targetOptions(target)
     })), args.limit));
   });
 
@@ -430,13 +438,14 @@ export function registerPohodaTools(server: McpServer, context: PohodaServerCont
     },
     annotations: { readOnlyHint: true, openWorldHint: true }
   }, async (args) => {
+    const target = await databaseTarget(args.databaseId);
     assertExportAgendaFilters(args.agenda, args);
     return jsonText(jsonList(assertOk(await client.listRecords(args.agenda, clean({
       id: args.id || undefined, lastChanges: args.lastChanges, userFilterName: args.userFilterName, queryFilter: args.queryFilter
     }), "", {
       idFrom: args.idFrom,
       count: exportAgendasWithoutServerLimit.includes(args.agenda as any) ? args.count : (args.count || args.limit),
-      database: await databaseName(args.databaseId)
+      ...targetOptions(target)
     })), args.limit));
   });
 
@@ -459,20 +468,20 @@ export function registerPohodaTools(server: McpServer, context: PohodaServerCont
     annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true }
   }, async ({ operations, databaseId, dataPackId }) => {
     const plans = operations.map((operation, index) => batchListOperationPlan(operation, index));
-    const database = await databaseName(databaseId);
+    const target = await databaseTarget(databaseId);
     const response = await client.listRecordsBatch(plans.map((plan) => ({
       agenda: plan.agenda,
       filter: plan.filter,
       subType: plan.subtype,
       options: plan.options,
       note: `${plan.requestId}:${plan.tool}`
-    })), dataPackId, clean({ databaseOverride: database }));
+    })), dataPackId, targetOptions(target));
     const data = response.toArray();
     const results = plans.map((plan, index) => compactBatchListResult(plan, data.items[index]));
     const structuredContent = {
       ok: data.state === "ok" && results.every((result) => result.ok),
       state: data.state,
-      database: activeDatabase(database),
+      database: activeDatabase(target),
       operationCount: plans.length,
       transport: data.transport,
       results
@@ -497,7 +506,7 @@ export function registerPohodaTools(server: McpServer, context: PohodaServerCont
     },
     annotations: { destructiveHint: false, idempotentHint: false, openWorldHint: true }
   }, async ({ items, dataPackId, databaseId, ...header }) =>
-    jsonResult(assertOk(await client.createInvoice(header, items, dataPackId, await databaseName(databaseId)))));
+    jsonResult(assertOk(await client.createInvoice(header, items, dataPackId, targetOptions(await databaseTarget(databaseId))))));
 
   server.registerTool("create_address", {
     title: "Create Pohoda contact",
@@ -507,7 +516,7 @@ export function registerPohodaTools(server: McpServer, context: PohodaServerCont
     },
     annotations: { destructiveHint: false, idempotentHint: false, openWorldHint: true }
   }, async ({ dataPackId, databaseId, ...data }) =>
-    jsonResult(assertOk(await client.createAddress(data, dataPackId, await databaseName(databaseId)))));
+    jsonResult(assertOk(await client.createAddress(data, dataPackId, targetOptions(await databaseTarget(databaseId))))));
 
   server.registerTool("batch_create_invoices", {
     title: "Batch create Pohoda invoices with optional contacts",
@@ -520,19 +529,19 @@ export function registerPohodaTools(server: McpServer, context: PohodaServerCont
     annotations: { destructiveHint: false, idempotentHint: false, openWorldHint: true }
   }, async ({ invoices, dataPackId, databaseId }) => {
     const plans = invoices.map((entry, index) => batchInvoiceCreatePlan(entry, index));
-    const database = await databaseName(databaseId);
+    const target = await databaseTarget(databaseId);
     const response = await client.createInvoiceBatch(plans.map((plan) => ({
       requestId: plan.requestId,
       ...(plan.address ? { address: plan.address } : {}),
       header: plan.header,
       items: plan.items
-    })), dataPackId, database);
+    })), dataPackId, targetOptions(target));
     const data = response.toArray();
     const results = compactBatchCreateInvoiceResults(plans, data.items);
     const structuredContent = {
       ok: data.state === "ok" && results.every((result) => result.ok),
       state: data.state,
-      database: activeDatabase(database),
+      database: activeDatabase(target),
       invoiceCount: plans.length,
       dataPackItemCount: data.items.length,
       transport: data.transport,
@@ -555,14 +564,14 @@ export function registerPohodaTools(server: McpServer, context: PohodaServerCont
     annotations: { destructiveHint: false, idempotentHint: false, openWorldHint: true }
   }, async ({ operations, dataPackId, databaseId }) => {
     const plans = operations.map((operation, index) => batchWriteOperationPlan(operation, index));
-    const database = await databaseName(databaseId);
-    const response = await client.writeBatch(plans.map((plan) => plan.operation), dataPackId, database);
+    const target = await databaseTarget(databaseId);
+    const response = await client.writeBatch(plans.map((plan) => plan.operation), dataPackId, targetOptions(target));
     const data = response.toArray();
     const results = plans.map((plan, index) => compactBatchWriteResult(plan, data.items[index]));
     const structuredContent = {
       ok: data.state === "ok" && results.every((result) => result.ok),
       state: data.state,
-      database: activeDatabase(database),
+      database: activeDatabase(target),
       operationCount: plans.length,
       transport: data.transport,
       results
@@ -585,7 +594,7 @@ export function registerPohodaTools(server: McpServer, context: PohodaServerCont
     },
     annotations: { destructiveHint: false, idempotentHint: false, openWorldHint: true }
   }, async ({ dataPackId, databaseId, ...data }) =>
-    jsonResult(assertOk(await client.createStock(data, dataPackId, await databaseName(databaseId)))));
+    jsonResult(assertOk(await client.createStock(data, dataPackId, targetOptions(await databaseTarget(databaseId))))));
 
   server.registerTool("create_order", {
     title: "Create Pohoda order",
@@ -595,7 +604,7 @@ export function registerPohodaTools(server: McpServer, context: PohodaServerCont
     },
     annotations: { destructiveHint: false, idempotentHint: false, openWorldHint: true }
   }, async ({ items, dataPackId, databaseId, ...header }) =>
-    jsonResult(assertOk(await client.createOrder(header, items, dataPackId, await databaseName(databaseId)))));
+    jsonResult(assertOk(await client.createOrder(header, items, dataPackId, targetOptions(await databaseTarget(databaseId))))));
 
   server.registerTool("print", {
     title: "Print Pohoda record",
@@ -612,21 +621,21 @@ export function registerPohodaTools(server: McpServer, context: PohodaServerCont
     },
     annotations: { destructiveHint: false, idempotentHint: false, openWorldHint: true }
   }, async ({ databaseId, ...options }) =>
-    jsonResult(assertOk(await client.printRecord({ ...options, database: await databaseName(databaseId) }))));
+    jsonResult(assertOk(await client.printRecord({ ...options, ...targetOptions(await databaseTarget(databaseId)) }))));
 
   server.registerTool("raw_xml", {
     title: "Send raw Pohoda XML",
     inputSchema: { xml: z.string().min(1), note: z.string().default(""), dataPackId: z.string().default(""), databaseId: databaseIdSchema },
     annotations: { destructiveHint: true, idempotentHint: false, openWorldHint: true }
   }, async ({ xml, note, dataPackId, databaseId }) =>
-    jsonResult(assertOk(await client.sendRawXml(xml, note, dataPackId, clean({ databaseOverride: await databaseName(databaseId) })))));
+    jsonResult(assertOk(await client.sendRawXml(xml, note, dataPackId, targetOptions(await databaseTarget(databaseId))))));
 
   server.registerTool("raw_xml_batch", {
     title: "Send raw Pohoda XML batch",
     inputSchema: { items: z.array(z.string().min(1)).min(1), note: z.string().default(""), dataPackId: z.string().default(""), databaseId: databaseIdSchema },
     annotations: { destructiveHint: true, idempotentHint: false, openWorldHint: true }
   }, async ({ items, note, dataPackId, databaseId }) =>
-    jsonResult(assertOk(await client.sendRawXmlBatch(items, note, dataPackId, clean({ databaseOverride: await databaseName(databaseId) })))));
+    jsonResult(assertOk(await client.sendRawXmlBatch(items, note, dataPackId, targetOptions(await databaseTarget(databaseId))))));
 
   server.registerTool("create_data_export", {
     title: "Create compact persisted Pohoda data export",
@@ -653,8 +662,8 @@ export function registerPohodaTools(server: McpServer, context: PohodaServerCont
     outputSchema: exportOutputSchema(),
     annotations: { readOnlyHint: true, idempotentHint: false, openWorldHint: true }
   }, async (args) => {
-    const database = await databaseName(args.databaseId);
-    const snapshot = await createExportSnapshot(args, database);
+    const target = await databaseTarget(args.databaseId);
+    const snapshot = await createExportSnapshot(args, target);
     const page = await exportStore.page(snapshot.exportId, "", args.previewLimit || 1);
     const structuredContent = exportResponse(snapshot, page.records.slice(0, args.previewLimit), page.nextCursor);
     return exportToolResult(structuredContent, "Created POHODA export snapshot.");
@@ -676,8 +685,8 @@ export function registerPohodaTools(server: McpServer, context: PohodaServerCont
     },
     annotations: { readOnlyHint: true, idempotentHint: false, openWorldHint: true }
   }, async ({ exports, databaseId, dataPackId }) => {
-    const database = await databaseName(databaseId);
-    const snapshots = await createExportBundleSnapshots(exports, database, dataPackId);
+    const target = await databaseTarget(databaseId);
+    const snapshots = await createExportBundleSnapshots(exports, target, dataPackId);
     const exportResults = await Promise.all(snapshots.map(async ({ requestId, snapshot, previewLimit }) => {
       const page = await exportStore.page(snapshot.exportId, "", previewLimit || 1);
       return {
@@ -687,7 +696,7 @@ export function registerPohodaTools(server: McpServer, context: PohodaServerCont
     }));
     const structuredContent = {
       ok: true,
-      database: activeDatabase(database),
+      database: activeDatabase(target),
       exportCount: exportResults.length,
       exports: exportResults
     };
@@ -756,26 +765,73 @@ export function registerPohodaTools(server: McpServer, context: PohodaServerCont
 
   registerResources(server, { ...context, exportStore });
 
-  async function databaseName(databaseId: string): Promise<string> {
+  async function databaseTarget(databaseId = ""): Promise<DatabaseTarget> {
     const trimmed = databaseId.trim();
     if (trimmed === "") {
       if (client.getDatabase().trim() !== "") {
-        return "";
+        return { database: "", ico: "" };
       }
       throw new Error("databaseId is required for this tool because no default POHODA database is configured. Use list_accounting_units or list_xml_databases, then pass the registry id or exact database name as databaseId.");
     }
     if (!databaseRegistry) {
-      return trimmed;
+      return directDatabaseTarget(trimmed);
     }
     try {
-      return (await databaseRegistry.get(trimmed)).database;
+      return await targetFromDatabase(await databaseRegistry.get(trimmed));
     } catch {
-      return trimmed;
+      return directDatabaseTarget(trimmed);
     }
   }
 
-  function activeDatabase(databaseOverride: string): string {
-    return databaseOverride || client.getDatabase();
+  function targetOptions(target: DatabaseTarget): Record<string, string> {
+    return clean({
+      databaseOverride: target.database,
+      dataPackIco: target.ico
+    }) as Record<string, string>;
+  }
+
+  function activeDatabase(target: DatabaseTarget): string {
+    return target.database || client.getDatabase();
+  }
+
+  function activeIco(target: DatabaseTarget): string {
+    return target.ico || client.getIco();
+  }
+
+  async function targetFromDatabase(item: XmlDatabase): Promise<DatabaseTarget> {
+    const ico = item.ico ?? inferIco(item.database);
+    if (ico !== "") {
+      return { database: item.database, ico };
+    }
+    return directDatabaseTarget(item.database);
+  }
+
+  async function directDatabaseTarget(database: string): Promise<DatabaseTarget> {
+    const inferred = inferIco(database);
+    if (inferred !== "") {
+      return { database, ico: inferred };
+    }
+    const live = await liveDatabaseTarget(database);
+    if (live) {
+      return live;
+    }
+    if (database === client.getDatabase() && client.getIco() !== "") {
+      return { database, ico: client.getIco() };
+    }
+    throw new Error(`ICO is unknown for POHODA database '${database}'. Add this database with its ico to POHODA_XML_DATABASES_FILE, use a database filename containing the 8-digit ICO, or choose it from list_accounting_units so the MCP can build a dataPack for the correct accounting unit.`);
+  }
+
+  async function liveDatabaseTarget(idOrDatabase: string): Promise<DatabaseTarget | undefined> {
+    try {
+      const units = extractAccountingUnits(assertOk(await client.listAccountingUnits()), 10_000);
+      const item = units.find((unit) => unit.id === idOrDatabase || unit.database === idOrDatabase || unit.path === idOrDatabase);
+      if (item && item.ico) {
+        return { database: item.database, ico: item.ico };
+      }
+    } catch {
+      // Live lookup is best-effort; callers report the unresolved ICO clearly.
+    }
+    return undefined;
   }
 
   /*
@@ -799,7 +855,7 @@ export function registerPohodaTools(server: McpServer, context: PohodaServerCont
     userFilterName: string;
     pageSize: number;
     maxRecords: number;
-  }, database: string): Promise<ExportSnapshot> {
+  }, target: DatabaseTarget): Promise<ExportSnapshot> {
     const plan = exportPlan(args);
     if (args.kind === "export_agenda") {
       assertExportAgendaFilters(args.agenda, {
@@ -828,7 +884,7 @@ export function registerPohodaTools(server: McpServer, context: PohodaServerCont
     let complete = false;
     while (records.length < args.maxRecords) {
       const count = Math.min(args.pageSize, args.maxRecords - records.length);
-      const options = plan.useServerLimit ? { idFrom, count, database } : { database };
+      const options = plan.useServerLimit ? { idFrom, count, ...targetOptions(target) } : targetOptions(target);
       const response = assertOk(await client.listRecords(plan.agenda, filters, plan.subtype, options));
       fetchedPages += 1;
       const pageRecords = extractRecords(response).map((record, pageIndex) => normalizeExportRecord(record, records.length + pageIndex));
@@ -845,8 +901,8 @@ export function registerPohodaTools(server: McpServer, context: PohodaServerCont
       kind: args.kind,
       agenda: plan.agenda,
       subtype: plan.subtype,
-      database: activeDatabase(database),
-      ico: client.getIco(),
+      database: activeDatabase(target),
+      ico: activeIco(target),
       filters,
       paging: {
         requestedPageSize: args.pageSize,
@@ -859,7 +915,7 @@ export function registerPohodaTools(server: McpServer, context: PohodaServerCont
     });
   }
 
-  async function createExportBundleSnapshots(specs: Array<z.infer<typeof dataExportSpecSchema>>, database: string, dataPackId: string): Promise<Array<{
+  async function createExportBundleSnapshots(specs: Array<z.infer<typeof dataExportSpecSchema>>, target: DatabaseTarget, dataPackId: string): Promise<Array<{
     requestId: string;
     previewLimit: number;
     snapshot: ExportSnapshot;
@@ -907,12 +963,12 @@ export function registerPohodaTools(server: McpServer, context: PohodaServerCont
           agenda: state.plan.agenda,
           filter: state.filters,
           subType: state.plan.subtype,
-          options: state.plan.useServerLimit ? { idFrom: state.idFrom, count, database } : { database },
+          options: state.plan.useServerLimit ? { idFrom: state.idFrom, count } : {},
           note: `${state.requestId}:page-${state.fetchedPages + 1}`
         };
       });
       const roundId = dataPackId === "" ? "" : suffixedDataPackId(dataPackId, `-r${round + 1}`);
-      const response = assertOk(await client.listRecordsBatch(requests, roundId, clean({ databaseOverride: database })));
+      const response = assertOk(await client.listRecordsBatch(requests, roundId, targetOptions(target)));
       active.forEach((state, index) => {
         const item = response.items?.[index];
         state.fetchedPages += 1;
@@ -937,8 +993,8 @@ export function registerPohodaTools(server: McpServer, context: PohodaServerCont
         kind: state.spec.kind,
         agenda: state.plan.agenda,
         subtype: state.plan.subtype,
-        database: activeDatabase(database),
-        ico: client.getIco(),
+        database: activeDatabase(target),
+        ico: activeIco(target),
         filters: state.filters,
         paging: {
           requestedPageSize: state.spec.pageSize,
@@ -1855,6 +1911,10 @@ function decodeAccountingCursor(cursor: string): number {
 
 function databaseNameFromPath(path: string): string {
   return path.split(/[\\/]/).pop() || path;
+}
+
+function inferIco(value: string): string {
+  return value.match(/(?:^|[^0-9])([0-9]{8})(?:[^0-9]|$)/)?.[1] ?? "";
 }
 
 function safeId(value: string): string {
