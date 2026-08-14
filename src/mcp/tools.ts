@@ -1,3 +1,4 @@
+import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { McpServer, ResourceTemplate } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
@@ -19,6 +20,7 @@ import type { PohodaClient } from "../pohoda/client.js";
 import type { XmlDatabase, XmlDatabaseRegistry } from "../pohoda/database-registry.js";
 import type { PohodaResponse } from "../pohoda/response.js";
 import { ExportStore, type CurrencyTotal, type ExportRecord, type ExportSnapshot, summarizeRecords } from "./export-store.js";
+import { preparePdfPages } from "./pdf-pages.js";
 
 export type PohodaServerContext = {
   client: PohodaClient;
@@ -59,8 +61,18 @@ const itemSchema = z.object({
   CodePDP: z.string().default("")
 });
 
+const dateTaxSchema = z.string().default("").describe(
+  "YYYY-MM-DD. POHODA VAT date. On received taxable documents this is the deduction/delivery date and determines the VAT/control-statement reporting period. It is not a substitute for the supplier's original DUZP when that date differs."
+);
+const dateKHDPHSchema = z.string().default("").describe(
+  "YYYY-MM-DD. Datum KH DPH: the source document's DUZP/DPPD reported in Czech VAT control-statement detail. For received taxable invoices, other liabilities, cash expenses, and corrective tax documents, copy the source DUZP here explicitly. If it equals dateTax, repeat the same date in both fields; if it differs, preserve the source DUZP here. Do not normally set this on an ordinary issued invoice."
+);
+const dateApplicationVATSchema = z.string().default("").describe(
+  "YYYY-MM-DD. Date VAT is applied, primarily for corrective tax documents; this controls VAT-return treatment and is distinct from dateKHDPH/DPPD."
+);
+
 const invoiceCreateSchema = z.object({
-  type: z.enum(invoiceTypes),
+  type: z.enum(invoiceTypes).describe("POHODA invoice type. dateKHDPH applies especially to received taxable types, commitment, and issued/received corrective tax documents; it is not normally used for issuedInvoice."),
   items: z.array(itemSchema).min(1),
   extId: z.string().default(""),
   extSystemName: z.string().default(""),
@@ -81,10 +93,10 @@ const invoiceCreateSchema = z.object({
   symConst: z.string().default(""),
   symSpec: z.string().default(""),
   dateDue: z.string().default(""),
-  dateTax: z.string().default(""),
+  dateTax: dateTaxSchema,
   dateAccounting: z.string().default(""),
-  dateApplicationVAT: z.string().default(""),
-  dateKHDPH: z.string().default(""),
+  dateApplicationVAT: dateApplicationVATSchema,
+  dateKHDPH: dateKHDPHSchema,
   dateDelivery: z.string().default(""),
   paymentType: z.string().default(""),
   accountIds: z.string().default(""),
@@ -120,8 +132,8 @@ const cashVoucherCreateSchema = z.object({
   originalDocument: z.string().default(""),
   date: z.string(),
   datePayment: z.string().default(""),
-  dateTax: z.string().default(""),
-  dateKHDPH: z.string().default(""),
+  dateTax: dateTaxSchema,
+  dateKHDPH: dateKHDPHSchema,
   accounting: z.string().default(""),
   classificationVAT: z.string().default(""),
   classificationKVDPH: z.string().default(""),
@@ -264,13 +276,13 @@ const documentHeaderSchema = z.object({
   date: z.string().default(""),
   datePayment: z.string().default(""),
   dateStatement: z.string().default(""),
-  dateTax: z.string().default(""),
+  dateTax: dateTaxSchema,
   dateAccounting: z.string().default(""),
   dateDelivery: z.string().default(""),
   dateOrder: z.string().default(""),
   dateOfReceipt: z.string().default(""),
   validTill: z.string().default(""),
-  dateKHDPH: z.string().default(""),
+  dateKHDPH: dateKHDPHSchema,
   dateKVDPH: z.string().default(""),
   numberOrder: z.string().default(""),
   text: z.string().default(""),
@@ -621,9 +633,84 @@ const databaseIdSchema = z.string().default("").describe(
   "Registry id or exact POHODA database name. Prefer passing this explicitly on every accounting-unit-specific call. The MCP must also know the unit ICO for the dataPack wrapper, from registry/live discovery or an 8-digit ICO in the database filename."
 );
 
+const prepareScannedPdfSchema = z.object({
+  pdfPath: z.string().min(1).describe("Absolute path, or path relative to the MCP working directory, of the source PDF accessible to this MCP server."),
+  outputDirectory: z.string().default("").describe("Optional output root. A content-specific subdirectory is created inside it. Defaults to POHODA_DOCUMENT_IMAGE_DIR or var/document-pages."),
+  format: z.enum(["jpeg", "png"]).default("jpeg"),
+  dpi: z.number().int().min(96).max(300).default(180),
+  jpegQuality: z.number().int().min(50).max(100).default(82),
+  firstPage: z.number().int().min(1).default(1),
+  lastPage: z.number().int().min(0).default(0).describe("Inclusive last page; 0 means the final PDF page."),
+  maxPages: z.number().int().min(1).max(200).default(50),
+  maxFileMb: z.number().int().min(1).max(1_000).default(250),
+  concurrency: z.number().int().min(1).max(8).default(4),
+  password: z.string().default(""),
+  inlineImages: z.boolean().default(true).describe("Return rendered pages as MCP image content so the model can inspect them immediately."),
+  maxInlinePages: z.number().int().min(1).max(100).default(24)
+});
+
 export function registerPohodaTools(server: McpServer, context: PohodaServerContext): void {
   const { client, databaseRegistry } = context;
   const exportStore = context.exportStore ?? new ExportStore(process.env.POHODA_XML_EXPORT_DIR ?? join(process.cwd(), "var", "exports"));
+
+  server.registerTool("prepare_scanned_pdf", {
+    title: "Render a scanned PDF into page images",
+    description: "Renders PDF pages into separate compact JPEG or lossless PNG files with bounded parallelism and cache reuse. By default all selected pages are also returned as MCP image content, allowing the model to inspect a scanned invoice/receipt bundle immediately. Render once, then delegate disjoint page paths to sub-agents for parallel extraction; keep POHODA writes centralized and batched after validation.",
+    inputSchema: prepareScannedPdfSchema.shape,
+    outputSchema: {
+      pdfPath: z.string(),
+      outputDirectory: z.string(),
+      manifestPath: z.string(),
+      pageCount: z.number(),
+      selectedPageCount: z.number(),
+      firstPage: z.number(),
+      lastPage: z.number(),
+      format: z.enum(["jpeg", "png"]),
+      dpi: z.number(),
+      cached: z.boolean(),
+      durationMs: z.number(),
+      inlineImageCount: z.number(),
+      pages: z.array(z.object({
+        page: z.number(),
+        path: z.string(),
+        mimeType: z.enum(["image/jpeg", "image/png"]),
+        width: z.number(),
+        height: z.number(),
+        bytes: z.number()
+      }))
+    },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false }
+  }, async ({ outputDirectory, password, inlineImages, maxInlinePages, ...options }) => {
+    const prepared = await preparePdfPages({
+      ...options,
+      outputDirectory: outputDirectory || undefined,
+      password: password || undefined
+    });
+    const inlinePages = inlineImages ? prepared.pages.slice(0, maxInlinePages) : [];
+    const inlineContent = (await Promise.all(inlinePages.map(async (page) => ([{
+      type: "text" as const,
+      text: `PDF page ${page.page} (${page.width}x${page.height}, ${page.path})`
+    }, {
+      type: "image" as const,
+      data: (await readFile(page.path)).toString("base64"),
+      mimeType: page.mimeType
+    }])))).flat();
+    const structuredContent = {
+      ...prepared,
+      inlineImageCount: inlinePages.length
+    };
+    const omitted = prepared.selectedPageCount - inlinePages.length;
+    const note = omitted > 0 && inlineImages
+      ? ` Rendered every page, but only inlined ${inlinePages.length}; use the returned page paths or call a smaller firstPage/lastPage range to inline the remaining ${omitted}.`
+      : "";
+    return {
+      content: [{
+        type: "text" as const,
+        text: `Rendered ${prepared.selectedPageCount}/${prepared.pageCount} PDF pages to ${prepared.outputDirectory} in ${prepared.durationMs} ms${prepared.cached ? " (cache hit)" : ""}.${note}`
+      }, ...inlineContent],
+      structuredContent
+    };
+  });
 
   server.registerTool("status", {
     title: "Check Pohoda XML transport status",
@@ -892,7 +979,7 @@ export function registerPohodaTools(server: McpServer, context: PohodaServerCont
 
   server.registerTool("create_invoice", {
     title: "Create Pohoda invoice",
-    description: "Creates one POHODA invoice document. Supports the official invoiceType enum including issued/received invoices, other receivables (receivable), and other liabilities (commitment).",
+    description: "Creates one POHODA invoice document. Supports the official invoiceType enum including issued/received invoices, other receivables (receivable), and other liabilities (commitment). For a received taxable or corrective document, send both dateTax (deduction/reporting date) and dateKHDPH (source DUZP/DPPD), even when they are equal.",
     inputSchema: {
       ...invoiceCreateSchema.shape,
       dataPackId: z.string().default(""), databaseId: databaseIdSchema
@@ -903,7 +990,7 @@ export function registerPohodaTools(server: McpServer, context: PohodaServerCont
 
   server.registerTool("create_other_liability", {
     title: "Create Pohoda other liability",
-    description: "Creates one Ostatni zavazek using inv:invoice with invoiceType=commitment. Use this for other payables/liabilities instead of raw XML.",
+    description: "Creates one Ostatni zavazek using inv:invoice with invoiceType=commitment. Use this for other payables/liabilities instead of raw XML. For a taxable source document, send both dateTax (deduction/reporting date) and dateKHDPH (source DUZP/DPPD), even when they are equal.",
     inputSchema: {
       ...otherLiabilityCreateSchema.shape,
       dataPackId: z.string().default(""), databaseId: databaseIdSchema
@@ -935,7 +1022,7 @@ export function registerPohodaTools(server: McpServer, context: PohodaServerCont
 
   server.registerTool("create_cash_voucher", {
     title: "Create Pohoda cash voucher",
-    description: "Creates one cash register document (Pokladna) using vch:voucher. Use type=receipt for income cash receipts and type=expense for cash expenses.",
+    description: "Creates one cash register document (Pokladna) using vch:voucher. Use type=receipt for income cash receipts and type=expense for cash expenses. For a taxable cash expense, send both dateTax (deduction/reporting date) and dateKHDPH (source DUZP/DPPD), even when they are equal.",
     inputSchema: {
       ...cashVoucherCreateSchema.shape,
       dataPackId: z.string().default(""), databaseId: databaseIdSchema
@@ -957,7 +1044,7 @@ export function registerPohodaTools(server: McpServer, context: PohodaServerCont
 
   server.registerTool("batch_create_invoices", {
     title: "Batch create Pohoda invoices with optional contacts",
-    description: "Creates up to 50 invoices for one accounting unit in a single POHODA /XML run. Use this instead of repeated create_address/create_invoice calls when creating multiple invoices, especially when each invoice needs a new addressbook contact.",
+    description: "Creates up to 50 invoices for one accounting unit in a single POHODA /XML run. Use this instead of repeated create_address/create_invoice calls when creating multiple invoices, especially when each invoice needs a new addressbook contact. Each received taxable/corrective invoice must include dateTax and dateKHDPH; repeat the same date in both when the source DUZP/DPPD equals the deduction date.",
     inputSchema: {
       invoices: z.array(batchInvoiceCreateSchema).min(1).max(50),
       dataPackId: z.string().default(""),
@@ -1616,6 +1703,18 @@ function registerResources(server: McpServer, context: PohodaServerContext): voi
         },
         efficiency: "Tools default server-side count to limit. Increase count only when needed; use idFrom for paging.",
         filters: "Prefer explicit filters first. extId requires extSystemName."
+      },
+      scannedDocuments: {
+        tool: "prepare_scanned_pdf",
+        use: "Call once for PDFs containing scanned invoices or receipts. It renders pages concurrently, caches unchanged inputs, writes numbered page images, and inlines images by default so they are immediately visible to the model.",
+        delegation: "When there are at least four independent pages/documents and sub-agents are available, give each sub-agent a disjoint set of returned page paths. Sub-agents extract only and return structured fields plus confidence and page-boundary notes. The parent reconciles multi-page documents, duplicates, totals, VAT, supplier/customer identity, and target accounting unit before any POHODA write.",
+        writing: "After extraction and validation, group records by databaseId and use one batch_write or batch_create_invoices call per accounting unit. Different accounting-unit batches may run in parallel; never let parallel readers independently create duplicate POHODA records."
+      },
+      vatDates: {
+        dateTax: "For received taxable documents, the deduction/delivery date that determines the VAT-return and control-statement reporting period.",
+        dateKHDPH: "Datum KH DPH: the supplier's original DUZP/DPPD from the source document. Send it explicitly for received taxable invoices, other liabilities, cash expenses, internal documents, and corrective tax documents. Repeat dateTax when both dates are equal; preserve the original source date when they differ.",
+        issuedInvoices: "Do not normally set dateKHDPH on an ordinary issuedInvoice. Issued corrective tax documents are an exception.",
+        fallback: "As a defensive fallback on applicable document types only, the XML builder copies dateTax to dateKHDPH when dateKHDPH was omitted. This cannot recover a distinct supplier DUZP, so extraction must still provide both fields."
       },
       writing: {
         use: {

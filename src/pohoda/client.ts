@@ -544,6 +544,7 @@ function buildDocumentHeader(config: DocumentConfig, header: Record<string, any>
 
 function buildGenericHeader(config: DocumentConfig, header: Record<string, any>): XmlObject {
   const prefix = config.prefix;
+  header = withDefaultControlStatementDate(header, prefix === "int");
   const documentType = normalizeDocumentType(prefix, header.type ?? (config.typeField ? header[config.typeField] : undefined) ?? config.typeDefault);
   return filterEmpty({
     [`${prefix}:id`]: Number(header.id ?? 0) > 0 ? Number(header.id) : undefined,
@@ -1154,8 +1155,19 @@ function optionalNamespaceObject(prefix: string, value: unknown): XmlObject | un
   return Object.keys(object).length > 0 ? object : undefined;
 }
 
+function withDefaultControlStatementDate(header: Record<string, any>, applicable: boolean): Record<string, any> {
+  if (!applicable || String(header.dateKHDPH ?? "").trim() !== "" || String(header.dateTax ?? "").trim() === "") {
+    return header;
+  }
+  return { ...header, dateKHDPH: header.dateTax };
+}
+
 function buildInvoiceData(header: Record<string, any>, items: Record<string, any>[]): XmlObject {
   const type = header.type || "issuedInvoice";
+  header = withDefaultControlStatementDate(header, [
+    "receivedInvoice", "receivedCreditNotice", "receivedDebitNote", "receivedCorrectiveTax",
+    "commitment", "issuedCreditNotice", "issuedDebitNote", "issuedCorrectiveTax"
+  ].includes(type));
   const currency = header.currency ?? "";
   const invoiceHeader = filterEmpty({
     "inv:invoiceType": type,
@@ -1230,6 +1242,7 @@ function buildInvoiceData(header: Record<string, any>, items: Record<string, any
 }
 
 function buildVoucherData(header: Record<string, any>, items: Record<string, any>[]): XmlObject {
+  header = withDefaultControlStatementDate(header, (header.type ?? header.voucherType) === "expense");
   const currency = header.currency ?? "";
   const data: XmlObject = {
     "vch:voucherHeader": filterEmpty({

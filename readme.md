@@ -11,7 +11,7 @@ This backend does not require POHODA mServer. It writes a request XML file and a
 
 ## Setup
 
-Requires Node.js 22 or newer.
+Requires Node.js 22.13 or newer.
 
 ```bash
 npm install
@@ -46,6 +46,7 @@ and then starts `dist/index.js`.
 | `POHODA_XML_DATABASES_FILE` | Optional JSON registry of databases | empty |
 | `POHODA_DATA_DIR` | Optional folder scanned for database-like files | empty |
 | `POHODA_XML_EXPORT_DIR` | Persisted export snapshots/resources | `XML/var/exports` |
+| `POHODA_DOCUMENT_IMAGE_DIR` | Cached page images created by `prepare_scanned_pdf` | `XML/var/document-pages` |
 
 Example MCP config:
 
@@ -139,6 +140,7 @@ Database and transport:
 
 Read tools:
 
+- `prepare_scanned_pdf`
 - `list_documents`
 - `list_stock`
 - `list_contacts`
@@ -193,6 +195,58 @@ Advanced:
 
 - `raw_xml`
 - `raw_xml_batch`
+
+## Scanned PDF preprocessing
+
+Use `prepare_scanned_pdf` when one uploaded PDF contains scanned invoices or receipts.
+The tool uses PDF.js and a cross-platform native canvas renderer, so it does not require a
+separate Poppler/ImageMagick installation on Windows. It:
+
+- renders each selected PDF page to a numbered JPEG or PNG;
+- renders several pages concurrently with a bounded worker pool;
+- caches output by source file metadata and render settings;
+- returns absolute image paths and dimensions;
+- inlines rendered pages as MCP image content by default so the model can inspect them
+  immediately;
+- supports encrypted PDFs, page ranges, rendering limits, DPI/quality controls, and an
+  optional output root.
+
+Example arguments:
+
+```json
+{
+  "pdfPath": "C:\\Imports\\scanned-invoices.pdf",
+  "format": "jpeg",
+  "dpi": 180,
+  "jpegQuality": 82,
+  "inlineImages": true
+}
+```
+
+For four or more independently readable pages/documents, render once and distribute
+disjoint returned page paths to sub-agents. Each reader should return structured fields,
+source pages, confidence, and continuation markers. The parent agent must merge multi-page
+documents, validate totals/VAT/identity, deduplicate, choose the accounting unit, and then
+perform one `batch_write` or `batch_create_invoices` call per `databaseId`. Reader agents
+must not write to POHODA independently.
+
+### Czech VAT dates on imported documents
+
+For received taxable invoices, other liabilities, and taxable cash expenses, extract and
+send both VAT dates:
+
+- `dateTax` is the deduction/delivery date that determines the VAT-return and control-
+  statement reporting period.
+- `dateKHDPH` is the supplier's original DUZP/DPPD shown on the source document.
+
+When the dates are equal, repeat the same `YYYY-MM-DD` in both fields. When they differ,
+preserve each date; do not replace the source DUZP/DPPD with the later deduction date.
+The same distinction applies to internal and corrective tax documents. Ordinary issued
+invoices do not normally use `dateKHDPH`.
+
+For applicable document types, the XML builder defensively copies `dateTax` into a missing
+`dateKHDPH`. This only protects equal-date documents and cannot infer a different source
+DUZP/DPPD, so agents and sub-agents must still extract both values explicitly.
 
 Use `raw_xml_batch` for schema-specific multi-step workflows where batching several
 `dataPackItem`s into one POHODA process run is more efficient than separate calls.
@@ -286,6 +340,9 @@ snapshot with normal `read_export_page`, `summarize_export`, and resource suppor
   diagnostic for the configured fallback database. If a tool needs an accounting unit and
   neither `databaseId` nor a configured default exists, it fails before running POHODA.
 - Prefer explicit filters and server-side `count`/`idFrom` over large exports.
+- For scanned document bundles, call `prepare_scanned_pdf` once and use its cached page
+  paths for parallel sub-agent extraction. Keep POHODA writes in the parent agent after
+  page-boundary reconciliation, validation, and deduplication.
 - If the task clearly needs several reads from the same accounting unit, plan them first
   and call `batch_list_records` instead of making separate list calls.
 - For larger lists, summaries, or analysis, prefer `create_data_export` instead of

@@ -24,6 +24,66 @@ the intended operational path.
 - For retryable writes, provide a stable `dataPackId` so POHODA duplicate checking can
   help protect against accidental re-imports.
 
+## Scanned PDF Intake
+
+When a user provides one PDF containing scanned invoices, receipts, or other accounting
+documents, call `prepare_scanned_pdf` before trying to inspect the PDF page by page. The
+tool renders all selected pages concurrently, stores stable numbered JPEG/PNG files,
+returns page metadata and paths, and inlines the images by default. Unchanged inputs with
+the same render options use the cache, so do not render the same PDF repeatedly.
+
+Recommended defaults are JPEG, 180 DPI, quality 82, and `inlineImages: true`. Use PNG only
+when lossless rendering is needed for unusually small or degraded print. For very large
+files, process explicit `firstPage`/`lastPage` ranges instead of raising limits without
+reason.
+
+When sub-agents are available and the PDF contains at least four pages/documents that can
+be read independently:
+
+1. Render the PDF once with `prepare_scanned_pdf`.
+2. Divide the returned page paths into disjoint, roughly equal adjacent ranges and ask
+   sub-agents to extract them concurrently. Do not ask every sub-agent to inspect the
+   whole PDF.
+3. Require each sub-agent to return structured document fields, source page numbers,
+   confidence/uncertainties, both `dateTax` and `dateKHDPH` when applicable, and whether
+   a page continues the previous or next document.
+4. Keep extraction read-only. Sub-agents must not create contacts, invoices, receipts, or
+   other POHODA records independently.
+5. The parent agent reconciles multi-page documents, detects duplicates, verifies supplier
+   or customer identity, dates, document numbers, currencies, net/VAT/gross totals, payment
+   method, and target accounting unit.
+6. Group validated records by `databaseId`, then submit one `batch_write` or
+   `batch_create_invoices` call per accounting unit. Different accounting-unit batches may
+   run in parallel; same-unit writes remain ordered in one batch.
+7. Verify the completed write with fresh compact reads/exports and report rejected or
+   uncertain documents separately.
+
+For adjacent pages that may belong to one invoice, preserve overlap as metadata instead
+of importing each page as a separate document. A page image is not automatically one
+accounting document.
+
+## Czech VAT Date Rule
+
+Do not treat `dateTax` and `dateKHDPH` as interchangeable optional fields.
+
+- For a received taxable invoice or other liability, `dateTax` is POHODA's date of
+  deduction/delivery. It determines the VAT-return and control-statement period.
+- `dateKHDPH` is the supplier's original DUZP/DPPD shown on the source document and
+  reported in the control-statement detail.
+- If the dates are equal, explicitly send the same `YYYY-MM-DD` value in both fields.
+  Do not fill only `dateTax`.
+- If they differ, put the deduction/delivery date in `dateTax` and preserve the original
+  source DUZP/DPPD in `dateKHDPH`.
+- Apply the same extraction rule to taxable cash expenses, internal documents,
+  commitments, and corrective tax documents. Do not normally set `dateKHDPH` on an
+  ordinary `issuedInvoice`.
+- Never invent a source DUZP/DPPD from an issue date. Flag the document for review when
+  the relevant date cannot be read reliably.
+
+The XML builder defensively copies `dateTax` into `dateKHDPH` when the latter is omitted
+on an applicable document type. That fallback only protects the equal-date case; it
+cannot recover a distinct supplier date, so extraction must still return both fields.
+
 ## Discovery
 
 Use `list_accounting_units` first when you do not know which client/company/year to use.
@@ -160,6 +220,10 @@ You need the correct POHODA print agenda and report id. For example:
 
 PDF paths are paths on the Windows machine running POHODA, not local paths in this
 project.
+
+`prepare_scanned_pdf` is separate from POHODA printing. Its `pdfPath` must be accessible
+to the machine running this MCP process, and its returned image paths are local to that
+same machine.
 
 ## Parallelism
 

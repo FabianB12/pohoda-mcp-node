@@ -18,13 +18,15 @@ const client = new PohodaClient({ transport, ico: config.ico, database: config.d
 
 const server = new McpServer({
   name: "pohoda-xml-cli",
-  version: "1.0.0",
+  version: "1.1.0",
   title: "Pohoda XML CLI MCP Server"
 }, {
   instructions: [
     'Pohoda XML MCP server interacts with POHODA through the official command-line XML API: Pohoda.exe /XML "user" "password" "xml_imp.ini".',
     "Target accounting units explicitly: discover them with list_accounting_units or list_xml_databases, then pass databaseId on accounting-unit-specific calls. POHODA validates the dataPack ICO against the selected accounting unit, so use registry/live rows that include ICO or database filenames containing the 8-digit ICO. current_database only shows the configured fallback; there is no mutable select_database workflow.",
     "Same-database calls are serialized with a per-database lock. Different databases may run in parallel, capped by POHODA_XML_MAX_PARALLEL_PROCESSES.",
+    "For PDFs containing scanned invoices or receipts, call prepare_scanned_pdf once before manual inspection. It renders and caches numbered page images with bounded parallelism and returns them inline by default. When several documents/pages can be read independently and sub-agents are available, delegate disjoint page paths for parallel extraction; the parent agent must reconcile page boundaries, duplicates, totals, VAT, and accounting-unit targets before writing.",
+    "For received Czech taxable documents, extract both VAT dates: dateTax is the deduction/delivery date that controls the VAT and control-statement period; dateKHDPH is the supplier's original DUZP/DPPD from the source document. If they are equal, explicitly send the same YYYY-MM-DD in both fields. If they differ, preserve each date. Do not normally send dateKHDPH for an ordinary issuedInvoice.",
     "Prefer filters, idFrom/count, and limit on list tools. When you already know you need several reads from one accounting unit, use batch_list_records or create_data_export_bundle to avoid repeated Pohoda.exe startup. When doing more than one write/output operation for one accounting unit, use batch_write; it supports contacts, invoices, other liabilities/receivables, cash vouchers, activities, stock/order management, bank/internal/warehouse/production/sales receipt documents, offers, enquiries, contracts, centres, stores/storage, bank accounts, stock groups, parameter definitions, and print jobs. For repeated contact+invoice creation, use batch_create_invoices. Use raw_xml_batch only for advanced schema-specific dataPacks not covered by typed tools.",
     "Reference data and usage guidance are exposed as resources under pohoda://enums/*, pohoda://xml-databases, and pohoda://guide."
   ].join("\n")

@@ -246,6 +246,74 @@ describe("PohodaClient", () => {
     expect(transport.calls[2]?.xml).toContain("<acv:name>Consulting</acv:name>");
   });
 
+  it("keeps dateTax and dateKHDPH correct across taxable document types", async () => {
+    const transport = new FakeTransport();
+    const client = new PohodaClient({ transport, ico: "12345678", database: "Default" });
+    const item = [{ text: "Taxable supply", unitPrice: 100, quantity: 1, vatRate: "high" }];
+
+    await client.createInvoice({
+      type: "receivedInvoice",
+      date: "2026-08-05",
+      dateTax: "2026-08-05",
+      partnerName: "Supplier"
+    }, item, "received-same", "Db");
+    await client.createInvoice({
+      type: "receivedInvoice",
+      date: "2026-08-05",
+      dateTax: "2026-08-05",
+      dateKHDPH: "2026-07-31",
+      partnerName: "Supplier"
+    }, item, "received-different", "Db");
+    await client.createInvoice({
+      type: "issuedInvoice",
+      date: "2026-08-05",
+      dateTax: "2026-08-05",
+      partnerName: "Customer"
+    }, item, "issued", "Db");
+    await client.createInvoice({
+      type: "issuedCorrectiveTax",
+      date: "2026-08-05",
+      dateTax: "2026-08-05",
+      partnerName: "Customer"
+    }, item, "issued-corrective", "Db");
+    await client.createOtherLiability({
+      date: "2026-08-05",
+      dateTax: "2026-08-05",
+      partnerName: "Supplier"
+    }, item, "liability", "Db");
+    await client.createCashVoucher({
+      type: "expense",
+      cashAccount: "HLAVNI",
+      date: "2026-08-05",
+      dateTax: "2026-08-05",
+      text: "Cash expense"
+    }, item, "expense", "Db");
+    await client.createCashVoucher({
+      type: "receipt",
+      cashAccount: "HLAVNI",
+      date: "2026-08-05",
+      dateTax: "2026-08-05",
+      text: "Cash receipt"
+    }, item, "receipt", "Db");
+    await client.createInternalDocument({
+      date: "2026-08-05",
+      dateTax: "2026-08-05",
+      text: "Internal VAT document"
+    }, item, "internal", "Db");
+
+    expect(transport.calls[0]?.xml).toContain("<inv:dateTax>2026-08-05</inv:dateTax>");
+    expect(transport.calls[0]?.xml).toContain("<inv:dateKHDPH>2026-08-05</inv:dateKHDPH>");
+    expect(transport.calls[1]?.xml).toContain("<inv:dateTax>2026-08-05</inv:dateTax>");
+    expect(transport.calls[1]?.xml).toContain("<inv:dateKHDPH>2026-07-31</inv:dateKHDPH>");
+    expect(transport.calls[2]?.xml).toContain("<inv:dateTax>2026-08-05</inv:dateTax>");
+    expect(transport.calls[2]?.xml).not.toContain("<inv:dateKHDPH>");
+    expect(transport.calls[3]?.xml).toContain("<inv:dateKHDPH>2026-08-05</inv:dateKHDPH>");
+    expect(transport.calls[4]?.xml).toContain("<inv:dateKHDPH>2026-08-05</inv:dateKHDPH>");
+    expect(transport.calls[5]?.xml).toContain("<vch:dateKHDPH>2026-08-05</vch:dateKHDPH>");
+    expect(transport.calls[6]?.xml).not.toContain("<vch:dateKHDPH>");
+    expect(transport.calls[7]?.xml).toContain("<int:dateKHDPH>2026-08-05</int:dateKHDPH>");
+  });
+
   it("batches new voucher, liability, receivable, and activity operations in one dataPack", async () => {
     const transport = new FakeTransport();
     const client = new PohodaClient({ transport, ico: "12345678", database: "Default" });
@@ -254,13 +322,13 @@ describe("PohodaClient", () => {
       {
         requestId: "voucher",
         tool: "create_cash_voucher",
-        header: { type: "expense", cashAccount: "HLAVNI", date: "2026-07-02", text: "Cash expense" },
+        header: { type: "expense", cashAccount: "HLAVNI", date: "2026-07-02", dateTax: "2026-07-02", text: "Cash expense" },
         items: [{ text: "Expense", unitPrice: 50, quantity: 1, vatRate: "none" }]
       },
       {
         requestId: "liability",
         tool: "create_other_liability",
-        header: { partnerName: "Supplier", date: "2026-07-02", text: "Liability" },
+        header: { partnerName: "Supplier", date: "2026-07-02", dateTax: "2026-07-02", text: "Liability" },
         items: [{ text: "Fee", unitPrice: 100, quantity: 1, vatRate: "none" }]
       },
       {
@@ -277,8 +345,10 @@ describe("PohodaClient", () => {
     expect(transport.calls[0]?.xml).toContain('note="voucher:create_cash_voucher"');
     expect(transport.calls[0]?.xml).toContain("<vch:voucher");
     expect(transport.calls[0]?.xml).toContain("<vch:voucherType>expense</vch:voucherType>");
+    expect(transport.calls[0]?.xml).toContain("<vch:dateKHDPH>2026-07-02</vch:dateKHDPH>");
     expect(transport.calls[0]?.xml).toContain('note="liability:create_other_liability"');
     expect(transport.calls[0]?.xml).toContain("<inv:invoiceType>commitment</inv:invoiceType>");
+    expect(transport.calls[0]?.xml).toContain("<inv:dateKHDPH>2026-07-02</inv:dateKHDPH>");
     expect(transport.calls[0]?.xml).toContain('note="receivable:create_other_receivable"');
     expect(transport.calls[0]?.xml).toContain("<inv:invoiceType>receivable</inv:invoiceType>");
     expect(transport.calls[0]?.xml).toContain('note="activity:manage_activity"');
