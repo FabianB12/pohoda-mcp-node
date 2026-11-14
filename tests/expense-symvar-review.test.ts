@@ -45,7 +45,8 @@ describe("received invoice VS in reviewed imports", () => {
     const preview = prepared.rows[0].preview;
     expect(preview.planned).toMatchObject({ symVar: "20260007", symVarRule: "derived-from-source-document", originalDocument: "FV-2026/0007" });
     expect(preview.sourceFacts.sourceSymVar).toBeUndefined();
-    expect(preview.warnings.join(" ")).toContain("derived from supplier document number");
+    expect(preview.warnings.join(" ")).toContain("VS 20260007 odvozen z čísla dokladu FV-2026/0007");
+    expect(preview.warningCodes).toContain("SYMVAR_DERIVED");
     const { ws } = await sheet();
     expect(ws.getCell(3, colOf("targetSymVar")).value).toBe("20260007");
     expect(String(ws.getCell(3, colOf("plannedImport")).value)).toContain("20260007");

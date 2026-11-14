@@ -76,7 +76,7 @@ describe("Real XLSX reviewed-import integration", () => {
   it("does not resurrect a cleared source document number through the originalDocument alias", async () => {
     const { edit, submit, runs } = await setup();
     await edit({ targetDocument: null });
-    await expect(submit()).rejects.toThrow(/SOURCE_DOCUMENT_NUMBER_REQUIRED/);
+    await expect(submit()).rejects.toMatchObject({ details: { invalid: [expect.objectContaining({ errorCode: "SOURCE_DOCUMENT_NUMBER_REQUIRED", error: "Chybí číslo dokladu dodavatele." })] } });
     expect(runs).toHaveLength(0);
   });
 
@@ -98,7 +98,7 @@ describe("Real XLSX reviewed-import integration", () => {
     const lookup = async () => ({ status: "matched", fetchedAt: "2026-11-14", supplier: { name: "Test supplier", ico: "25596641", country: "CZ" }, vat: { status: "registry-non-payer" } });
     const { edit, submit, runs } = await setup({ taxMode: "auto", classificationVAT: "", sourceChargesVat: false, priceHigh: undefined, priceHighVAT: undefined, priceNone: 121 }, lookup);
     await edit({ targetPriceNone: null, targetPriceHigh: 100, targetPriceHighVAT: 21 });
-    await expect(submit()).rejects.toThrow(/Document charges VAT but registry status/);
+    await expect(submit()).rejects.toThrow(/Režim DPH dodavatele nelze z registru jednoznačně určit/);
     expect(runs).toHaveLength(0);
   });
 
@@ -106,7 +106,7 @@ describe("Real XLSX reviewed-import integration", () => {
     const lookup = async () => ({ status: "matched", fetchedAt: "2026-11-14", supplier: { name: "Test supplier", ico: "25596641", country: "CZ" }, vat: { status: "payer" } });
     const { edit, submit, runs } = await setup({ taxMode: "auto", sourceChargesVat: true }, lookup);
     await edit({ targetPriceHigh: null, targetPriceHighVAT: null, targetPriceNone: 121 });
-    await expect(submit()).rejects.toThrow(/Document shows no VAT but registry status/);
+    await expect(submit()).rejects.toThrow(/Režim DPH dodavatele nelze z registru jednoznačně určit/);
     expect(runs).toHaveLength(0);
   });
 
@@ -114,7 +114,7 @@ describe("Real XLSX reviewed-import integration", () => {
     const lookup = async () => ({ status: "matched", fetchedAt: "2026-11-14", supplier: { name: "Old Supplier", ico: "25596641", street: "Old address 1", country: "CZ" }, vat: { status: "payer" } });
     const { edit, submit, runs } = await setup({ partnerName: "" }, lookup);
     await edit({ partnerIco: "27082440" });
-    await expect(submit()).rejects.toThrow(/Supplier identity changed/);
+    await expect(submit()).rejects.toThrow(/Dodavatel byl změněn/);
     expect(runs).toHaveLength(0);
     await edit({ partnerName: "New Supplier" });
     await submit();

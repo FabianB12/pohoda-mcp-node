@@ -534,7 +534,7 @@ function buildGenericDocumentData(config: DocumentConfig, header: Record<string,
   if (prefix === "bnk" && header.liquidations?.length) {
     if (items.length) throw new Error("Liquidation bank records cannot also contain ordinary items.");
     if (!String(header.account || header.bankAccount || "").trim()) throw new Error("Liquidation requires an explicit bank account.");
-    data["bnk:bankDetail"] = buildBankLiquidationDetail(header.liquidations, header.currency || "CZK");
+    data["bnk:bankDetail"] = buildBankLiquidationDetail(header.liquidations, header.currency || "CZK", header.accountingMode);
   }
   if (config.summaryName) {
     const summary = buildDocumentSummary(prefix, header);

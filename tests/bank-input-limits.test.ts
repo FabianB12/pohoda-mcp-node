@@ -94,3 +94,29 @@ describe('bank header limits on every entry path', () => {
     await close();
   });
 });
+
+describe('liquidation price branch in serialized bank XML', () => {
+  const liq = [{ agenda: 'issuedInvoice', id: 9, amount: '1470.70', vat: [{rate:'none',base:1470.7,vat:0}] }];
+  const write = async (accountingMode?: string) => {
+    const transport = new RecordingTransport();
+    const client = new PohodaClient({ transport, ico: '12345678', database: 'Db' });
+    await client.writeBatch([{ tool: 'create_bank_document', requestId: 'm1', header: bankHeader({ ...(accountingMode ? { accountingMode } : {}), liquidations: liq }), items: [] }], 'pack');
+    return transport.calls[0]!;
+  };
+  it('daňová evidence uses the explicit source price and VAT in homeCurrencyJU', async () => {
+    const xml = await write('singleEntry');
+    expect(xml).toContain('<typ:unitPrice>1470.7</typ:unitPrice>');
+    expect(xml).toContain('<typ:price>1470.7</typ:price>');
+    expect(xml).toContain('<typ:priceVAT>0</typ:priceVAT>');
+    expect(xml).toContain('<bnk:rateVAT>none</bnk:rateVAT>');
+    expect(xml).not.toMatch(/<bnk:homeCurrency>|accountingMode/);
+  });
+  it('double-entry keeps bnk:homeCurrency/bnk:unitPrice', async () => {
+    const xml = await write('doubleEntry');
+    expect(xml).toMatch(/<bnk:homeCurrency>\s*<bnk:unitPrice>1470.7<\/bnk:unitPrice>\s*<\/bnk:homeCurrency>/);
+    expect(xml).not.toMatch(/homeCurrencyJU/);
+  });
+  it('refuses a liquidation without a verified accounting mode before any exchange', async () => {
+    await expect(write()).rejects.toThrow(/accounting mode/);
+  });
+});

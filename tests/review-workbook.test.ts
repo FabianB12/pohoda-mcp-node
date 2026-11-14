@@ -296,10 +296,11 @@ describe("review workbook round trip", () => {
     expect(color(4, "targetDocument")).toBe("FFFFCDD2");
     expect(sheet.getCell(4, colOf("reviewNotes")).text).not.toContain("2026-03-20");
     expect(color(5, "targetTotal")).toBe("FFF1F5F9");
-    // An uncomputable row: the reason is in the note and the Celkem cell is marked, nothing invented.
+    // A row the import rejects: the Czech reason is in the note and Celkem is marked; the
+    // source total stays as given (never replaced by the bucket sum), nothing is invented.
     expect(color(6, "targetTotal")).toBe("FFFEF3C7");
-    expect(sheet.getCell(6, colOf("targetTotal")).value).toBeNull();
-    expect(sheet.getCell(6, colOf("reviewNotes")).text).toMatch(/Ověřit součet\.\nNelze spočítat hodnoty pro POHODU: SUMMARY_MISMATCH/);
+    expect(sheet.getCell(6, colOf("targetTotal")).value).toBe(1);
+    expect(sheet.getCell(6, colOf("reviewNotes")).text).toMatch(/^Ověřit součet\.\nSoučet částek .* neodpovídá částce Celkem 1,00; ověřte částky na dokladu\.$/);
     expect(sheet.getColumn(colOf("plannedImport")).hidden).toBe(true);
   });
 

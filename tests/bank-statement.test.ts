@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { PDFDocument } from 'pdf-lib';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { BankStatementService, classifyBankWriteResponse, classifySettlementDocument, matchStatementPayments, normalizeSymbol, resolveStatementAccount, settlementDocument, type StatementInput, type StatementPayment, type UnknownDocument } from '../src/mcp/bank-statement.js';
-import { buildBankLiquidationDetail, statementMonthNumber, validateBankHeaderText } from '../src/pohoda/bank-settlement.js';
+import { accountingModeOf, buildBankLiquidationDetail, sourceVatBuckets, statementMonthNumber, validateBankHeaderText } from '../src/pohoda/bank-settlement.js';
 import { toMinorUnits } from '../src/pohoda/money.js';
 import { PohodaResponse } from '../src/pohoda/response.js';
 import { recordsIn } from '../src/mcp/expense-import.js';
@@ -19,6 +19,12 @@ const response=(items:Fields[])=>({isOk:()=>true,items:items.map(data=>({state:'
 class Client {
   accounts=[account()]; invoices:Fields[]=[invoice()]; banks:Fields[]=[]; calls:Fields[]=[]; writes:Fields[]=[];
   onList:((requests:Fields[])=>void)|undefined; onWrite:((client:Client)=>void)|undefined;
+  unitType:string|undefined='doubleEntry'; unitIco='12345678'; failUnits=false; unitReads=0;
+  async listAccountingUnits(){
+    this.unitReads++;if(this.failUnits)throw Error('units down');
+    const item=(file:string,ico:string,unitType?:string)=>({dataFile:file,...(unitType?{unitType}:{}),accountingUnitIdentity:{address:{company:'MCPTEST',ico}}});
+    return {isOk:()=>true,toArray:()=>({items:[{data:{itemAccountingUnit:[item('C:\\Data\\12345678_2026.mdb',this.unitIco,this.unitType),item('87654321_2026.mdb','87654321','singleEntry')]}}]})};
+  }
   throwAfterWrite=false; failBeforeWrite=false; failedWriteResponse=false; failTargeted=false; failScan=false;
   /** Returns a raw POHODA response XML (parsed by the real PohodaResponse); index -> per-item fate. */
   writeXml:((pack:string,output:Fields[])=>string)|undefined; applyWrite:((index:number)=>boolean)|undefined;
@@ -126,15 +132,41 @@ describe('Bank account and exact matching policy',()=>{
     expect(matchStatementPayments([payment()],'CZK',docs)[0]!.status).toBe('unmatched');
   });
   it('builds a specific import-only liquidation link with exact amount',()=>{
-    const xml=buildBankLiquidationDetail([{agenda:'receivedInvoice',id:7,amount:'100.01'}]);
+    const xml=buildBankLiquidationDetail([{agenda:'receivedInvoice',id:7,amount:'100.01'}],'CZK','doubleEntry');
     expect(xml[0]?.['bnk:bankLiquidationItem']).toMatchObject({'bnk:settingsLiquidation':{'bnk:sourceDocument':{'typ:id':7},'bnk:liquidationPrice':100.01},'bnk:liquidationItem':{'bnk:quantity':1,'bnk:homeCurrency':{'bnk:unitPrice':100.01}}});
-    expect(()=>buildBankLiquidationDetail([{agenda:'receivedInvoice',id:7,amount:0}])).toThrow();
-    expect(()=>buildBankLiquidationDetail([{agenda:'receivedInvoice',id:7,amount:100.001}])).toThrow();
-    expect(()=>buildBankLiquidationDetail([{agenda:'receivedInvoice',id:7,amount:1},{agenda:'receivedInvoice',id:7,amount:1}])).toThrow(/Duplicate/);
+    expect(()=>buildBankLiquidationDetail([{agenda:'receivedInvoice',id:7,amount:0}],'CZK','doubleEntry')).toThrow();
+    expect(()=>buildBankLiquidationDetail([{agenda:'receivedInvoice',id:7,amount:100.001}],'CZK','doubleEntry')).toThrow();
+    expect(()=>buildBankLiquidationDetail([{agenda:'receivedInvoice',id:7,amount:1},{agenda:'receivedInvoice',id:7,amount:1}],'CZK','doubleEntry')).toThrow(/Duplicate/);
+  });
+  it('uses the JU/DE price branch (typ:unitPrice) for daňová evidence and never guesses the mode',()=>{
+    const item=(currency:string,mode:any)=>{const b=buildBankLiquidationDetail([{agenda:'issuedInvoice',id:9,amount:'1470.70',vat:[{rate:'none',base:1470.7,vat:0}]}],currency,mode)[0]!['bnk:bankLiquidationItem'];return Array.isArray(b)?b[1]['bnk:liquidationItem']:b['bnk:liquidationItem'];};
+    expect(item('CZK','singleEntry')).toEqual({'bnk:quantity':1,'bnk:payVAT':false,'bnk:rateVAT':'none','bnk:homeCurrencyJU':{'typ:unitPrice':1470.7,'typ:price':1470.7,'typ:priceVAT':0}});
+    expect(()=>item('EUR','singleEntry')).toThrow(/only in CZK/);
+    expect(item('EUR','doubleEntry')).toEqual({'bnk:quantity':1,'bnk:foreignCurrency':{'bnk:unitPrice':1470.7}});
+    for(const mode of [undefined,'','doubleEntryNonProfit','PU'])expect(()=>item('CZK',mode)).toThrow(/accounting mode/);
+    expect([accountingModeOf('singleEntry'),accountingModeOf('doubleEntry'),accountingModeOf('doubleEntryNonProfit'),accountingModeOf('doubleEntryAllowance'),accountingModeOf(''),accountingModeOf(undefined),accountingModeOf('taxFlat')]).toEqual(['singleEntry','doubleEntry','doubleEntry','doubleEntry',undefined,undefined,undefined]);
   });
 });
 
 describe('Bank statement processing and verification',()=>{
+  it('keeps exact source VAT buckets for DE and does not guess a partial or rounded allocation',()=>{
+    const raw={invoiceSummary:{homeCurrency:{priceNone:50,priceLow:100,priceLowVAT:{'#text':'12',rate:'12'},priceHigh:200,priceHighVAT:{'#text':'42',rate:'21'}}}};
+    expect(sourceVatBuckets(raw,404)).toEqual({buckets:[{rate:'none',base:50,vat:0},{rate:'low',base:100,vat:12},{rate:'high',base:200,vat:42}]});
+    expect(sourceVatBuckets(raw,200)).toHaveProperty('problem');
+    expect(sourceVatBuckets({invoiceSummary:{homeCurrency:{priceLow:100,priceLowVAT:{'#text':'15',rate:'15'}}}},115)).toHaveProperty('problem');
+    expect(sourceVatBuckets({invoiceSummary:{homeCurrency:{priceHigh:100,priceHighVAT:{'#text':'20','@rate':'20'}}}},120)).toHaveProperty('problem');
+    expect(sourceVatBuckets({invoiceSummary:{homeCurrency:{priceNone:100.4,round:{priceRound:-0.4}}}},100)).toHaveProperty('problem');
+    const xml=buildBankLiquidationDetail([{agenda:'receivedInvoice',id:1,amount:404,vat:[{rate:'none',base:50,vat:0},{rate:'low',base:100,vat:12},{rate:'high',base:200,vat:42}]}],'CZK','singleEntry');
+    expect(xml[0]!['bnk:bankLiquidationItem'].filter((x:any)=>x['bnk:liquidationItem'])).toHaveLength(3);
+  });
+  it('DE preview blocks an unproven remaining VAT split without dropping unaffected matches',async()=>{
+    const client=new Client();client.unitType='singleEntry';
+    client.invoices=[invoice(1,60),invoice(2,100,{symVar:'456'})];
+    client.invoices[0]!.invoiceSummary.homeCurrency.priceNone=100;
+    const result=await run(client,input({execute:false,payments:[payment(1,{amount:60}),payment(2,{variableSymbol:'456'})]}));
+    expect(result.rows.map((r:Fields)=>r.status)).toEqual(['needs_review','matched']);
+    expect(result.matched).toBe(1);expect(client.writes).toHaveLength(0);
+  });
   it('rejects oversized bank text and symbols before reading or writing; accepts exact schema boundaries',async()=>{
     expect(()=>validateBankHeaderText({text:'x'.repeat(96),symVar:'1'.repeat(20)})).not.toThrow();
     for (const extra of [{text:'x'.repeat(97)},{variableSymbol:'1'.repeat(21)}]) {
@@ -166,6 +198,26 @@ describe('Bank statement processing and verification',()=>{
     expect(client.writes).toHaveLength(1);expect(client.writes[0]!.operations).toHaveLength(1);
     expect(client.writes[0]!.operations[0].header).toMatchObject({account:'B2',statementPeriod:'2026-10',numberMovement:'1',liquidations:[{agenda:'receivedInvoice',id:1,amount:100}]});
     expect(await readFile(source)).toEqual(before);expect(result.annotatedPdf.path).not.toBe(source);expect(client.calls).toHaveLength(4);
+  });
+  it('reads the live unit type once per run, reports it and routes daňová evidence to the JU branch',async()=>{
+    const pu=new Client(),puPreview=await run(pu,input({execute:false}));
+    expect(puPreview.accountingUnit).toEqual({unitType:'doubleEntry',accountingMode:'doubleEntry'});expect(pu.unitReads).toBe(1);
+    const de=new Client();de.unitType='singleEntry';
+    const preview=await run(de,input({execute:false}));
+    expect(preview).toMatchObject({state:'planned',matched:1,accountingUnit:{unitType:'singleEntry',accountingMode:'singleEntry'}});
+    const result=await run(de);
+    expect(result).toMatchObject({ok:true,settled:1,accountingUnit:{accountingMode:'singleEntry'}});
+    expect(de.writes[0]!.operations[0].header.accountingMode).toBe('singleEntry');expect(de.unitReads).toBe(2);
+  });
+  it('blocks execution before any write when the unit type is missing, unsupported, ambiguous or unreadable, but still previews',async()=>{
+    const cases:[string,(c:Client)=>void][]=[['missing',c=>{c.unitType=undefined;}],['unsupported',c=>{c.unitType='taxFlat';}],['wrong ICO',c=>{c.unitIco='99999999';}],['read failure',c=>{c.failUnits=true;}]];
+    for(const [,setup] of cases){
+      const client=new Client();setup(client);
+      const preview=await run(client,input({execute:false}));
+      expect(preview).toMatchObject({state:'planned',matched:1,accountingUnit:{accountingMode:'unknown'}});expect(preview.message).toMatch(/execute=true bude odmítnut/);
+      await expect(run(client)).rejects.toThrow(/Typ účetní jednotky nelze ověřit.*Nic nebylo zapsáno/);
+      expect(client.writes).toHaveLength(0);expect(client.calls).toHaveLength(1);
+    }
   });
   it('creates nothing when all rows are unmatched',async()=>{
     const client=new Client(),result=await run(client,input({payments:[payment(1,{amount:99})]}));

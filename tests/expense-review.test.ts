@@ -121,8 +121,8 @@ describe("ExpenseReviewService.prepare", () => {
     expect(dup!.reviewNotes).toContain("Duplicita: FP263 (#3)");
     expect(nohist!.action).toBe("review");
     expect(nohist!.data.total).toBe("999");
-    expect(nohist!.reviewNotes).toContain("prefer a brief description");
-    expect(nohist!.reviewNotes).toContain("SUMMARY_MISMATCH");
+    expect(nohist!.reviewNotes).toContain("stačí krátký popis do 60 znaků");
+    expect(nohist!.reviewNotes).toMatch(/Součet .* neodpovídá částce Celkem|Celkem je/);
     expect(codec.written[0]!.examples.every((e) => e.rowIds.includes("dup"))).toBe(true);
     expect(importer.runs).toHaveLength(0);
   });
@@ -148,7 +148,7 @@ describe("ExpenseReviewService.prepare", () => {
     expect(out.rows[0].preview.planned.classificationVAT).toBe("PN");
     expect(importer.runs).toHaveLength(0);
     await edit(out.workbookPath, (wb) => { wb.rows[0].data.partnerIco = "27082440"; });
-    await expect(enriched.importReviewed({ reviewId: out.reviewId, approved: true, target: TARGET, databaseId: DB })).rejects.toThrow(/VAT_STATUS|TAX_MODE/);
+    await expect(enriched.importReviewed({ reviewId: out.reviewId, approved: true, target: TARGET, databaseId: DB })).rejects.toMatchObject({ details: { invalid: [expect.objectContaining({ errorCode: expect.stringMatching(/VAT_STATUS|TAX_MODE/) })] } });
     expect(importer.runs).toHaveLength(0);
   });
 
@@ -255,9 +255,9 @@ describe("ExpenseReviewService inspect/import", () => {
   it("preflights every edited row so malformed values stop the whole batch", async () => {
     const out = await prepareTwo();
     await edit(out.workbookPath, (wb) => { wb.rows[1].data.total = "1300.00"; });
-    await expect(service.importReviewed({ reviewId: out.reviewId, approved: true, target: TARGET, databaseId: DB })).rejects.toThrow(/B: SUMMARY_MISMATCH/);
+    await expect(service.importReviewed({ reviewId: out.reviewId, approved: true, target: TARGET, databaseId: DB })).rejects.toMatchObject({ message: expect.stringMatching(/B: Součet/), details: { invalid: expect.arrayContaining([expect.objectContaining({ rowId: "B", errorCode: "SUMMARY_MISMATCH" })]) } });
     await edit(out.workbookPath, (wb) => { wb.rows[1].data.total = "1210.00"; wb.rows[0].data.text = "y".repeat(241); });
-    await expect(service.importReviewed({ reviewId: out.reviewId, approved: true, target: TARGET, databaseId: DB })).rejects.toThrow(/A: TEXT_TOO_LONG/);
+    await expect(service.importReviewed({ reviewId: out.reviewId, approved: true, target: TARGET, databaseId: DB })).rejects.toMatchObject({ message: expect.stringMatching(/A: Text dokladu má \d+ znaků/), details: { invalid: expect.arrayContaining([expect.objectContaining({ rowId: "A", errorCode: "TEXT_TOO_LONG" })]) } });
     expect(importer.runs).toHaveLength(0);
   });
 
@@ -275,7 +275,7 @@ describe("ExpenseReviewService inspect/import", () => {
     await service.importReviewed({ reviewId: out.reviewId, approved: true, target: TARGET, databaseId: DB });
     const header = importer.runs[0]!.ops[0].header;
     for (const key of ["extraHeader", "extId", "number"]) expect(header[key]).toBeUndefined();
-    expect(codec.written[0]!.rows[0]!.reviewNotes).toContain("Unsupported preview field extraHeader");
+    expect(codec.written[0]!.rows[0]!.reviewNotes).toContain("Pole extraHeader není součástí kontroly a bylo ignorováno.");
   });
 
   it("returns the recorded result for an identical successful rerun and retries failed imports", async () => {

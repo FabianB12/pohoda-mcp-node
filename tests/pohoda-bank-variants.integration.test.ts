@@ -22,6 +22,7 @@ import { recordsIn } from '../src/mcp/expense-import.js';
 import { registerPohodaTools } from '../src/mcp/tools.js';
 import { PohodaClient } from '../src/pohoda/client.js';
 import type { TransportOptions } from '../src/pohoda/transport.js';
+import { accountingModeOf, type AccountingMode } from '../src/pohoda/bank-settlement.js';
 import { parallelsOptionsFromEnv, discoverPohodaInstall, ensureVmRunning, ParallelsPohodaTransport, HarnessXmlClient, extractLiveUnits, selectVerifiedDemoUnit } from './support/parallels-pohoda.js';
 
 const opts = parallelsOptionsFromEnv();
@@ -50,6 +51,8 @@ const SPECS: Spec[] = [
 ];
 
 live('POHODA bank liquidation-state variants (live)', () => {
+  // Seed liquidations use the live-verified unit type (never assumed).
+  let accountingMode: AccountingMode;
   let transport: ParallelsPohodaTransport, client: PohodaClient, target: TransportOptions, database: string;
   let mcp: McpClient, ids: Record<string, number> = {}, input: StatementInput, planOk = false, executed: any;
   const bankWrites = (from: number) => transport.results.slice(from).reduce((n, r) => n + (r.request.match(/<bnk:bank version=/g)?.length ?? 0), 0);
@@ -79,6 +82,9 @@ live('POHODA bank liquidation-state variants (live)', () => {
     if (!selection.ok) throw Error(selection.reason);
     evidence.demoSelection = selection.evidence;
     database = selection.unit.database;
+    const mode = accountingModeOf(selection.unit.unitType);
+    if (!mode) throw Error(`Unsupported live unitType '${selection.unit.unitType}' for ${selection.unit.database}`);
+    accountingMode = mode;
     target = { databaseOverride: database, dataPackIco: selection.unit.ico! };
     client = new PohodaClient({ transport, ico: selection.unit.ico!, database, application: 'MCPTEST bank variants' });
     const server = new McpServer({ name: 'pohoda-test', version: '0' });
@@ -95,7 +101,7 @@ live('POHODA bank liquidation-state variants (live)', () => {
     evidence.ids = ids;
     expect(Object.values(ids).every(id => id > 0)).toBe(true);
     transport.label = 'seed-pay-P';
-    const paid = await client.writeBatch([{ tool: 'create_bank_document', requestId: 'P', header: { type: 'receipt', account: 'TSB2', statementPeriod: '2026-11', numberMovement: String(movementBase + 50), dateStatement: '2026-11-30', datePayment: '2026-11-21', symVar: vs('4'), text: `MCPTEST bankvar ${run} pay P`, intNote: `MCPTEST bankvar ${run} seed P`, liquidations: [{ agenda: 'issuedAdvanceInvoice', id: ids.P!, amount: amt(100) }] }, items: [] }], `MCPTEST-bankvar-pay-${run}`, target);
+    const paid = await client.writeBatch([{ tool: 'create_bank_document', requestId: 'P', header: { type: 'receipt', account: 'TSB2', statementPeriod: '2026-11', numberMovement: String(movementBase + 50), dateStatement: '2026-11-30', datePayment: '2026-11-21', symVar: vs('4'), text: `MCPTEST bankvar ${run} pay P`, intNote: `MCPTEST bankvar ${run} seed P`, accountingMode, liquidations: [{ agenda: 'issuedAdvanceInvoice', id: ids.P!, amount: amt(100) }] }, items: [] }], `MCPTEST-bankvar-pay-${run}`, target);
     expect(paid.isOk()).toBe(true);
     transport.label = 'seed-storno-S';
     const storno = await client.sendRawXmlBatch([`<inv:invoice version="2.0"><inv:cancelDocument><typ:sourceDocument><typ:id>${ids.S}</typ:id></typ:sourceDocument></inv:cancelDocument><inv:invoiceHeader><inv:invoiceType>receivedInvoice</inv:invoiceType><inv:text>MCPTEST bankvar ${run} S storno</inv:text></inv:invoiceHeader></inv:invoice>`], 'MCPTEST bankvar storno', `MCPTEST-bankvar-storno-${run}`, target);

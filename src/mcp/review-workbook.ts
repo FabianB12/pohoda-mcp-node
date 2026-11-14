@@ -20,7 +20,8 @@ import { createHash, randomBytes } from "node:crypto";
 import path from "node:path";
 import ExcelJS from "exceljs";
 import JSZip from "jszip"; // ExcelJS's own ZIP dependency
-import { resolveExpensePolicy } from "../pohoda/expense-policy.js";
+import { projectExpensePolicy, resolveExpensePolicy } from "../pohoda/expense-policy.js";
+import { czechAmount, czechDate, czechPolicyNotice, reviewIssueOf, type ReviewIssue } from "./review-messages.js";
 import type { ReviewAction, ReviewRow, ReviewTool, ReviewWorkbook, ReviewWorkbookRead } from "./review-contract.js";
 import { withDuplicateReviewNote, type PreviewDuplicateCheck } from "./expense-duplicates.js";
 import { displayedPaymentMethod, effectiveCardPayment, normalizePaymentMethod, paymentMethodLabel, PAYMENT_METHOD_LABELS, PRIMARY_PAYMENT_METHODS, reconcilePaymentMethod } from "./payment-method.js";
@@ -431,16 +432,40 @@ const LEGACY_CARD_PLACEHOLDERS = ["K + další č. PK", "další č. PK"];
 
 export type ReviewTargets = Record<string, string | number | null>;
 
+/** First reason the strict import policy rejects this row (Czech message + code), if any. */
+export function reviewPolicyIssue(row: Pick<ReviewRow, "tool" | "data">, vatPeriod: string): ReviewIssue | undefined {
+  const conflict = paymentConflict(row);
+  if (conflict) return { code: "PAYMENT_METHOD_CONFLICT", field: "paymentType", message: conflict };
+  try { resolveExpensePolicy(policyHeader(row, vatPeriod), [], policyKind(row)); return undefined; }
+  catch (error) { return reviewIssueOf(error); }
+}
+
 /**
- * Exactly what the import writes, from the shared policy and the same header derivation
- * as ExpenseImporter (card numbering, Forma úhrady). Dates are ISO strings. Empty when the
- * row cannot be computed (the reason is in the review note / inspect result).
+ * What the import writes, from the shared policy and the same header derivation as
+ * ExpenseImporter (card numbering, Forma úhrady). Dates are ISO strings.
+ * For a row the import still rejects (e.g. amounts that do not reconcile), this is the
+ * policy projection: every value the rules determine independently of the problem
+ * (dates, Doklad/VS, exact source amounts, printed rounding and total); a value that
+ * depends on the missing or contradictory fact stays blank and nothing is invented.
+ * An unknown tax mode leaves only its dependants blank (PN collapse, KH date, Členění DPH).
+ * With a payment-method conflict the targets follow the visible Forma úhrady, and any
+ * value that differs under the contradicting card flag (Doklad/VS) stays blank; the row
+ * remains blocked by reviewPolicyIssue. Empty only on a structural failure (VAT period).
  * `classificationVAT` is the written Členění DPH (PN for non-tax rows).
  */
 export function computeReviewTargets(row: Pick<ReviewRow, "tool" | "data">, vatPeriod: string): ReviewTargets {
-  if (paymentConflict(row)) return {};
+  const chosen = projectTargets(row, vatPeriod);
+  if (!chosen || !paymentConflict(row)) return chosen ?? {};
+  // The contradicting interpretation: the legacy card flag instead of the visible method.
+  const card = row.data?.cardPayment;
+  const alternative = projectTargets({ tool: row.tool, data: { ...row.data, paymentType: card === true ? "creditcard" : card === false && displayedPaymentMethod(row.tool, row.data ?? {}) === "creditcard" ? "" : row.data?.paymentType, cardPayment: undefined } }, vatPeriod);
+  if (!alternative) return { ...chosen, targetDocument: null, targetSymVar: null };
+  return Object.fromEntries(Object.entries(chosen).map(([key, value]) => [key, value === alternative[key] ? value : null]));
+}
+
+function projectTargets(row: Pick<ReviewRow, "tool" | "data">, vatPeriod: string): ReviewTargets | undefined {
   let result: Record<string, any>;
-  try { result = resolveExpensePolicy(policyHeader(row, vatPeriod), [], policyKind(row)); } catch { return {}; }
+  try { result = projectExpensePolicy(policyHeader(row, vatPeriod), policyKind(row)).result; } catch { return undefined; }
   const policy = result._expensePolicy ?? {};
   const card = policy.originalDocumentRule === "card-sequence";
   const value = (v: unknown) => blank(v) ? null : typeof v === "number" ? v : String(v);
@@ -515,8 +540,8 @@ function writeMainSheet(workbook: ExcelJS.Workbook, input: ReviewWorkbook): void
     REVIEW_COLUMNS.forEach((c, colIndex) => {
       const cell = excelRow.getCell(colIndex + 1);
       cell.value = TARGET_KINDS.has(c.kind) ? targetCellValue(c, targets[c.key])
-        : c.key === "classificationVAT" && !blank(targets.classificationVAT) ? String(targets.classificationVAT)
-          : c.kind === "reviewNotes" ? reviewNoteWithIssue(row, note, targets, input.vatPeriod)
+        : c.key === "classificationVAT" ? (blank(targets.classificationVAT) ? null : String(targets.classificationVAT))
+          : c.kind === "reviewNotes" ? reviewNoteWithIssue(row, note, input.vatPeriod)
             : cellValueFor(c, row, plan);
       if (NUM_FMT[c.kind]) cell.numFmt = NUM_FMT[c.kind]!;
       cell.border = THIN_BORDER;
@@ -614,15 +639,11 @@ function targetCellValue(column: ReviewColumn, value: unknown): ExcelJS.CellValu
 }
 
 /** The review note, plus a short reason when the POHODA values cannot be computed. */
-function reviewNoteWithIssue(row: ReviewRow, note: string, targets: ReviewTargets, vatPeriod: string): ExcelJS.CellValue {
-  if (row.action === "skip" || Object.keys(targets).length) return note || null;
-  let issue = paymentConflict(row) ?? "";
-  if (!issue) {
-    try { resolveExpensePolicy(policyHeader(row, vatPeriod), [], policyKind(row)); }
-    catch (error) { issue = error instanceof Error ? error.message : String(error); }
-  }
+function reviewNoteWithIssue(row: ReviewRow, note: string, vatPeriod: string): ExcelJS.CellValue {
+  if (row.action === "skip") return note || null;
+  const issue = reviewPolicyIssue(row, vatPeriod)?.message;
   if (!issue || note.includes(issue)) return note || null;
-  return [note, `Nelze spočítat hodnoty pro POHODU: ${issue}`].filter(Boolean).join("\n");
+  return [note, issue].filter(Boolean).join("\n");
 }
 
 function cellValueFor(column: ReviewColumn, row: ReviewRow, plan: string): ExcelJS.CellValue {
@@ -679,36 +700,31 @@ function describePlan(row: ReviewRow, vatPeriod: string): string {
   const conflict = paymentConflict(row);
   if (conflict) return `Nelze naplánovat – ${conflict}`;
   const kind = policyKind(row);
+  const blocked = reviewPolicyIssue(row, vatPeriod) ? "Import zatím nelze – důvod je v poznámce." : "";
   try {
-    const result = resolveExpensePolicy(policyHeader(row, vatPeriod), [], kind);
+    const result = projectExpensePolicy(policyHeader(row, vatPeriod), kind).result;
     const policy = result._expensePolicy ?? {};
-    const lines: string[] = [];
+    const lines: string[] = blocked ? [blocked] : [];
     if (policy.lateSource) lines.push(`Pozdní doklad → data na 1. den období ${czDate(`${vatPeriod}-01`)}; původní data zůstanou v interní poznámce.`);
     const dates = [`Datum ${czDate(result.date)}`, `DPH ${czDate(result.dateTax)}`];
     if (result.dateAccounting) dates.push(`účetní ${czDate(result.dateAccounting)}`);
     if (policy.taxMode === "taxable") dates.push(`KH ${czDate(result.dateKHDPH)}`);
     if (kind === "voucher") dates.push(`úhrada ${czDate(result.datePayment)}`);
     lines.push(dates.join(", "));
-    if (policy.taxMode === "nonTax") lines.push(`PN: celá částka ${formatAmount(result.priceNone)} v sazbě 0 %, bez data KH.`);
+    if (policy.taxMode === "nonTax") lines.push(blank(result.priceNone) ? "PN: v sazbě 0 %, bez data KH." : `PN: celá částka ${czechAmount(result.priceNone)} v sazbě 0 %, bez data KH.`);
     else if (policy.taxMode === "taxable") lines.push("Daňový doklad – odpočet DPH podle zdrojových částek.");
     if (policy.originalDocumentRule === "card-sequence") lines.push("Karta ≤ 10 000 Kč: Doklad K + další číslo řady PK, VS = stejné číslo (přidělí import).");
-    else if (policy.originalDocumentRule === "card-source-document") lines.push(`Karta > 10 000 Kč: Doklad ${result.originalDocument}.`);
+    else if (policy.originalDocumentRule === "card-source-document") lines.push(`Karta > 10 000 Kč: Doklad ${result.originalDocument ?? "—"}.`);
     else if (policy.originalDocumentRule === "omitted-at-or-below-threshold") lines.push("Hotovost ≤ 10 000 Kč: bez čísla Dokladu.");
-    for (const warning of policy.warnings ?? []) lines.push(`Upozornění: ${warning}`);
+    for (const notice of policy.notices ?? []) { const textValue = czechPolicyNotice(notice); if (textValue) lines.push(`Upozornění: ${textValue}`); }
     return lines.join("\n");
-  } catch (error) {
-    return `Nelze naplánovat – zkontrolujte zdrojové hodnoty: ${error instanceof Error ? error.message : String(error)}`;
+  } catch {
+    return blocked || "Import zatím nelze – důvod je v poznámce.";
   }
 }
 
 function czDate(value: unknown): string {
-  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(value ?? ""));
-  return match ? `${match[3]}.${match[2]}.${match[1]}` : "—";
-}
-
-function formatAmount(value: unknown): string {
-  const n = Number(value);
-  return Number.isFinite(n) ? n.toLocaleString("cs-CZ", { minimumFractionDigits: 2, maximumFractionDigits: 2 }) : String(value ?? "");
+  return blank(value) ? "—" : czechDate(value);
 }
 
 async function writeExamplesSheet(workbook: ExcelJS.Workbook, examples: Array<Record<string, any>>): Promise<void> {

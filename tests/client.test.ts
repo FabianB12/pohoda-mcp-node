@@ -811,7 +811,7 @@ describe('typed bank liquidation imports', () => {
   it('writes an explicit target link and derives the padded statement month on single and batch paths', async () => {
     const transport = new FakeTransport();
     const client = new PohodaClient({ transport, ico: '12345678', database: 'Default' });
-    const header = { type: 'expense', account: '', bankAccount: 'KB', statementPeriod: '2026-01', statementNumber: 'wrong', numberMovement: '5', dateStatement: '2026-01-31', datePayment: '2026-01-20', liquidations: [{ agenda: 'receivedInvoice', id: 42, amount: '12.34' }] };
+    const header = { type: 'expense', account: '', bankAccount: 'KB', statementPeriod: '2026-01', statementNumber: 'wrong', numberMovement: '5', dateStatement: '2026-01-31', datePayment: '2026-01-20', accountingMode: 'doubleEntry', liquidations: [{ agenda: 'receivedInvoice', id: 42, amount: '12.34' }] };
     await client.createBankDocument(header, [], 'bank-settle-single', 'Db');
     await client.writeBatch([{ tool: 'create_bank_document', header, items: [] }], 'bank-settle-batch', 'Db');
     for (const call of transport.calls) {

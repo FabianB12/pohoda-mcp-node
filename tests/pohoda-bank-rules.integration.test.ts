@@ -21,6 +21,7 @@ import { registerPohodaTools } from '../src/mcp/tools.js';
 import { preparePdfPages } from '../src/mcp/pdf-pages.js';
 import { PohodaClient } from '../src/pohoda/client.js';
 import type { TransportOptions } from '../src/pohoda/transport.js';
+import { accountingModeOf, type AccountingMode } from '../src/pohoda/bank-settlement.js';
 import { parallelsOptionsFromEnv, discoverPohodaInstall, ensureVmRunning, ParallelsPohodaTransport, HarnessXmlClient, extractLiveUnits, selectVerifiedDemoUnit } from './support/parallels-pohoda.js';
 
 const opts = parallelsOptionsFromEnv();
@@ -102,6 +103,8 @@ async function greenAtMarks(pdfPath: string, payments: StatementPayment[], dir: 
 }
 
 live('POHODA bank statement rules (independent live checks)', () => {
+  // Seed liquidations use the live-verified unit type (never assumed).
+  let accountingMode: AccountingMode;
   let transport: ParallelsPohodaTransport, client: PohodaClient, target: TransportOptions, database: string, accountId: number;
   let mcp: McpClient, inv: Record<string, number> = {};
   let dec: { input: StatementInput; pdf: string; bytes: Buffer }, planOk = false, decResult: any;
@@ -137,6 +140,9 @@ live('POHODA bank statement rules (independent live checks)', () => {
     evidence.units = units.map(u => ({ database: u.database, ico: u.ico, name: (u as any).name }));
     if (!selection.ok) throw Error(selection.reason);
     evidence.demoSelection = selection.evidence;
+    const mode = accountingModeOf(selection.unit.unitType);
+    if (!mode) throw Error(`Unsupported live unitType '${selection.unit.unitType}' for ${selection.unit.database}`);
+    accountingMode = mode;
     database = selection.unit.database;
     target = { databaseOverride: database, dataPackIco: selection.unit.ico! };
     client = new PohodaClient({ transport, ico: selection.unit.ico!, database, application: 'MCPTEST bank rules' });
@@ -172,7 +178,7 @@ live('POHODA bank statement rules (independent live checks)', () => {
 
     // Partial payment of R5 (400) as a separate earlier movement; it is not part of the tested statement.
     transport.label = 'seed-partial';
-    const partial = await client.writeBatch([{ tool: 'create_bank_document', requestId: 'partial', header: { type: 'expense', account: 'TSB2', statementPeriod: '2026-11', numberMovement: String(movementBase + 9), dateStatement: '2026-11-30', datePayment: '2026-11-20', symVar: vs('5'), text: `MCPTEST bankrules ${run} partial`, intNote: `MCPTEST bankrules ${run} seed partial`, liquidations: [{ agenda: 'receivedInvoice', id: inv.R5!, amount: '400.00' }] }, items: [] }], `MCPTEST-bankrules-partial-${run}`, target);
+    const partial = await client.writeBatch([{ tool: 'create_bank_document', requestId: 'partial', header: { type: 'expense', account: 'TSB2', statementPeriod: '2026-11', numberMovement: String(movementBase + 9), dateStatement: '2026-11-30', datePayment: '2026-11-20', symVar: vs('5'), text: `MCPTEST bankrules ${run} partial`, intNote: `MCPTEST bankrules ${run} seed partial`, accountingMode, liquidations: [{ agenda: 'receivedInvoice', id: inv.R5!, amount: '400.00' }] }, items: [] }], `MCPTEST-bankrules-partial-${run}`, target);
     expect(partial.isOk()).toBe(true);
     // Legacy unliquidated movement for R8 without statement numbering and without an MCP marker.
     transport.label = 'seed-legacy';

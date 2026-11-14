@@ -194,3 +194,34 @@ and [bank account rate modes](https://www.stormware.cz/schema/version_2/bankAcco
 Offline tests additionally cover edited/cleared cells, immutable review identity,
 approval/version checks, formula rejection, hidden rows, supplier ambiguity, registry
 evidence invalidation, partial retries and source-PDF copy failures.
+
+### Daňová evidence liquidation branch (live-verified)
+
+A client run on a POHODA daňová evidence unit rejected all 34 liquidations with
+errno 114 (“Likvidací dokladu nesmí vzniknout přeplatek” / “neplatné položky pro
+likvidaci”) and warning 602 at `bnk:liquidationItem/bnk:homeCurrency` (“Hodnota se
+nepoužívá u zvoleného typu záznamu”). bank.xsd defines `homeCurrency`/`foreignCurrency`
+(`bnk:unitPrice`) for double-entry units and `homeCurrencyJU`/`foreignCurrencyJU`
+(`typ:unitPrice`, “pouze pro JU a DE”) for daňová evidence. `process_bank_statement`
+now reads the live `unitType` for the exact database and ICO once per run, sends the JU
+branch for `singleEntry`, and refuses execute=true before writing if the type is unknown.
+The JU price node alone was insufficient. The live tests showed that each source VAT
+bucket needs its own liquidation item: `payVAT=false`, the corresponding `rateVAT`,
+and `homeCurrencyJU` containing `typ:unitPrice` and `typ:price` equal to the base and
+`typ:priceVAT` equal to the exact source VAT. A gross-only item was rejected for a VAT invoice.
+
+Run `rootde1` on POHODA 14302.10 passed all five tests in the positively identified
+`MCPTEST DE Bank s.r.o.` unit (`11223341_2026.mdb`, IČO 11223341, `singleEntry`).
+The old XML reproduced warning 602 plus error 114. The registered MCP tool then settled
+seven documents (received/issued invoices at 0% and 21%, a commitment and both advance
+types), verified their links and zero remaining balances, and retried without new records.
+Created bank IDs: 44, 46, 48, 50, 52, 54, 56. Evidence: ignored `tests/output/bankde-rootde1.json`
+and its XML folder. These were test records only; no client unit was changed.
+
+The existing double-entry integration suite also passed all four tests in run
+`rootpu1` against `12345678_2026.mdb` (53.67 seconds of tests), including settlement,
+unmatched payments and duplicate-free retries.
+
+The DE path does not guess VAT allocation after partial payment, for rounding or for an
+unsupported third or historical VAT bucket: those rows remain `needs_review` before writes. The double-entry
+path retains its previous exact-remaining-amount behavior. Foreign-currency execution remains blocked.

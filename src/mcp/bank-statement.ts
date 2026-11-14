@@ -4,7 +4,7 @@ import { readFile } from 'node:fs/promises';
 import type { PohodaClient, WriteBatchOperation } from '../pohoda/client.js';
 import type { TransportOptions } from '../pohoda/transport.js';
 import { toMinorUnits, moneyValue, sumHomeCurrency, sumHomeCurrencyMinor, homeSummaryFields } from '../pohoda/money.js';
-import { SETTLEMENT_AGENDAS, statementMonthNumber, validateBankHeaderText, type SettlementAgenda } from '../pohoda/bank-settlement.js';
+import { SETTLEMENT_AGENDAS, findLiveAccountingUnit, sourceVatBuckets, statementMonthNumber, validateBankHeaderText, type AccountingMode, type SettlementAgenda } from '../pohoda/bank-settlement.js';
 import { recordsIn, scanExpenseAgendas } from './expense-import.js';
 import { loadStatementPdf, markSettledPayments, type StatementMark } from './bank-statement-pdf.js';
 
@@ -244,7 +244,7 @@ export function matchStatementPayments(payments: StatementPayment[], currency: s
 }
 
 export class BankStatementService {
-  constructor(private readonly client: Pick<PohodaClient, 'listRecordsBatch' | 'writeBatch'>) {}
+  constructor(private readonly client: Pick<PohodaClient, 'listRecordsBatch' | 'writeBatch' | 'listAccountingUnits'>) {}
   async process(input: StatementInput, target: TransportOptions): Promise<Fields> {
     if (!target.databaseOverride || !target.dataPackIco || input.databaseId !== target.databaseOverride) throw new Error('Explicit matching accounting unit and ICO required.');
     const lockKey = `${target.databaseOverride}|${target.dataPackIco}`, previous = locks.get(lockKey) || Promise.resolve();
@@ -268,6 +268,11 @@ export class BankStatementService {
       catch (error) { throw new Error(`Pohyb ${p.movement}: ${(error as Error).message}`); }
     }
     const pdf = await loadStatementPdf(input.sourcePdfPath, input.payments.map(p => p.mark));
+    // The liquidation XML differs for daňová evidence (homeCurrencyJU) and
+    // double-entry units; read the live unit type for this exact file + ICO.
+    const unit = await this.accountingUnit(target);
+    if (input.execute && !unit.accountingMode) throw new Error(`Typ účetní jednotky nelze ověřit (${unit.problem}). Likvidace se pro daňovou evidenci a podvojné účetnictví zapisuje odlišně, proto se bez ověřeného typu nic nezapisuje. Nic nebylo zapsáno; zopakujte náhled execute=false po ověření jednotky v list_accounting_units.`);
+    const accountingUnit = { unitType: unit.unitType || null, accountingMode: unit.accountingMode ?? 'unknown', ...(unit.problem ? { problem: unit.problem } : {}) };
     const groups = [{ agenda: 'bankAccount', subType: '' }, { agenda: 'bank', subType: '' }, ...SETTLEMENT_AGENDAS.map(subType => ({ agenda: 'invoice', subType }))];
     let snapshot: Map<string, Fields[]>;
     try { snapshot = await scanExpenseAgendas(this.client, groups, {}, target, false, 2000); }
@@ -310,6 +315,11 @@ export class BankStatementService {
       rows.push({ movement: payment.movement, status: 'existing', bankId: Number(h.id), document: doc, payment, marker });
     }
     rows.push(...matchStatementPayments(fresh, input.currency, documents, unknown).map(p => ({ ...p, movement: p.payment.movement })));
+    if (unit.accountingMode === 'singleEntry') for (const row of rows.filter(r => r.status === 'matched')) {
+      const split = sourceVatBuckets(row.document.raw, row.payment.amount);
+      if ('problem' in split) { row.status = 'needs_review'; row.reason = split.problem; }
+      else row.vat = split.buckets;
+    }
     for (const issue of issues) {
       const movements = rows.filter(r => r.blockedBy?.some((b: DocumentRef) => b.agenda === issue.agenda && b.id === issue.id && b.number === issue.number)).map(r => r.movement);
       if (movements.length) issue.movements = movements;
@@ -320,8 +330,8 @@ export class BankStatementService {
     const diagnostics = publicDiagnostics(issues);
     if (!input.execute) {
       const review = rows.filter(r => r.status === 'needs_review').length;
-      return { ok: true, state: 'planned', account: { id: account.id, ids: account.ids }, statementNumber, matched: toWrite.length, unmatched: rows.filter(r => r.status === 'unmatched').length, needsReview: review, rows: rows.map(publicRow), ...(diagnostics ? { diagnostics } : {}),
-        message: `Náhled: likvidace zatím nebyla provedena. Zapsat lze jen ${toWrite.length} pohybů se stavem matched; nespárované a needs_review se nezapisují.${diagnostics ? ` ${diagnostics.unresolvedCount} dokladů má neověřený stav likvidace; blokují jen pohyby uvedené v blockedBy, ostatní plán zůstává platný.` : ''} execute=true jen v rámci pokynu uživatele zpracovat výpis a případného schválení hostitelem; zamítnutý zápis neobcházet.` };
+      return { ok: true, state: 'planned', accountingUnit, account: { id: account.id, ids: account.ids }, statementNumber, matched: toWrite.length, unmatched: rows.filter(r => r.status === 'unmatched').length, needsReview: review, rows: rows.map(publicRow), ...(diagnostics ? { diagnostics } : {}),
+        message: `Náhled: likvidace zatím nebyla provedena. Zapsat lze jen ${toWrite.length} pohybů se stavem matched; nespárované a needs_review se nezapisují.${diagnostics ? ` ${diagnostics.unresolvedCount} dokladů má neověřený stav likvidace; blokují jen pohyby uvedené v blockedBy, ostatní plán zůstává platný.` : ''} execute=true jen v rámci pokynu uživatele zpracovat výpis a případného schválení hostitelem; zamítnutý zápis neobcházet.${unit.accountingMode ? '' : ` Typ účetní jednotky nelze ověřit (${unit.problem}); execute=true bude odmítnut před zápisem.`}` };
     }
     if (checksum(await readFile(input.sourcePdfPath)) !== pdf.sha256) throw new Error('Source statement changed; nothing was written.');
     const reportedIds = new Set<number>();
@@ -337,12 +347,16 @@ export class BankStatementService {
           const detail = !raw ? 'doklad nebyl nalezen' : state?.kind === 'unknown' ? state.unknown.issue.problem : state?.kind === 'ignored' ? state.issue.problem : 'změnil se zůstatek, měna, VS, datum nebo storno';
           throw new Error(`An invoice changed; re-run matching. Nothing was written. (${row.document.agenda} #${row.document.id} ${row.document.number}: ${detail})`);
         }
+        if (unit.accountingMode === 'singleEntry') {
+          const split = sourceVatBuckets(raw!, row.payment.amount);
+          if ('problem' in split || JSON.stringify(split.buckets) !== JSON.stringify(row.vat)) throw new Error(`Rozpis DPH dokladu ${row.document.number} se změnil; zopakujte náhled. Nic nebylo zapsáno.`);
+        }
       }
       const operations: Extract<WriteBatchOperation, { tool: 'create_bank_document' }>[] = toWrite.map(row => ({
         tool: 'create_bank_document', requestId: `movement-${row.movement}`, header: {
           type: row.payment.direction, account: String(account.ids), statementPeriod: input.statementPeriod, numberMovement: String(row.movement), dateStatement: input.dateStatement, datePayment: row.payment.date, symVar: row.payment.variableSymbol || '', text: row.payment.text || `Úhrada ${row.document.number}`,
           intNote: `${this.marker(input, row.payment, account.id)}|${key(row.document)}`,
-          ...(input.currency !== 'CZK' ? { currency: input.currency } : {}), liquidations: [{ agenda: row.document.agenda, id: row.document.id, amount: row.payment.amount }]
+          accountingMode: unit.accountingMode!, ...(input.currency !== 'CZK' ? { currency: input.currency } : {}), liquidations: [{ agenda: row.document.agenda, id: row.document.id, amount: row.payment.amount, ...(row.vat ? { vat: row.vat } : {}) }]
         }, items: []
       }));
       // Markers and full read-back are the duplicate guard. The transport pack
@@ -388,8 +402,21 @@ export class BankStatementService {
     try { annotated = await markSettledPayments(pdf, input.sourcePdfPath, output, settled.map(r => r.payment.mark)); }
     catch (error) { annotated = { error: (error as Error).message }; }
     const rejected = rows.filter(r => r.status === 'rejected').length, uncertain = rows.filter(r => r.status === 'write_uncertain').length;
-    return { ok: !rows.some(r => ['needs_review', 'write_uncertain', 'rejected'].includes(r.status)) && !annotated.error, state: 'processed', account: { id: account.id, ids: account.ids }, statementNumber, settled: settled.length, unmatched: rows.filter(r => r.status === 'unmatched').length, needsReview: rows.filter(r => r.status === 'needs_review').length, rejected, writeUncertain: uncertain, createdIds: [...reportedIds], rows: rows.map(publicRow), ...(writeSummary ? { write: writeSummary } : {}), ...(diagnostics ? { diagnostics } : {}), annotatedPdf: annotated,
+    return { ok: !rows.some(r => ['needs_review', 'write_uncertain', 'rejected'].includes(r.status)) && !annotated.error, state: 'processed', accountingUnit, account: { id: account.id, ids: account.ids }, statementNumber, settled: settled.length, unmatched: rows.filter(r => r.status === 'unmatched').length, needsReview: rows.filter(r => r.status === 'needs_review').length, rejected, writeUncertain: uncertain, createdIds: [...reportedIds], rows: rows.map(publicRow), ...(writeSummary ? { write: writeSummary } : {}), ...(diagnostics ? { diagnostics } : {}), annotatedPdf: annotated,
       ...(writeSummary ? { message: writeMessage(writeSummary, settled.length) } : {}) };
+  }
+  /** One fresh listAccountingUnit read per run; a missing, ambiguous or unknown type never defaults to double-entry. */
+  private async accountingUnit(target: TransportOptions): Promise<{ unitType: string; accountingMode?: AccountingMode | undefined; problem?: string }> {
+    let data: Fields;
+    try {
+      const response = await this.client.listAccountingUnits();
+      if (!response.isOk()) throw new Error(`stav odpovědi ${response.state}`);
+      data = response.toArray();
+    } catch (error) { return { unitType: '', problem: `čtení seznamu účetních jednotek selhalo: ${(error as Error).message}` }; }
+    const unit = findLiveAccountingUnit(data, String(target.databaseOverride), String(target.dataPackIco));
+    if (!unit) return { unitType: '', problem: `jednotka ${target.databaseOverride} s IČO ${target.dataPackIco} není v seznamu účetních jednotek jednoznačně` };
+    if (!unit.accountingMode) return { unitType: unit.unitType, problem: `nepodporovaný typ účetní jednotky '${unit.unitType || '(prázdný)'}'` };
+    return { unitType: unit.unitType, accountingMode: unit.accountingMode };
   }
   /**
    * Read-only reconciliation after a rejected or uncertain write: one bank scan

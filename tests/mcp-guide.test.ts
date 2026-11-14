@@ -73,6 +73,7 @@ describe("Canonical MCP operator guide", () => {
       expect(guide.bankStatements.errors).toContain("never tell the user to wait until POHODA starts exporting");
       expect(guide.bankStatements.writeResults).toContain("write.causes");
       expect(guide.bankStatements.writeResults).toContain("still outstanding debt");
+      expect(guide.bankStatements.accountingUnit).toContain("execute=true is refused before any write");
       expect(guide.xmlTransport.batching).toContain("never bypasses expense review, bank-statement preview or a rejected/unapproved write");
       const bank = tools.tools.find((tool) => tool.name === "process_bank_statement")!;
       expect(bank.description).toContain("Always call execute=false first");

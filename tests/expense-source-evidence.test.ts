@@ -144,9 +144,12 @@ describe("review preview", () => {
     expect(prepared.nextAction).toBe("deliver_workbook");
     const [invoiceRow, cashRow] = prepared.rows;
     expect(invoiceRow.action).toBe("review");
-    for (const expected of ["PARTNER_COUNTRY_REQUIRED", "SYMVAR_INVALID", "VAT_CLASSIFICATION_REQUIRED"]) expect(invoiceRow.reviewNotes).toContain(expected);
+    expect(invoiceRow.issues.map((i: any) => i.code)).toEqual(expect.arrayContaining(["PARTNER_COUNTRY_REQUIRED", "SYMVAR_INVALID", "VAT_CLASSIFICATION_REQUIRED"]));
+    for (const expected of ["chybí země dodavatele", "není číselný", "Chybí Členění DPH"]) expect(invoiceRow.reviewNotes).toContain(expected);
+    expect(invoiceRow.reviewNotes).not.toMatch(/[A-Z]{3,}_[A-Z]{3,}|Needs data/);
     expect(cashRow.action).toBe("review");
-    expect(cashRow.reviewNotes.match(/SOURCE_PAYMENT_DATE_REQUIRED/g)).toHaveLength(1);
+    expect(cashRow.issues.filter((i: any) => i.code === "SOURCE_PAYMENT_DATE_REQUIRED")).toHaveLength(1);
+    expect(cashRow.reviewNotes.match(/Chybí skutečné datum úhrady/g)).toHaveLength(1);
     expect(runs).toBe(0);
   });
 });

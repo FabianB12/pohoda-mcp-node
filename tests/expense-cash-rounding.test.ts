@@ -188,14 +188,15 @@ describe("cash rounding: preview → workbook → import → XML", () => {
     const { service, prepared, submit, runs } = await setup({ ...source, total: 832.48 });
     const row = prepared.rows?.find?.((r: any) => r.rowId === "FP26113");
     expect(row?.action).toBe("review");
-    expect(String(row?.reviewNotes)).toContain("CASH_ROUNDING_UNCONFIRMED");
+    expect(String(row?.reviewNotes)).toContain("Hotovost 832,48 má haléře a doklad neuvádí zaokrouhlení");
+    expect(row?.issues).toEqual(expect.arrayContaining([expect.objectContaining({ code: "CASH_ROUNDING_UNCONFIRMED", field: "roundingAmount" })]));
     // Forcing import without resolving it is rejected before any write.
     await editRow(prepared.workbookPath, { action: "Importovat" });
-    await expect(submit()).rejects.toThrow(/CASH_ROUNDING_UNCONFIRMED/);
+    await expect(submit()).rejects.toMatchObject({ details: { invalid: [expect.objectContaining({ errorCode: "CASH_ROUNDING_UNCONFIRMED" })] } });
     expect(runs).toHaveLength(0);
     // Reviewer enters the printed CELKEM K ÚHRADĚ in the visible POHODA Celkem cell; nothing is re-prepared.
     expect(await editRow(prepared.workbookPath, { targetTotal: 832 })).toBe(true);
-    // The row was blank (not computable); its other POHODA cells must be shown before import.
+    // The derived rounding is not shown yet; the table must show it before import.
     const pending = await service.inspect({ reviewId: prepared.reviewId });
     expect(pending.rows[0]).toMatchObject({ valid: false, error: expect.stringContaining("Zaokrouhlení (prázdné) → -0.48") });
     await expect(submit()).rejects.toThrow(/neukazuje importované hodnoty/);

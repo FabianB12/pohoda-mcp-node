@@ -13,7 +13,8 @@ import { recordsIn } from "./expense-import.js";
 import type { ReviewAction, ReviewRow, ReviewTool, ReviewWorkbook, ReviewWorkbookRead } from "./review-contract.js";
 import type { ListRecordsBatchRequest, PohodaClient, WriteBatchOperation } from "../pohoda/client.js";
 import type { TransportOptions } from "../pohoda/transport.js";
-import { expenseSourceIssues, MAX_TEXT_LENGTH, resolveExpensePolicy } from "../pohoda/expense-policy.js";
+import { canonicalExpenseText, MAX_TEXT_LENGTH, projectExpensePolicy, resolveExpensePolicy } from "../pohoda/expense-policy.js";
+import { czechPolicyNotice, REVIEW_TEXT, ReviewRowError, reviewIssueOf, type ReviewIssue } from "./review-messages.js";
 import { moneyValue, sumHomeCurrency, toMinorUnits } from "../pohoda/money.js";
 import * as workbookCodec from "./review-workbook.js";
 import { companyKey, decideNonPayerTreatment, normalizeDic, normalizeIco } from "../registry/czech-registry.js";
@@ -70,6 +71,11 @@ const LIST_BATCH = 25;
 const REVIEW_ID = /^rv-[0-9a-f]{16}$/;
 const ROW_ID = /^[A-Za-z0-9._:-]{1,64}$/;
 const locks = new Map<string, Promise<unknown>>();
+/**
+ * Manifest marker: target cells of rows the import rejects show the policy projection.
+ * Older workbooks left every target cell of such rows blank; those blanks are not edits.
+ */
+const TARGET_PROJECTION_VERSION = 2;
 
 const text = (v: unknown): string => v == null ? "" : String(v).trim();
 const sha256 = (v: string | Buffer): string => createHash("sha256").update(v).digest("hex");
@@ -131,7 +137,7 @@ export class ExpenseReviewService {
       const current = workbook.rows.map((row) => {
         const original = originals.get(row.rowId);
         if (!original || original.tool !== row.tool) throw new ReviewImportError("Existing workbook contains an unknown or changed document row.");
-        return { rowId: row.rowId, tool: row.tool, data: mergeReviewedRow(original.tool, original.data, row.data, row.targets).data };
+        return { rowId: row.rowId, tool: row.tool, data: mergeReviewedRow(original.tool, original.data, row.data, row.targets, legacyTargets(existing)).data };
       });
       const { snapshot: _snapshot, ...checks } = await checkPreviewDuplicates(this.client, current, target);
       if (!codec.updateReviewDuplicateChecks) throw new ReviewImportError("This workbook codec cannot safely refresh duplicate checks.");
@@ -158,7 +164,7 @@ export class ExpenseReviewService {
         if (lookup.status === "matched") {
           const s = lookup.supplier;
           if (h.partnerName && s.name && companyKey(h.partnerName) !== companyKey(s.name)) {
-            draft.blocking = true; draft.notes.push(`Supplier name does not match ARES: source ${h.partnerName}; registry ${s.name}. Verify IČO before import.`);
+            draft.blocking = true; draft.notes.push(REVIEW_TEXT.supplierName(h.partnerName, s.name));
           }
           const filled: string[] = [];
           for (const [field, value] of Object.entries({ partnerName: s.name, partnerIco: s.ico, partnerDic: s.dic, partnerStreet: s.street, partnerCity: s.city, partnerZip: s.zip, partnerCountry: s.country })) if (empty(h[field]) && !empty(value)) { h[field] = value; filled.push(field); }
@@ -167,7 +173,7 @@ export class ExpenseReviewService {
           // source (e.g. a non-Czech IČO). Neither is assumed correct; the reviewer decides.
           const vatId = normalizeDic(text(h.partnerDic));
           if (filled.includes("partnerCountry") && vatId?.isoCountry && vatId.vatPrefix !== "CZ" && vatId.isoCountry !== text(h.partnerCountry).toUpperCase()) {
-            draft.blocking = true; draft.notes.push(`Registry country ${h.partnerCountry} (by IČO) differs from the ${vatId.isoCountry} VAT id ${vatId.normalized}; confirm the supplier's country and IČO from the source.`);
+            draft.blocking = true; draft.notes.push(REVIEW_TEXT.registryCountry(text(h.partnerCountry), vatId.isoCountry, vatId.normalized));
           }
           h._registryEvidence = { vat: lookup.vat, fetchedAt: lookup.fetchedAt };
           if (!h.taxMode || h.taxMode === "auto") {
@@ -176,13 +182,13 @@ export class ExpenseReviewService {
             if (treatment.pn === "auto" || treatment.pn === "standard") {
               h.partnerVatStatus = treatment.pn === "auto" ? "non-payer" : "payer";
               h.vatStatusEvidence = `ARES/ADIS ${lookup.vat.status}, checked ${lookup.fetchedAt}; current status, not historical`;
-            } else { draft.blocking = true; draft.notes.push(`VAT treatment requires review: ${treatment.reasons.join("; ")}`); }
+            } else { draft.blocking = true; draft.notes.push(REVIEW_TEXT.vatTreatment); draft.issues.push({ code: "VAT_TREATMENT_REVIEW", message: REVIEW_TEXT.vatTreatment, detail: treatment.reasons.join("; ") }); }
           }
         } else if (lookup.status === "ambiguous") {
-          draft.blocking = true; draft.notes.push("Supplier registry match is ambiguous; resolve the supplier before import.");
+          draft.blocking = true; draft.notes.push(REVIEW_TEXT.registryAmbiguous);
         } else if (lookup.status === "notFound" && h.partnerIco) {
-          draft.blocking = true; draft.notes.push("IČO was not found in ARES. Verify the source identifier before import.");
-        } else if (lookup.status === "unavailable") draft.notes.push(`Registry unavailable: ${lookup.message}`);
+          draft.blocking = true; draft.notes.push(REVIEW_TEXT.registryNotFound);
+        } else if (lookup.status === "unavailable") { draft.notes.push(REVIEW_TEXT.registryUnavailable); draft.issues.push({ code: "REGISTRY_UNAVAILABLE", message: REVIEW_TEXT.registryUnavailable, detail: text(lookup.message) }); }
       }
     }
     // History is read before any workbook is written, scoped to the explicit unit.
@@ -192,6 +198,7 @@ export class ExpenseReviewService {
     const history = await this.readHistory(drafts.map((d) => ({ rowId: d.rowId, tool: d.tool, data: d.data })), vatPeriod, target, snapshot);
     const rows: ReviewRow[] = [];
     const sources: Fields = {};
+    const rowIssueCodes = new Map<string, Fields[]>();
     for (const draft of drafts) {
       const notes: string[] = [...draft.notes];
       let blocking = draft.blocking;
@@ -208,33 +215,39 @@ export class ExpenseReviewService {
           if (field === "classificationVAT" && values.some((value) => ["PN", "nonSubsume"].includes(value))) continue;
           if (values.length === 1) {
             const value = values[0]!;
-            if (field === "text" && value.length > MAX_TEXT_LENGTH) { notes.push(`History text exceeds ${MAX_TEXT_LENGTH} characters and was not used; enter a brief text.`); continue; }
-            data[field] = value;
+            if (field === "text" && value.length > MAX_TEXT_LENGTH) { notes.push(REVIEW_TEXT.historyTextTooLong(MAX_TEXT_LENGTH)); continue; }
+            data[field] = field === "text" ? canonicalExpenseText(value) : value;
             const fromIds = found.records.filter((r) => text(r[field]) === value).map((r) => r.id);
-            suggestions.push({ field, value, fromIds, rule: "unanimous same-supplier POHODA history" });
+            suggestions.push({ field, value: data[field], fromIds, rule: "unanimous same-supplier POHODA history" });
 
           } else if (values.length > 1) {
-            notes.push(`History has ${values.length} different ${field} values (${values.slice(0, 4).join(" | ")}); choose one.`);
+            notes.push(REVIEW_TEXT.historyChoices(field, values.length, values.slice(0, 4)));
           }
         }
         if (draft.tool === "create_cash_voucher" && empty(data.cashAccount)) {
           const accounts = [...new Set(found.records.map((r) => text(r.cashAccount)).filter(Boolean))];
-          if (accounts.length) notes.push(`History cash accounts: ${accounts.join(", ")}.`);
+          if (accounts.length) notes.push(REVIEW_TEXT.historyCashAccounts(accounts));
         }
       } else if (history.skipped.has(draft.rowId)) {
-        notes.push("No supplier IČO or name; no POHODA history was searched.");
+        notes.push(REVIEW_TEXT.noSupplier);
       }
-      if (draft.tool === "create_cash_voucher" && empty(data.cashAccount)) { blocking = true; notes.push("cashAccount is required for a cash expense."); }
+      // History or caller labels are shown as POHODA will store them (PD, PHM nafta, ...).
+      for (const suggestion of normalizeWrittenLabels(draft.tool, data)) {
+        const entry = suggestions.find((s) => s.field === suggestion.field);
+        if (entry) entry.value = suggestion.value;
+      }
       const textLength = text(data.text).length;
-      if (textLength > PREFERRED_TEXT_LENGTH && textLength <= MAX_TEXT_LENGTH) notes.push(`Text has ${textLength} characters; prefer a brief description up to ${PREFERRED_TEXT_LENGTH} (e.g. "Materiál").`);
-      // List every missing/invalid source fact at once; the policy itself stops at the first.
-      const issues = expenseSourceIssues(toolHeader(draft.tool, data), draft.tool === "create_cash_voucher" ? "voucher" : "invoice");
-      for (const issue of issues) { blocking = true; notes.push(`Needs data: ${issue.code}: ${issue.message}`); }
-      const check = preflight(draft.tool, data);
-      if (!check.ok && !issues.some((issue) => check.error?.startsWith(`${issue.code}:`))) { blocking = true; notes.push(`Needs data: ${check.error}`); }
-      if (data.sourcePdfPath && !(await fileExists(text(data.sourcePdfPath)))) { blocking = true; notes.push(`Source PDF not found: ${data.sourcePdfPath}`); }
+      if (textLength > PREFERRED_TEXT_LENGTH && textLength <= MAX_TEXT_LENGTH) notes.push(REVIEW_TEXT.textLength(textLength, PREFERRED_TEXT_LENGTH));
+      // List every missing/invalid source fact at once (Czech for the reviewer, codes as metadata).
+      const policyIssues = rowIssues(draft.tool, data);
+      const issues = [...draft.issues, ...policyIssues];
+      for (const issue of policyIssues) { blocking = true; if (!notes.includes(issue.message)) notes.push(issue.message); }
+      if (data.sourcePdfPath && !(await fileExists(text(data.sourcePdfPath)))) {
+        blocking = true; notes.push(REVIEW_TEXT.pdfNotFound(text(data.sourcePdfPath))); issues.push({ code: "SOURCE_PDF_NOT_FOUND", message: REVIEW_TEXT.pdfNotFound(text(data.sourcePdfPath)) });
+      }
       const reviewNotes = [draft.callerNotes, ...notes].filter(Boolean).join("\n");
       rows.push({ rowId: draft.rowId, tool: draft.tool, data, action: blocking ? "review" : "import", reviewNotes, duplicateCheck: duplicates });
+      rowIssueCodes.set(draft.rowId, issues.map(({ code, field, detail }) => ({ code, ...(field ? { field } : {}), ...(detail ? { detail } : {}) })));
       sources[draft.rowId] = { query: found?.key, exampleIds: found?.records.map((r) => r.id) ?? [], suggestions, registryFilled: data._registryFilled ?? [] };
     }
 
@@ -247,9 +260,9 @@ export class ExpenseReviewService {
       await rename(tmpWorkbook, workbookPath);
     } catch (error) { await unlink(tmpWorkbook).catch(() => {}); throw error; }
     const manifest: Fields = {
-      version: 1, reviewId, createdAt: new Date().toISOString(), databaseId, target, vatPeriod, workbookPath,
+      version: 1, targetProjection: TARGET_PROJECTION_VERSION, reviewId, createdAt: new Date().toISOString(), databaseId, target, vatPeriod, workbookPath,
       preparedWorkbookSha256: sha256(await readFile(workbookPath)),
-      rows: rows.map((row) => ({ rowId: row.rowId, tool: row.tool, data: row.data, action: row.action, reviewNotes: row.reviewNotes, duplicateCheck: row.duplicateCheck })),
+      rows: rows.map((row) => ({ rowId: row.rowId, tool: row.tool, data: row.data, action: row.action, reviewNotes: row.reviewNotes, issues: rowIssueCodes.get(row.rowId) ?? [], duplicateCheck: row.duplicateCheck })),
       sourcePdfPaths: [...new Set(rows.map((r) => text(r.data.sourcePdfPath)).filter(Boolean))],
       sources, history: { queries: history.queries, warnings: history.warnings, exampleCount: history.examples.length },
       duplicateCheck, imports: []
@@ -261,7 +274,7 @@ export class ExpenseReviewService {
       manifestPath, rowCount: rows.length, requiresReview: pending, historyWarnings: history.warnings, exampleCount: history.examples.length,
       duplicateCheck: { complete: duplicateCheck.complete, checkedAt: duplicateCheck.checkedAt, scannedRecords: duplicateCheck.scannedRecords, warnings: duplicateCheck.warnings, matchedRowIds: rows.filter((row) => row.duplicateCheck!.matchCount > 0).map((row) => row.rowId) },
       rowsTruncated: rows.length > 20,
-      rows: rows.slice(0, 20).map((row) => ({ rowId: row.rowId, tool: row.tool, action: row.action, reviewNotes: row.reviewNotes, duplicateCheck: row.duplicateCheck, preview: preflight(row.tool, row.data).preview })),
+      rows: rows.slice(0, 20).map((row) => ({ rowId: row.rowId, tool: row.tool, action: row.action, reviewNotes: row.reviewNotes, issues: rowIssueCodes.get(row.rowId) ?? [], duplicateCheck: row.duplicateCheck, preview: preflight(row.tool, row.data).preview })),
       nextAction: "deliver_workbook",
       message: "Preparation succeeded. Deliver workbookPath as a linked XLSX, including when all rows are duplicates or need review. requiresReview describes the rows, not a failed preparation. A findings summary alone is not completion. No POHODA records were changed. Wait for explicit import approval."
     };
@@ -373,16 +386,16 @@ export class ExpenseReviewService {
       if (text(row.tool) && row.tool !== original.tool) { errors.push(`row ${rowId} changed document kind ${original.tool} -> ${row.tool}; prepare a new review instead`); continue; }
       const action = text(row.action).toLowerCase() as ReviewAction;
       if (!ACTIONS.includes(action)) { errors.push(`row ${rowId} has action "${text(row.action)}" (use import, review or skip)`); continue; }
-      const merged = mergeReviewedRow(original.tool, original.data, row.data ?? {}, row.targets);
+      const merged = mergeReviewedRow(original.tool, original.data, row.data ?? {}, row.targets, legacyTargets(manifest));
       ignored.push(...merged.ignored.map((field) => ({ rowId, field })));
       const pdf = text(merged.data.sourcePdfPath);
       if (pdf && pdf !== text(original.data.sourcePdfPath) && !allowedPdfs.has(pdf)) { errors.push(`row ${rowId} sourcePdfPath ${pdf} is not one of the prepared source PDFs`); continue; }
       if (action === "skip") { skipped.push(rowId); report.push({ rowId, action, changedFields: merged.changed }); continue; }
       if (action === "review") unresolved.push(rowId);
       const check = preflight(original.tool, merged.data);
-      if (!check.ok && action === "import") invalid.push({ rowId, error: check.error });
+      if (!check.ok && action === "import") invalid.push({ rowId, error: check.error, errorCode: check.code });
       if (action === "import") selected.push({ rowId, tool: original.tool, data: merged.data });
-      report.push({ rowId, tool: original.tool, action, valid: check.ok, error: check.error, changedFields: merged.changed, preview: check.preview });
+      report.push({ rowId, tool: original.tool, action, valid: check.ok, error: check.error, ...(check.code ? { errorCode: check.code } : {}), changedFields: merged.changed, preview: check.preview });
     }
     const omitted = [...originals.keys()].filter((id) => !seen.has(id));
     return { workbookPath, workbookSha256, errors, selected, unresolved, skipped, invalid, ignored, omitted, report };
@@ -457,20 +470,21 @@ function explicitTarget(target: TransportOptions | undefined): { databaseOverrid
   return { databaseOverride, dataPackIco };
 }
 
-function draftData(tool: ReviewTool, input: Fields, vatPeriod: string): { data: Fields; notes: string[]; blocking: boolean } {
+function draftData(tool: ReviewTool, input: Fields, vatPeriod: string): { data: Fields; notes: string[]; issues: ReviewIssue[]; blocking: boolean } {
   const data: Fields = {};
   const notes: string[] = [];
+  const issues: ReviewIssue[] = [];
   let blocking = false;
   for (const [key, value] of Object.entries(input ?? {})) {
     if (REVIEW_ONLY_KEYS.includes(key) || key.startsWith("_")) continue;
     if (!EDITABLE.has(key) && !["type", "sourceType", "vatPeriod", "intNote"].includes(key)) {
-      if (!empty(value)) notes.push(`Unsupported preview field ${key} was ignored; only reviewed document fields may be imported.`);
+      if (!empty(value)) notes.push(REVIEW_TEXT.unsupportedField(key));
       continue;
     }
     if (!empty(value)) data[key] = value;
   }
-  if (Array.isArray(input?.items) && input.items.length) { blocking = true; notes.push("Items were dropped; expenses use exact summary amounts only."); }
-  if (data.vatPeriod && text(data.vatPeriod) !== vatPeriod) { blocking = true; notes.push(`Document vatPeriod ${data.vatPeriod} replaced by the review period ${vatPeriod}; confirm.`); }
+  if (Array.isArray(input?.items) && input.items.length) { blocking = true; notes.push(REVIEW_TEXT.itemsDropped); }
+  if (data.vatPeriod && text(data.vatPeriod) !== vatPeriod) { blocking = true; notes.push(REVIEW_TEXT.vatPeriodReplaced(text(data.vatPeriod), vatPeriod)); }
   data.vatPeriod = vatPeriod;
   data.sourceType = text(data.sourceType) === "manual" ? "manual" : "pdf";
   // Put legacy aliases in the visible source columns. A reviewer must be able to
@@ -489,14 +503,50 @@ function draftData(tool: ReviewTool, input: Fields, vatPeriod: string): { data: 
   if (tool === "create_other_liability") data.type = "commitment";
   if (tool === "create_cash_voucher") data.type = "expense";
   if (tool === "create_invoice" && !["receivedInvoice", "commitment"].includes(text(data.type))) {
-    if (data.type) { blocking = true; notes.push(`Invoice type ${data.type} is not an expense; set receivedInvoice or commitment in a new review.`); }
+    if (data.type) { blocking = true; notes.push(REVIEW_TEXT.notExpense(text(data.type))); }
     data.type = "receivedInvoice";
   }
   // Forma úhrady is the single reviewed payment fact; a card flag is only an input alias.
   const payment = reconcilePaymentMethod(tool, data, "cardPayment" in data ? coerce("cardPayment", data.cardPayment) : undefined);
   if (payment.conflict) { blocking = true; notes.push(payment.conflict); }
   if (payment.notes.length) { blocking = true; notes.push(...payment.notes); }
-  return { data: payment.data, notes, blocking };
+  // Text is shown exactly as written to POHODA (fuel-only texts -> PHM nafta / PHM benzin).
+  if (!empty(payment.data.text)) payment.data.text = canonicalExpenseText(payment.data.text);
+  return { data: payment.data, notes, issues, blocking };
+}
+
+const legacyTargets = (manifest: Fields): boolean => manifest.targetProjection !== TARGET_PROJECTION_VERSION;
+
+const kindOf = (tool: ReviewTool) => tool === "create_cash_voucher" ? "voucher" as const : "invoice" as const;
+const policyInput = (tool: ReviewTool, data: Fields): Fields => {
+  const header = toolHeader(tool, data);
+  return { ...header, ...(header.cardPayment === true ? { cardSequence: 1 } : {}) };
+};
+
+/**
+ * Stores text and Členění DPH as the policy writes them (known aliases only: fuel-only
+ * text, PDzjed -> PD for a domestic taxable row), so a history or caller value is never
+ * shown differently from the XML. Returns the changed fields.
+ */
+function normalizeWrittenLabels(tool: ReviewTool, data: Fields): Array<{ field: string; value: string }> {
+  let result: Fields;
+  try { result = projectExpensePolicy(policyInput(tool, data), kindOf(tool)).result; } catch { return []; }
+  const changed: Array<{ field: string; value: string }> = [];
+  for (const field of ["text", "classificationVAT"]) {
+    if (field === "classificationVAT" && result._expensePolicy?.taxMode !== "taxable") continue;
+    if (!empty(data[field]) && !empty(result[field]) && text(result[field]) !== text(data[field])) { data[field] = result[field]; changed.push({ field, value: result[field] }); }
+  }
+  return changed;
+}
+
+/** Every reason the import rejects the row, in Czech, with machine codes for metadata. */
+function rowIssues(tool: ReviewTool, data: Fields): ReviewIssue[] {
+  const issues: ReviewIssue[] = [];
+  const check = preflight(tool, data);
+  try { issues.push(...projectExpensePolicy(policyInput(tool, data), kindOf(tool)).issues.map(reviewIssueOf)); }
+  catch (error) { issues.push(reviewIssueOf(error)); }
+  if (!check.ok && !issues.some((issue) => issue.code === check.code)) issues.unshift({ code: check.code ?? "REVIEW_ERROR", message: check.error! });
+  return issues.filter((issue, index) => issues.findIndex((i) => i.message === issue.message) === index);
 }
 
 /** Visible POHODA target cell -> the source field an edit of it changes (see mapTargetEdits). */
@@ -527,7 +577,7 @@ function sameTarget(key: string, a: unknown, b: unknown): boolean {
  *   every visible target cell must equal what is imported: a cell left stale by another
  *   edit blocks the row until the reviewer updates it (inspect lists the value to type).
  */
-function mergeReviewedRow(tool: ReviewTool, original: Fields, decoded: Fields, targets?: Fields): { data: Fields; changed: string[]; ignored: string[] } {
+function mergeReviewedRow(tool: ReviewTool, original: Fields, decoded: Fields, targets?: Fields, legacy = false): { data: Fields; changed: string[]; ignored: string[] } {
   const vatPeriod = text(original.vatPeriod);
   const before = workbookCodec.computeReviewTargets({ tool, data: original }, vatPeriod);
   const edits: Fields = { ...(decoded ?? {}) };
@@ -540,7 +590,7 @@ function mergeReviewedRow(tool: ReviewTool, original: Fields, decoded: Fields, t
     const now = text(edits.classificationVAT);
     if (now === shown) edits.classificationVAT = original.classificationVAT ?? "";
     else if (now === "PN") taxSwitch = "nonTax";
-    else if (shown === "PN") taxSwitch = "taxable";
+    else if (now && (shown === "PN" || !before.classificationVAT)) taxSwitch = "taxable";
   }
   const merged = mergeRow(original, edits);
   if (taxSwitch && !merged.changed.includes("taxMode")) { merged.data.taxMode = taxSwitch; merged.changed.push("taxMode"); }
@@ -560,16 +610,33 @@ function mergeReviewedRow(tool: ReviewTool, original: Fields, decoded: Fields, t
   const error = result.conflict ?? (editedUnknown ? `Forma úhrady "${method}" není známá; použijte ${Object.values(PAYMENT_METHOD_LABELS).join(", ")}. Neznámou zkratku z POHODY nelze zadat v kontrole, připravte ji ve zdrojových datech.` : undefined);
   if (error) merged.data._paymentReviewError = error;
   delete merged.data._registryReviewError;
-  const targetError = mapTargetEdits(tool, merged, original, before, targets ?? {}, vatPeriod);
-  if (targetError) merged.data._targetReviewError = targetError;
+  // An older workbook left every target cell of a rejected row blank: those blanks are not edits.
+  const legacyBlank = legacy && Boolean(workbookCodec.reviewPolicyIssue({ tool, data: original }, vatPeriod));
+  const errors = [mapTargetEdits(tool, merged, original, before, targets ?? {}, vatPeriod, legacyBlank), ...writtenLabelErrors(tool, merged.data, decoded ?? {}, vatPeriod)].filter(Boolean);
+  if (errors.length) merged.data._targetReviewError = errors.join(" ");
   return merged;
+}
+
+/** Text and Členění DPH cells must show what the policy writes (no silent PDzjed -> PD). */
+function writtenLabelErrors(tool: ReviewTool, data: Fields, decoded: Fields, vatPeriod: string): string[] {
+  const errors: string[] = [];
+  const shownText = text(data.text);
+  const writtenText = canonicalExpenseText(shownText);
+  if (shownText && writtenText !== shownText) errors.push(REVIEW_TEXT.writtenAs("Text dokladu", shownText, writtenText));
+  if ("classificationVAT" in decoded) {
+    const shown = text(decoded.classificationVAT);
+    const written = text(workbookCodec.computeReviewTargets({ tool, data }, vatPeriod).classificationVAT);
+    if (shown && written && shown !== written) errors.push(REVIEW_TEXT.writtenAs("Členění DPH", shown, written));
+  }
+  return errors;
 }
 
 type TargetCell = [string, unknown];
 
-function mapTargetEdits(tool: ReviewTool, merged: { data: Fields; changed: string[] }, original: Fields, before: Fields, targets: Fields, vatPeriod: string): string | undefined {
+function mapTargetEdits(tool: ReviewTool, merged: { data: Fields; changed: string[] }, original: Fields, before: Fields, targets: Fields, vatPeriod: string, legacyBlank = false): string | undefined {
   const cells: TargetCell[] = Object.entries(targets).filter(([key]) => key in TARGET_SOURCE);
-  const edited = cells.filter(([key, value]) => !sameTarget(key, value, before[key]));
+  const priorBlank = ([key, value]: TargetCell) => legacyBlank && empty(value) && !empty(before[key]);
+  const edited = cells.filter((cell) => !sameTarget(cell[0], cell[1], before[cell[0]]) && !priorBlank(cell));
   const label = (key: string) => TARGET_LABELS.get(key) ?? key;
   const shown = (v: unknown) => empty(v) ? "(prázdné)" : String(v);
   // Applies target edits to a copy; the targets are what the import would write.
@@ -602,7 +669,10 @@ function mapTargetEdits(tool: ReviewTool, merged: { data: Fields; changed: strin
     }
     // The table must show what is imported: an unchanged cell made stale by another edit
     // (Členění DPH, Forma úhrady, Celkem, ...) blocks the row until the reviewer updates it.
-    const stale = cells.filter(([key, value]) => !edited.some(([k]) => k === key) && !sameTarget(key, after[key], value))
+    // A legacy blank is stale only once the row is importable (it must then show the values).
+    const importable = !workbookCodec.reviewPolicyIssue({ tool, data: merged.data }, vatPeriod);
+    const stale = cells.filter((cell) => !(priorBlank(cell) && !importable))
+      .filter(([key, value]) => !edited.some(([k]) => k === key) && !sameTarget(key, after[key], value))
       .map(([key, value]) => `${label(key)} ${shown(value)} → ${empty(after[key]) ? "vymazat" : String(after[key])}`);
     if (stale.length) errors.push(`Po úpravách tabulka neukazuje importované hodnoty: ${stale.join("; ")}. Přepište tyto buňky (sbalené sloupce rozbalte).`);
   }
@@ -698,7 +768,7 @@ function recheckRegistry(merged: { data: Fields; changed: string[] }, original: 
     } else {
       delete data.partnerVatStatus;
       delete data.vatStatusEvidence;
-      data._registryReviewError = `VAT treatment requires review: ${decision.reasons.join("; ")}`;
+      data._registryReviewError = REVIEW_TEXT.vatTreatment;
     }
   }
 }
@@ -748,20 +818,21 @@ function toolHeader(tool: ReviewTool, data: Fields): Fields {
  * sequence; the K-number/symVar it would produce is never shown because the importer
  * reserves the real PK number at import time.
  */
-function preflight(tool: ReviewTool, data: Fields): { ok: boolean; error?: string; preview?: Fields } {
+function preflight(tool: ReviewTool, data: Fields): { ok: boolean; error?: string; code?: string; preview?: Fields } {
+  const reject = (code: string, message: string): never => { throw new ReviewRowError(code, message); };
   try {
-    if (data._registryReviewError) throw new Error(data._registryReviewError);
-    if (data._paymentReviewError) throw new Error(data._paymentReviewError);
-    if (data._targetReviewError) throw new Error(data._targetReviewError);
-    if (data._supplierChanged && !data.partnerName) throw new Error("Supplier identity changed; confirm the new supplier name/address or prepare a refreshed preview.");
-    if (data.partnerIco && (!data.partnerCountry || data.partnerCountry === "CZ") && !normalizeIco(data.partnerIco).ok) throw new Error("Invalid Czech supplier IČO; review the source identifier.");
+    if (data._registryReviewError) reject("VAT_TREATMENT_REVIEW", data._registryReviewError);
+    if (data._paymentReviewError) reject("PAYMENT_METHOD_REVIEW", data._paymentReviewError);
+    if (data._targetReviewError) reject("TARGET_EDIT_REJECTED", data._targetReviewError);
+    if (data._supplierChanged && !data.partnerName) reject("SUPPLIER_CHANGED", REVIEW_TEXT.supplierChanged);
+    if (data.partnerIco && (!data.partnerCountry || data.partnerCountry === "CZ") && !normalizeIco(data.partnerIco).ok) reject("PARTNER_ICO_INVALID", REVIEW_TEXT.invalidIco);
     const header = toolHeader(tool, data);
-    if (tool === "create_invoice" && !["receivedInvoice", "commitment"].includes(text(header.type))) throw new Error("create_invoice must be receivedInvoice or commitment.");
-    if (header.sourceType !== "manual" && !text(header.sourcePdfPath)) throw new Error("sourcePdfPath is required for PDF imports.");
+    if (tool === "create_invoice" && !["receivedInvoice", "commitment"].includes(text(header.type))) reject("INVOICE_TYPE_INVALID", REVIEW_TEXT.invoiceType);
+    if (header.sourceType !== "manual" && !text(header.sourcePdfPath)) reject("SOURCE_PDF_REQUIRED", REVIEW_TEXT.sourcePdfRequired);
     if (header.sourceType !== "manual" || header.sourcePdfPath) {
-      if (!Array.isArray(header.sourcePages) || !header.sourcePages.length || header.sourcePages.some((p: unknown) => !Number.isInteger(p) || Number(p) < 1)) throw new Error("sourcePages must identify at least one positive PDF page.");
+      if (!Array.isArray(header.sourcePages) || !header.sourcePages.length || header.sourcePages.some((p: unknown) => !Number.isInteger(p) || Number(p) < 1)) reject("SOURCE_PAGES_REQUIRED", REVIEW_TEXT.sourcePagesRequired);
     }
-    if (tool === "create_cash_voucher" && !text(header.cashAccount)) throw new Error("cashAccount is required for a cash expense.");
+    if (tool === "create_cash_voucher" && !text(header.cashAccount)) reject("CASH_ACCOUNT_REQUIRED", REVIEW_TEXT.cashAccountRequired);
     const kind = tool === "create_cash_voucher" ? "voucher" : "invoice";
     const resolved = resolveExpensePolicy({ ...header, ...(header.cardPayment === true ? { cardSequence: 1 } : {}) }, [], kind);
     const policy = resolved._expensePolicy ?? {};
@@ -780,9 +851,11 @@ function preflight(tool: ReviewTool, data: Fields): { ok: boolean; error?: strin
       // derived value is never presented as a source fact.
       symVarRule: cardNumbered ? undefined : policy.symVarRule
     };
-    return { ok: true, preview: { sourceFacts, planned: Object.fromEntries(Object.entries(planned).filter(([, v]) => v !== undefined && v !== "")), warnings: policy.warnings ?? [] } };
+    const warnings = (policy.notices ?? []).map(czechPolicyNotice).filter(Boolean);
+    return { ok: true, preview: { sourceFacts, planned: Object.fromEntries(Object.entries(planned).filter(([, v]) => v !== undefined && v !== "")), warnings, warningCodes: (policy.notices ?? []).map((n: Fields) => n.code) } };
   } catch (error) {
-    return { ok: false, error: (error as Error).message };
+    const issue = reviewIssueOf(error);
+    return { ok: false, error: issue.message, code: issue.code };
   }
 }
 
