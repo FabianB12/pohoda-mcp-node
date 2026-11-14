@@ -96,6 +96,19 @@ describe('Bank account and exact matching policy',()=>{
     expect(matchStatementPayments([payment(1,{variableSymbol:'other'})],'CZK',[settlementDocument(invoice())])[0]!.reason).toBe('amount');
     expect(matchStatementPayments([payment(1,{variableSymbol:''})],'CZK',[settlementDocument(invoice()),settlementDocument(invoice(2))])[0]!.status).toBe('unmatched');
   });
+  it('gives VS matches priority over earlier amount-only rows',()=>{
+    const rows=matchStatementPayments([payment(1,{variableSymbol:''}),payment(2,{variableSymbol:'123'})],'CZK',[settlementDocument(invoice())]);
+    expect(rows.map(r=>[r.status,r.document?.id])).toEqual([['unmatched',undefined],['matched',1]]);
+  });
+  it('leaves same-amount rows competing for one document untouched',()=>{
+    const rows=matchStatementPayments([payment(1,{variableSymbol:''}),payment(2,{variableSymbol:'555'})],'CZK',[settlementDocument(invoice())]);
+    expect(rows.map(r=>r.status)).toEqual(['unmatched','unmatched']);expect(rows[0]!.reason).toMatch(/více pohybů/);
+  });
+  it('never falls back to an amount match once same-VS documents are used',()=>{
+    const docs=[settlementDocument(invoice(1)),settlementDocument(invoice(2,100,{symVar:'other'}))];
+    const rows=matchStatementPayments([payment(1),payment(2)],'CZK',docs);
+    expect(rows.map(r=>[r.status,r.document?.id])).toEqual([['matched',1],['unmatched',undefined]]);
+  });
   it('never matches opposite direction, another currency, paid or cancelled invoices',()=>{
     const foreign=invoice();foreign.invoiceSummary={foreignCurrency:{currency:{ids:'EUR'},priceSum:100}};foreign.invoiceHeader.liquidation={amountForeign:100};
     const docs=[invoice(1,0),invoice(2,100,{invoiceType:'issuedInvoice'}),invoice(3,100,{storno:'true'}),foreign].map(settlementDocument);
@@ -182,6 +195,32 @@ describe('Bank statement processing and verification',()=>{
     const client=new Client();
     for(const value of [input({dateStatement:'2026-10-32'}),input({payments:[payment(1,{date:'2026-02-30'})]}),input({payments:[payment(),payment()]}),input({databaseId:'other'}),input({sourcePdfPath:join(dir,'missing.pdf')})])await expect(run(client,value)).rejects.toThrow();
     expect(client.writes).toHaveLength(0);
+  });
+  it('does not create a second bank record when a legacy entry uses other numbering',async()=>{
+    const client=new Client();
+    client.banks.push({bankHeader:{id:90,bankType:'expense',account:{id:2,ids:'B2'},datePayment:'2026-10-15',dateStatement:'2026-10-31',symVar:'',intNote:'Ručně zadáno'},bankSummary:{homeCurrency:{priceNone:100}}});
+    const result=await run(client);
+    expect(result.rows[0]).toMatchObject({status:'needs_review',bankId:90,doNotRetry:true});expect(client.writes).toHaveLength(0);expect(result.annotatedPdf.marked).toBe(0);
+    client.banks[0]!.bankHeader.symVar='999';expect((await run(client)).settled).toBe(1); // different VS is a different payment
+  });
+  it('does not treat its own marked records as legacy for identical same-day payments',async()=>{
+    const client=new Client();client.invoices=[invoice(1,100,{symVar:'1'}),invoice(2,100,{symVar:'2'})];
+    const args=input({payments:[payment(1,{variableSymbol:'1'}),payment(2,{variableSymbol:'2'})]});
+    expect((await run(client,args)).settled).toBe(2);const retry=await run(client,args);
+    expect(retry).toMatchObject({ok:true,settled:2,createdIds:[]});expect(client.writes).toHaveLength(1);
+  });
+  it('settles an incoming receipt against an issued invoice and keeps December, payment date and remaining amount',async()=>{
+    const client=new Client();client.invoices=[invoice(5,250,{invoiceType:'issuedInvoice',symVar:'77'})];client.invoices[0]!.invoiceHeader.liquidation.amountHome='60.50';
+    const result=await run(client,input({statementPeriod:'2026-12',dateStatement:'2026-12-31',payments:[payment(9,{direction:'receipt',variableSymbol:'77',amount:'60.50',date:'2026-12-03'})]}));
+    expect(result).toMatchObject({ok:true,settled:1,statementNumber:'012'});
+    expect(client.writes[0]!.operations[0].header).toMatchObject({type:'receipt',statementPeriod:'2026-12',numberMovement:'9',datePayment:'2026-12-03',liquidations:[{agenda:'issuedInvoice',id:5,amount:'60.50'}]});
+  });
+  it('processes 1000 movements with one write and bounded reads',async()=>{
+    const client=new Client();client.invoices=Array.from({length:1000},(_,i)=>invoice(i+1,100+i,{symVar:String(i+1)}));
+    const payments=Array.from({length:1000},(_,i)=>payment(i+1,{variableSymbol:String(i+1),amount:100+i,mark:{page:1,x:.03,y:.05+i*.0009}}));
+    const started=performance.now(),result=await run(client,input({payments})),ms=performance.now()-started;
+    expect(result.settled).toBe(1000);expect(client.writes).toHaveLength(1);expect(client.calls).toHaveLength(31);
+    expect(client.calls.every(c=>c.requests.length<=100)).toBe(true);expect(ms).toBeLessThan(10_000);
   });
   it('uses one write batch and bounded read batches for 200 movements',async()=>{
     const client=new Client();client.invoices=Array.from({length:200},(_,i)=>invoice(i+1,100,{symVar:String(i+1)}));

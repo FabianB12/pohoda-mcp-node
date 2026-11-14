@@ -115,23 +115,35 @@ export function matchStatementPayments(payments: StatementPayment[], currency: s
     list.push(d); byAmount.set(indexKey, list);
   }
   for (const list of byVS.values()) list.sort((a, b) => a.date.localeCompare(b.date) || a.id - b.id || a.agenda.localeCompare(b.agenda));
-  return payments.map(payment => {
+  type Row = { payment: StatementPayment; status: 'matched' | 'unmatched'; reason: string; document?: SettlementDocument };
+  const rows: Row[] = [], fallback = new Map<string, Row[]>();
+  // Pass 1: variable symbols, in statement order. A VS that names outstanding
+  // documents never falls back to an amount match, even once they are used up.
+  for (const payment of payments) {
     const amount = minor(payment.amount), symbol = normalizeSymbol(payment.variableSymbol);
     if (amount <= 0 || !['expense', 'receipt'].includes(payment.direction)) throw new Error('Invalid statement payment.');
-    const sameVS = symbol ? (byVS.get(`${payment.direction}|${currency}|${symbol}`) || []).filter(d => !reserved.has(key(d))) : [];
-    let match: SettlementDocument | undefined, reason = '';
-    if (sameVS.length) {
+    const row: Row = { payment, status: 'unmatched', reason: '' }; rows.push(row);
+    const vsList = symbol ? byVS.get(`${payment.direction}|${currency}|${symbol}`) : undefined;
+    if (vsList) {
+      const open = vsList.filter(d => !reserved.has(key(d)));
       // Never jump over an older unpaid document sharing this variable symbol.
-      if (sameVS[0]!.remaining === amount) { match = sameVS[0]; reason = 'variableSymbol'; }
-      else return { payment, status: 'unmatched' as const, reason: 'VS souhlasí, ale nejstarší doklad má jinou zbývající částku.' };
-    } else {
-      const sameAmount = (byAmount.get(`${payment.direction}|${currency}|${amount}`) || []).filter(d => !reserved.has(key(d)));
-      if (sameAmount.length === 1) { match = sameAmount[0]; reason = 'amount'; }
-      else return { payment, status: 'unmatched' as const, reason: sameAmount.length ? 'Částka odpovídá více dokladům.' : 'Nenalezena odpovídající položka k likvidaci.' };
+      if (open[0]?.remaining === amount) { row.status = 'matched'; row.reason = 'variableSymbol'; row.document = open[0]!; reserved.add(key(open[0]!)); }
+      else row.reason = open.length ? 'VS souhlasí, ale nejstarší doklad má jinou zbývající částku.' : 'Doklady s tímto VS již páruje jiný pohyb výpisu.';
+      continue;
     }
-    reserved.add(key(match!));
-    return { payment, status: 'matched' as const, reason, document: match! };
-  });
+    const amountKey = `${payment.direction}|${currency}|${amount}`;
+    fallback.set(amountKey, [...(fallback.get(amountKey) || []), row]);
+  }
+  // Pass 2: a unique exact amount, only when exactly one movement and one
+  // remaining document share it; otherwise the pairing is ambiguous.
+  for (const [amountKey, list] of fallback) {
+    const sameAmount = (byAmount.get(amountKey) || []).filter(d => !reserved.has(key(d)));
+    for (const row of list) {
+      if (sameAmount.length === 1 && list.length === 1) { row.status = 'matched'; row.reason = 'amount'; row.document = sameAmount[0]!; reserved.add(key(sameAmount[0]!)); }
+      else row.reason = sameAmount.length > 1 ? 'Částka odpovídá více dokladům.' : sameAmount.length ? 'Stejnou částku má více pohybů výpisu.' : 'Nenalezena odpovídající položka k likvidaci.';
+    }
+  }
+  return rows;
 }
 
 export class BankStatementService {
@@ -164,10 +176,11 @@ export class BankStatementService {
     const bankRows = snapshot.get('bank|') || [];
     const documents = SETTLEMENT_AGENDAS.flatMap(a => (snapshot.get(`invoice|${a}`) || []).map(settlementDocument));
     const documentIndex = new Map(documents.map(d => [key(d), d]));
-    const bankIndex = new Map<string, Fields[]>();
+    const bankIndex = new Map<string, Fields[]>(), legacy: Fields[] = [];
     for (const raw of bankRows) {
       const h = header(raw);
       if (Number(h.account?.id) !== Number(account.id) && text(h.account?.ids) !== text(account.ids)) continue;
+      if (!/^MCP-BANK:/m.test(text(h.intNote))) legacy.push(raw);
       const indexKey = `${text(h.dateStatement).slice(0, 4)}|${text(h.statementNumber?.statementNumber)}|${Number(h.statementNumber?.numberMovement)}`;
       const list = bankIndex.get(indexKey) || []; list.push(raw); bankIndex.set(indexKey, list);
     }
@@ -175,7 +188,14 @@ export class BankStatementService {
     for (const payment of input.payments) {
       const matches = bankIndex.get(`${input.statementPeriod.slice(0, 4)}|${statementNumber}|${payment.movement}`) || [];
       if (matches.length > 1) throw new Error(`Movement ${payment.movement} has duplicate bank records; nothing was written.`);
-      if (!matches.length) { fresh.push(payment); continue; }
+      if (!matches.length) {
+        // A manually entered or homebanking movement may use other numbering.
+        // Same facts without our marker must be reviewed, never duplicated.
+        const same = legacy.find(raw => this.sameMovementFacts(raw, input, payment));
+        if (same) rows.push({ movement: payment.movement, status: 'needs_review', bankId: Number(header(same).id), doNotRetry: true, reason: 'V účtu již existuje stejný bankovní pohyb bez ověřené vazby; nezapisuje se znovu.' });
+        else fresh.push(payment);
+        continue;
+      }
       const raw = matches[0]!, h = header(raw), expectedMarker = this.marker(input, payment, account.id);
       const marker = text(h.intNote).split(/\r?\n/).find(line => line.startsWith(`${expectedMarker}|`));
       if (!marker || !this.bankFactsMatch(raw, input, payment, account)) {
@@ -255,6 +275,15 @@ export class BankStatementService {
       const h = header(raw), foreign = raw.bankSummary?.foreignCurrency;
       const amount = foreign ? moneyValue(foreign.priceSum) : sumHomeCurrency(raw.bankSummary?.homeCurrency || {});
       return (text(foreign?.currency?.ids) || 'CZK') === input.currency && minor(amount) === minor(payment.amount) && Number(h.account?.id) === Number(account.id) && text(h.statementNumber?.statementNumber) === statementMonthNumber(input.statementPeriod) && Number(h.statementNumber?.numberMovement) === payment.movement && text(h.dateStatement) === input.dateStatement && text(h.datePayment) === payment.date && text(h.bankType) === payment.direction && normalizeSymbol(h.symVar) === normalizeSymbol(payment.variableSymbol);
+    } catch { return false; }
+  }
+  /** Account is pre-filtered. A missing VS on either side is treated as compatible. */
+  private sameMovementFacts(raw: Fields, input: StatementInput, payment: StatementPayment): boolean {
+    try {
+      const h = header(raw), foreign = raw.bankSummary?.foreignCurrency;
+      const amount = foreign ? moneyValue(foreign.priceSum) : sumHomeCurrency(raw.bankSummary?.homeCurrency || {});
+      const stored = normalizeSymbol(h.symVar), wanted = normalizeSymbol(payment.variableSymbol);
+      return (text(foreign?.currency?.ids) || 'CZK') === input.currency && minor(amount) === minor(payment.amount) && text(h.datePayment) === payment.date && text(h.bankType) === payment.direction && (!stored || !wanted || stored === wanted);
     } catch { return false; }
   }
   private async readDocuments(documents: SettlementDocument[], target: TransportOptions): Promise<Map<string, Fields>> {

@@ -68,6 +68,34 @@ bank-rate path is implemented; read-only matching remains available. This differ
 from ordinary foreign-currency invoice import. The account builder also now uses
 the schema's `daily`/`fixed` rate mode instead of an invalid numeric value.
 
+### Independent rule check (`opus55r2`, 14 November 2026)
+
+A second live suite, `tests/pohoda-bank-rules.integration.test.ts`, runs the December
+statement through the registered `process_bank_statement` MCP tool (SDK server, zod
+input) on the production `PohodaClient`. It passed 7/7 after three matching fixes, and
+the original 4 bank checks were rerun (`opus55b2`) and passed:
+
+- A no-VS row could take an invoice by amount before a later row whose VS matched it.
+  VS matches now run first.
+- Two same-amount rows competing for one invoice settled the first one. They now stay
+  untouched, and a VS whose documents are already used never falls back to amount.
+- A legacy unmarked bank entry with other/no statement numbering was not detected, so
+  a second bank record would be created. It is now a `needs_review` row.
+
+Verified live: own account `TSB2` among three accounts (from account number and IBAN, with a counterparty account
+on every row), statements 010/011/012, kept movement gaps and payment dates; the oldest
+same-VS invoice with another amount, same-amount ambiguity, the competing rows and
+the legacy entry all stay unwritten with unchanged balances; remaining balance after
+an earlier partial payment, and an incoming receipt to an issued invoice, settle with a
+`bank` liquidation link (ID, amount, date) and zero remaining; checks render only
+beside settled rows in a copy (crop preserved, source bytes unchanged); a renamed
+copy and a lost response after a real write both retry without new bank records; an
+all-unmatched statement writes nothing; EUR previews but execution is refused before
+any XML request. Statement values are read back from a synthetic text-layer PDF;
+OCR of scanned statements is not tested. Offline: 1000 movements use one write
+and 31 bounded reads. Evidence: `tests/output/bankrules-opus55r2.json` and
+`tests/output/bankrules-opus55r2/`.
+
 Official schema references: [bank liquidation items](https://www.stormware.cz/schema/version_2/bank.xsd),
 [invoice liquidation state](https://www.stormware.cz/schema/version_2/invoice.xsd),
 and [bank account rate modes](https://www.stormware.cz/schema/version_2/bankAccount.xsd).
