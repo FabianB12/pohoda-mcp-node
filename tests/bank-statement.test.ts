@@ -3,8 +3,8 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { PDFDocument } from 'pdf-lib';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { BankStatementService, classifySettlementDocument, matchStatementPayments, normalizeSymbol, resolveStatementAccount, settlementDocument, type StatementInput, type StatementPayment, type UnknownDocument } from '../src/mcp/bank-statement.js';
-import { buildBankLiquidationDetail, statementMonthNumber } from '../src/pohoda/bank-settlement.js';
+import { BankStatementService, classifyBankWriteResponse, classifySettlementDocument, matchStatementPayments, normalizeSymbol, resolveStatementAccount, settlementDocument, type StatementInput, type StatementPayment, type UnknownDocument } from '../src/mcp/bank-statement.js';
+import { buildBankLiquidationDetail, statementMonthNumber, validateBankHeaderText } from '../src/pohoda/bank-settlement.js';
 import { toMinorUnits } from '../src/pohoda/money.js';
 import { PohodaResponse } from '../src/pohoda/response.js';
 import { recordsIn } from '../src/mcp/expense-import.js';
@@ -20,6 +20,8 @@ class Client {
   accounts=[account()]; invoices:Fields[]=[invoice()]; banks:Fields[]=[]; calls:Fields[]=[]; writes:Fields[]=[];
   onList:((requests:Fields[])=>void)|undefined; onWrite:((client:Client)=>void)|undefined;
   throwAfterWrite=false; failBeforeWrite=false; failedWriteResponse=false; failTargeted=false; failScan=false;
+  /** Returns a raw POHODA response XML (parsed by the real PohodaResponse); index -> per-item fate. */
+  writeXml:((pack:string,output:Fields[])=>string)|undefined; applyWrite:((index:number)=>boolean)|undefined;
   /** Shapes what an unfiltered scan returns (the scan has no lst:liquidations). */
   scanView:((raw:Fields)=>Fields)|undefined;
   async listRecordsBatch(requests:Fields[],_id:string,options:Fields){
@@ -39,17 +41,19 @@ class Client {
     this.writes.push({operations:structuredClone(operations),pack,options});
     if(this.failBeforeWrite)throw Error('Transport failure before output');
     const output:Fields[]=[];
-    for(const op of operations){
+    operations.forEach((op,index)=>{
+      if(this.applyWrite&&!this.applyWrite(index)){output.push({id:`${pack}-${index+1}`,state:'ok',data:{state:'error',producedDetails:{id:'0'}}});return;}
       const h=op.header,id=100+this.banks.length,l=h.liquidations[0],raw=this.invoices.find(r=>head(r).id===l.id&&head(r).invoiceType===l.agenda)!;
       const currency=h.currency||'CZK';
       this.banks.push({bankHeader:{id,bankType:h.type,account:{id:2,ids:'B2'},statementNumber:{statementNumber:statementMonthNumber(h.statementPeriod),numberMovement:h.numberMovement},dateStatement:h.dateStatement,datePayment:h.datePayment,symVar:h.symVar,intNote:h.intNote},bankSummary:currency==='CZK'?{homeCurrency:{priceNone:l.amount}}:{foreignCurrency:{currency:{ids:currency},priceSum:l.amount}}});
       raw.invoiceHeader.liquidation={date:h.datePayment};
       raw.liquidations={liquidation:{date:h.datePayment,sourceAgenda:'bank',sourceDocument:{id},amount:l.amount,foreignCurrencySource:l.amount}};
-      output.push(this.failedWriteResponse?{}:{producedDetails:{id}});
-    }
+      output.push({id:`${pack}-${index+1}`,state:'ok',data:this.failedWriteResponse?{state:'ok'}:{state:'ok',producedDetails:{id:String(id)}}});
+    });
     this.onWrite?.(this);
     if(this.throwAfterWrite)throw Error('Response lost after POHODA wrote');
-    return response(output);
+    if(this.writeXml)return new PohodaResponse(this.writeXml(pack,output),{jobId:'job-1'});
+    return {state:'ok',isOk:()=>true,items:output};
   }
 }
 let dir:string,source:string;
@@ -131,6 +135,14 @@ describe('Bank account and exact matching policy',()=>{
 });
 
 describe('Bank statement processing and verification',()=>{
+  it('rejects oversized bank text and symbols before reading or writing; accepts exact schema boundaries',async()=>{
+    expect(()=>validateBankHeaderText({text:'x'.repeat(96),symVar:'1'.repeat(20)})).not.toThrow();
+    for (const extra of [{text:'x'.repeat(97)},{variableSymbol:'1'.repeat(21)}]) {
+      const client=new Client();
+      await expect(run(client,input({payments:[payment(1,extra)]}))).rejects.toThrow(/Pohyb 1:.*nejvýše/);
+      expect(client.calls).toHaveLength(0); expect(client.writes).toHaveLength(0);
+    }
+  });
   it('previews without any accounting write or PDF modification',async()=>{
     const client=new Client(),before=await readFile(source),result=await run(client,input({execute:false}));
     expect(result).toMatchObject({state:'planned',matched:1,statementNumber:'010'});expect(client.writes).toHaveLength(0);expect(await readFile(source)).toEqual(before);expect(client.calls).toHaveLength(1);
@@ -390,5 +402,104 @@ describe('Liquidation states from parsed POHODA XML',()=>{
     for(const summary of ['','<inv:homeCurrency/>','<inv:homeCurrency><typ:round><typ:priceRound>0</typ:priceRound></typ:round></inv:homeCurrency>','<inv:homeCurrency><typ:priceNone></typ:priceNone></inv:homeCurrency>',`${zeroHome}<inv:foreignCurrency><typ:currency><typ:ids>EUR</typ:ids></typ:currency></inv:foreignCurrency>`])
       expect(state(parse(doc(1,'issuedInvoice',empty,summary))[0]!,true),summary).toBe('unknown:invoiceHeader.liquidation');
     expect(state({invoiceHeader:parse(doc(1,'issuedInvoice',empty,zeroHome))[0]!.invoiceHeader},true)).toBe('unknown:invoiceHeader.liquidation'); // no invoiceSummary at all
+  });
+});
+
+// Response shapes below follow live POHODA 14302.10 artifacts (tests/output, e.g.
+// bankvariants-bv1 pay-V14-26, bankeur001): a refused document comes back as
+// responsePackItem state="ok" with bnk:bankResponse state="error", producedDetails id 0
+// and the cause in rdc:importDetails. Schema failures use responsePackItem state="error"
+// with a note echoing the request XML. Notes marked SYNTHETIC are illustrative only.
+const rsp=(pack:string,items:string[],state='ok')=>`<?xml version="1.0" encoding="Windows-1250"?><rsp:responsePack version="2.0" id="${pack}" state="${state}" programVersion="14302.10 (22.6.2026)" ico="12345678" note="Batch write" xmlns:rsp="http://www.stormware.cz/schema/version_2/response.xsd" xmlns:rdc="http://www.stormware.cz/schema/version_2/documentresponse.xsd" xmlns:bnk="http://www.stormware.cz/schema/version_2/bank.xsd">${items.join('')}</rsp:responsePack>`;
+const detail=(state:string,errno:string,note:string,xpath='',produced='')=>`<rdc:detail><rdc:state>${state}</rdc:state><rdc:errno>${errno}</rdc:errno><rdc:note>${note}</rdc:note>${xpath?`<rdc:XPath>${xpath}</rdc:XPath>`:''}${produced?`<rdc:valueProduced>${produced}</rdc:valueProduced>`:''}</rdc:detail>`;
+const accWarn=(n:number)=>detail('warning','603','Hodnota prvku musela být upravena.',`/dat:dataPack/dat:dataPackItem[${n}]/bnk:bank[1]/bnk:bankHeader[1]/bnk:accounting`,'1Bv');
+const bankItem=(id:string,docState:string,details:string[],produced:number|string)=>`<rsp:responsePackItem version="2.0" id="${id}" state="ok"><bnk:bankResponse version="2.0" state="${docState}"><rdc:importDetails>${details.join('')}</rdc:importDetails><rdc:producedDetails><rdc:id>${produced}</rdc:id><rdc:actionType>add</rdc:actionType></rdc:producedDetails></bnk:bankResponse></rsp:responsePackItem>`;
+const created=(pack:string,n:number,id:number)=>bankItem(`${pack}-${n}`,'ok',[accWarn(n),detail('ok','0',`Byla provedena likvidace dokladu č. 2611000${n}.`)],id);
+const refused=(pack:string,n:number,errno:string,note:string,xpath='')=>bankItem(`${pack}-${n}`,'error',[accWarn(n),detail('error',errno,note,xpath)],0);
+const many=(n:number)=>{const c=new Client();c.invoices=Array.from({length:n},(_,i)=>invoice(i+1,100+i,{symVar:String(1000+i)}));return {client:c,payments:Array.from({length:n},(_,i)=>payment(i+1,{amount:100+i,variableSymbol:String(1000+i)}))};};
+const invoiceSnapshot=(c:Client)=>JSON.stringify(c.invoices);
+
+describe('Bank write response outcomes (real parser)',()=>{
+  it('reports 34 explicit POHODA rejections as rejected with grouped causes, not write_uncertain',async()=>{
+    const {client,payments}=many(34);client.applyWrite=()=>false;const before=invoiceSnapshot(client);
+    client.writeXml=(pack,output)=>rsp(pack,output.map((_,i)=>i<20
+      ?refused(pack,i+1,'114',`Likvidací dokladu nesmí vzniknout přeplatek (doklad č. 2611000${String(i).padStart(2,'0')}).`)
+      :refused(pack,i+1,'999','SYNTHETIC: Neplatná předkontace.',`/dat:dataPack/dat:dataPackItem[${i+1}]/bnk:bank[1]/bnk:bankHeader[1]/bnk:accounting`)));
+    const result=await run(client,input({payments}));
+    expect(result).toMatchObject({ok:false,settled:0,rejected:34,writeUncertain:0,needsReview:0,createdIds:[],annotatedPdf:{marked:0}});
+    expect(result.write).toMatchObject({responseState:'ok',programVersion:'14302.10 (22.6.2026)',jobId:'job-1',attempted:34,created:0,rejected:34,uncertain:0,conflicting:0,reconciliation:{performed:true,foundAfterRejectedOrUncertain:0}});
+    expect(result.write.causes).toEqual([
+      {errno:'114',note:expect.stringMatching(/přeplatek/),count:20,movements:Array.from({length:20},(_,i)=>i+1)},
+      {errno:'999',note:'SYNTHETIC: Neplatná předkontace.',field:'bnk:bank/bnk:bankHeader/bnk:accounting',count:14,movements:Array.from({length:14},(_,i)=>i+21)}]);
+    for(const row of result.rows){
+      expect(row).toMatchObject({status:'rejected',doNotRetry:true,write:{outcome:'rejected',itemState:'ok',documentState:'error',reconciliation:{performed:true,bankRecordFound:false}}});
+      expect(row.write.importErrors).toHaveLength(1);expect(row.write.importWarnings[0]).toMatchObject({errno:'603',valueProduced:'1Bv'});
+      expect(row.reason).toMatch(/odmítla.*neproběhla/s);
+    }
+    expect(result.message).toMatch(/odmítla 34/);expect(result.message).toMatch(/neuhrazený/);
+    expect(client.writes).toHaveLength(1);expect(client.banks).toHaveLength(0);expect(invoiceSnapshot(client)).toBe(before);
+    expect(JSON.stringify(result).length).toBeLessThan(60_000);
+  });
+  it('handles partial rejection, warnings and success in one pack; rejected rows stay unmarked',async()=>{
+    const {client,payments}=many(3);client.applyWrite=i=>i!==1;
+    client.writeXml=(pack,output)=>rsp(pack,[created(pack,1,Number(output[0]!.data.producedDetails.id)),refused(pack,2,'114','Likvidací dokladu nesmí vzniknout přeplatek (doklad č. 261100056).'),created(pack,3,Number(output[2]!.data.producedDetails.id))]);
+    const result=await run(client,input({payments}));
+    expect(result.rows.map((r:Fields)=>r.status)).toEqual(['settled','rejected','settled']);
+    expect(result).toMatchObject({settled:2,rejected:1,createdIds:[100,101],annotatedPdf:{marked:2},write:{created:2,rejected:1,uncertain:0}});
+    expect(result.rows[1].write.importErrors[0]).toEqual({state:'error',errno:'114',note:'Likvidací dokladu nesmí vzniknout přeplatek (doklad č. 261100056).'});
+    expect(result.rows[0].write).toMatchObject({outcome:'created',importWarnings:[{errno:'603'}]});
+  });
+  it('maps reordered response items by dataPackItem ID, never by position',async()=>{
+    const {client,payments}=many(2);client.applyWrite=i=>i===0;
+    client.writeXml=(pack,output)=>rsp(pack,[refused(pack,2,'114','x'),created(pack,1,Number(output[0]!.data.producedDetails.id))]);
+    const result=await run(client,input({payments}));
+    expect(result.rows.map((r:Fields)=>[r.movement,r.status,r.bankId])).toEqual([[1,'settled',100],[2,'rejected',undefined]]);
+  });
+  it('treats a missing item as uncertain, reconciles it read-only and a rerun does not duplicate it',async()=>{
+    const {client,payments}=many(2);
+    client.writeXml=(pack,output)=>rsp(pack,[created(pack,1,Number(output[0]!.data.producedDetails.id))]);
+    const first=await run(client,input({payments}));
+    expect(first.rows.map((r:Fields)=>r.status)).toEqual(['settled','write_uncertain']);
+    expect(first.rows[1]).toMatchObject({doNotRetry:true,bankId:101,write:{outcome:'missing',reconciliation:{bankRecordFound:true,bankIds:[101]}}});
+    expect(first.rows[1].reason).toMatch(/neobsahuje položku/);expect(first.annotatedPdf.marked).toBe(1);
+    client.writeXml=undefined;const retry=await run(client,input({payments}));
+    expect(client.writes).toHaveLength(1);expect(retry).toMatchObject({ok:true,settled:2});
+  });
+  it('reconciles a lost response without retrying and reports a confirmed absent record after a pre-write failure',async()=>{
+    const lost=new Client();lost.throwAfterWrite=true;
+    const a=await run(lost);expect(a.rows[0]).toMatchObject({status:'write_uncertain',bankId:100,write:{outcome:'missing',reconciliation:{bankRecordFound:true}}});
+    expect(a.write.transportError).toMatch(/Response lost/);expect(lost.writes).toHaveLength(1);
+    const none=new Client();none.failBeforeWrite=true;
+    const b=await run(none);expect(b.rows[0]).toMatchObject({status:'write_uncertain',write:{outcome:'missing',reconciliation:{performed:true,bankRecordFound:false}}});
+    expect(b.rows[0].reason).toMatch(/nenašlo/);
+  });
+  it('keeps an unparsable response uncertain and an explicit rejection rejected when reconciliation fails',async()=>{
+    const garbled=new Client();garbled.writeXml=()=>'<rsp:responsePack';
+    const a=await run(garbled);expect(a.rows[0]).toMatchObject({status:'write_uncertain',write:{outcome:'missing'}});expect(a.write.responseState).toBe('error');
+    const {client,payments}=many(1);client.applyWrite=()=>false;client.writeXml=pack=>rsp(pack,[refused(pack,1,'114','x')]);
+    const real=client.listRecordsBatch.bind(client);
+    client.listRecordsBatch=async(requests:Fields[],id:string,options:Fields)=>{if(client.writes.length&&requests.some(r=>r.agenda==='bank'))throw Error('read down');return real(requests,id,options);};
+    const b=await run(client,input({payments}));
+    expect(b.rows[0]).toMatchObject({status:'rejected',write:{reconciliation:{performed:false}}});expect(b.write.reconciliation.error).toMatch(/read down/);
+  });
+  it('never settles a record whose response reported an error together with an ID',async()=>{
+    const client=new Client();
+    client.writeXml=(pack,output)=>rsp(pack,[bankItem(`${pack}-1`,'error',[detail('error','999','SYNTHETIC conflict')],Number(output[0]!.data.producedDetails.id))]);
+    const result=await run(client);
+    expect(result.rows[0]).toMatchObject({status:'needs_review',verified:true,doNotRetry:true,bankId:100,write:{outcome:'conflict'}});
+    expect(result.annotatedPdf.marked).toBe(0);
+  });
+  it('reports a schema rejection from the item note without echoing request XML',()=>{
+    const note='Nepodařila se validace dokumentu podle schématu.&#xA;&lt;bnk:bank version=&quot;2.0&quot;&gt;&lt;bnk:text&gt;Partner s.r.o.&lt;/bnk:text&gt;&lt;/bnk:bank&gt;&#xA;Element &apos;{x}foo&apos; is unexpected.&#xA;';
+    const xml=rsp('P',[`<rsp:responsePackItem version="2.0" id="P-1" state="error" note="${note}"/>`,refused('P',2,'114','single detail')]);
+    const out=classifyBankWriteResponse(new PohodaResponse(xml),'P',3);
+    expect(out[0]).toMatchObject({outcome:'rejected',itemState:'error'});
+    expect(out[0]!.errors[0]!.note).toBe("Nepodařila se validace dokumentu podle schématu. Element '{x}foo' is unexpected.");
+    expect(out[1]).toMatchObject({outcome:'rejected',documentState:'error',errors:[{errno:'114',note:'single detail'}]});
+    expect(out[2]).toMatchObject({outcome:'missing'});
+    const dup=classifyBankWriteResponse(new PohodaResponse(rsp('P',[created('P',1,5),created('P',1,6)])),'P',1);
+    expect(dup[0]).toMatchObject({outcome:'missing'});expect(dup[0]!.detail).toMatch(/2 položky/);
+    const ok=classifyBankWriteResponse(new PohodaResponse(rsp('P',[`<rsp:responsePackItem version="2.0" id="P-1" state="ok"><bnk:bankResponse version="2.0" state="ok"/></rsp:responsePackItem>`])),'P',1);
+    expect(ok[0]).toMatchObject({outcome:'missing'});
   });
 });

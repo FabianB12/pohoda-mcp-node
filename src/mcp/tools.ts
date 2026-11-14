@@ -24,6 +24,7 @@ import { ExportStore, type CurrencyTotal, type ExportRecord, type ExportSnapshot
 import { preparePdfPages } from "./pdf-pages.js";
 import type { PdfArchive } from "../pohoda/pdf-archive.js";
 import { BankStatementService } from "./bank-statement.js";
+import { BANK_TEXT_MAX_LENGTH, BANK_SYMBOL_MAX_LENGTH } from "../pohoda/bank-settlement.js";
 import { ExpenseReviewService } from "./expense-review.js";
 import { ExpenseImporter, lookupSupplierRegistry } from "./expense-import.js";
 import { CzechRegistryClient } from "../registry/czech-registry.js";
@@ -723,7 +724,7 @@ export function registerPohodaTools(server: McpServer, context: PohodaServerCont
       payments: z.array(z.object({
         movement: z.number().int().min(1).max(999999).describe("Stable movement number from the statement, including unmatched rows; never renumber only matched rows."),
         date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/), amount: z.union([z.number().positive(),z.string().min(1)]),
-        direction: z.enum(["expense","receipt"]), variableSymbol: z.string().optional(), text: z.string().max(240).optional(),
+        direction: z.enum(["expense","receipt"]), variableSymbol: z.string().max(BANK_SYMBOL_MAX_LENGTH).optional(), text: z.string().max(BANK_TEXT_MAX_LENGTH).optional(),
         mark: z.object({page:z.number().int().min(1),x:z.number().min(0).max(.97),y:z.number().min(.03).max(.97)}).describe("Check-mark position in a blank margin beside this transaction; x/y are fractions of the displayed page from top-left.")
       })).min(1).max(1000)
     },

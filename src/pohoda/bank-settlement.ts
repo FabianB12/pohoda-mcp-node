@@ -5,6 +5,14 @@ export const SETTLEMENT_AGENDAS = ['receivedInvoice', 'commitment', 'issuedInvoi
 export type SettlementAgenda = typeof SETTLEMENT_AGENDAS[number];
 export type BankLiquidation = { agenda: SettlementAgenda; id: number; amount: number | string };
 
+// bank.xsd: bankHeader/text is string96; type.xsd: symVarType is string20.
+export const BANK_TEXT_MAX_LENGTH = 96;
+export const BANK_SYMBOL_MAX_LENGTH = 20;
+export function validateBankHeaderText(header: { text?: unknown; symVar?: unknown }): void {
+  if (String(header.text ?? '').length > BANK_TEXT_MAX_LENGTH) throw new Error(`Text bankovního pohybu smí mít nejvýše ${BANK_TEXT_MAX_LENGTH} znaků. Zkraťte popis; částku ani VS neměňte.`);
+  if (String(header.symVar ?? '').length > BANK_SYMBOL_MAX_LENGTH) throw new Error(`Variabilní symbol bankovního pohybu smí mít nejvýše ${BANK_SYMBOL_MAX_LENGTH} znaků. Ověřte VS na výpisu; nekrátí se automaticky.`);
+}
+
 /** Import-only bankLiquidationItem creates the real payment link, not just a bank entry. */
 export function buildBankLiquidationDetail(targets: BankLiquidation[], currency = 'CZK'): XmlObject[] {
   if (!targets.length) throw new Error('At least one liquidation target is required.');

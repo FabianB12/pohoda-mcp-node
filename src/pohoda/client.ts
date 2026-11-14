@@ -1,4 +1,4 @@
-import { buildBankLiquidationDetail, statementMonthNumber } from './bank-settlement.js';
+import { buildBankLiquidationDetail, statementMonthNumber, validateBankHeaderText } from './bank-settlement.js';
 import { buildPdfAttachment } from "./pdf-archive.js";
 import { agendaConfig } from "./constants.js";
 import { isExpenseDocument, isForeignCurrency, resolveExpensePolicy } from "./expense-policy.js";
@@ -522,6 +522,7 @@ const enquiryConfig: DocumentConfig = {
 
 function buildGenericDocumentData(config: DocumentConfig, header: Record<string, any>, items: Record<string, any>[]): XmlObject {
   const prefix = config.prefix;
+  if (prefix === "bnk") validateBankHeaderText(header);
   const data: XmlObject = {
     [`${prefix}:${config.headerName}`]: buildDocumentHeader(config, header)
   };

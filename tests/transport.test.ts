@@ -3,7 +3,7 @@ import { createWriteStream, existsSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { CliXmlTransport, defaultProcessRunner, waitForStreamFinished } from "../src/pohoda/transport.js";
+import { CliXmlTransport, classifyResponseOutcome, defaultProcessRunner, waitForStreamFinished } from "../src/pohoda/transport.js";
 
 const retainedDirs: string[] = [];
 
@@ -268,6 +268,85 @@ describe("CliXmlTransport", () => {
     });
 
     await expect(waitForStreamFinished(stream)).resolves.toBeUndefined();
+  });
+});
+
+const RSP = 'xmlns:rsp="http://www.stormware.cz/schema/version_2/response.xsd" xmlns:bnk="http://www.stormware.cz/schema/version_2/bank.xsd" xmlns:rdc="http://www.stormware.cz/schema/version_2/documentresponse.xsd"';
+const pack = (state: string, items: string) => `<?xml version="1.0" encoding="Windows-1250"?><rsp:responsePack version="2.0" id="P" state="${state}" programVersion="14302.10" ${RSP}>${items}</rsp:responsePack>`;
+const bankItem = (id: string, itemState: string, docState: string, detail: string, produced: string) => `<rsp:responsePackItem version="2.0" id="${id}" state="${itemState}"><bnk:bankResponse version="2.0" state="${docState}"><rdc:importDetails>${detail}</rdc:importDetails><rdc:producedDetails><rdc:id>${produced}</rdc:id></rdc:producedDetails></bnk:bankResponse></rsp:responsePackItem>`;
+const detail = (state: string, errno: string, note: string) => `<rdc:detail><rdc:state>${state}</rdc:state><rdc:errno>${errno}</rdc:errno><rdc:note>${note}</rdc:note></rdc:detail>`;
+const RESPONSES = {
+  ok: pack("ok", bankItem("P-1", "ok", "ok", "", "41")),
+  warningOnly: pack("ok", bankItem("P-1", "ok", "ok", detail("warning", "301", "Upraveno"), "41")),
+  packWarning: pack("warning", bankItem("P-1", "warning", "ok", detail("warning", "301", "Upraveno"), "41")),
+  nestedError: pack("ok", bankItem("P-1", "ok", "ok", "", "41") + bankItem("P-2", "ok", "error", detail("error", "114", "Likvidac\u00ed nesm\u00ed vzniknout p\u0159eplatek."), "0")),
+  schemaItemError: pack("ok", '<rsp:responsePackItem version="2.0" id="P-1" state="error" note="Element text violates maxLength constraint of \'96\'." />'),
+  packError: pack("error", ""),
+  truncated: pack("ok", bankItem("P-1", "ok", "ok", "", "41")).slice(0, -40),
+  notResponse: '<html>Server error</html>',
+  unknownItemState: pack("ok", '<rsp:responsePackItem version="2.0" id="P-1" />')
+};
+
+describe("CliXmlTransport job retention by response outcome", () => {
+  it.each([
+    ["ok", "ok"], ["warningOnly", "ok"], ["packWarning", "ok"],
+    ["nestedError", "rejected"], ["schemaItemError", "rejected"], ["packError", "rejected"],
+    ["truncated", "malformed"], ["notResponse", "malformed"], ["unknownItemState", "malformed"]
+  ] as const)("classifies %s as %s", (name, outcome) => {
+    expect(classifyResponseOutcome(RESPONSES[name])).toBe(outcome);
+  });
+
+  async function run(name: keyof typeof RESPONSES, keepSuccessfulJobs: boolean, keepFailedJobs: boolean) {
+    const workDir = await mkdtemp(join(tmpdir(), "pohoda-retain-"));
+    retainedDirs.push(workDir);
+    const transport = new CliXmlTransport({
+      exePath: process.execPath, username: "Admin", password: "secret-pw", workDir, keepSuccessfulJobs, keepFailedJobs,
+      processRunner: async ({ responseXml }) => { await writeFile(responseXml, (await import("iconv-lite")).default.encode(RESPONSES[name], "win1250")); return 0; }
+    });
+    return transport.exchange("<dat:dataPack id=\"P\" />", "Db");
+  }
+
+  it.each(["nestedError", "schemaItemError", "packError", "truncated", "notResponse"] as const)(
+    "retains %s request, response and metadata under keepFailedJobs=true even with keepSuccessfulJobs=false",
+    async (name) => {
+      const result = await run(name, false, true);
+      expect(result.xml).toBe(RESPONSES[name]);
+      expect(result.jobRetained).toBe(true);
+      expect(result.responseOutcome).not.toBe("ok");
+      expect(await readFile(join(result.jobDir, "request.xml"), "utf8")).toContain('dat:dataPack id="P"');
+      expect((await import("iconv-lite")).default.decode(await readFile(join(result.jobDir, "response.xml")), "win1250")).toBe(RESPONSES[name]);
+      const metadata = JSON.parse(await readFile(join(result.jobDir, "metadata.json"), "utf8"));
+      expect(metadata).toMatchObject({ jobId: result.jobId, database: "Db", exitCode: 0, responseOutcome: result.responseOutcome });
+      expect(JSON.stringify(metadata)).not.toContain("secret-pw");
+    });
+
+  it("removes a rejected response job when keepFailedJobs=false, even with keepSuccessfulJobs=true", async () => {
+    const result = await run("nestedError", true, false);
+    expect(result).toMatchObject({ jobRetained: false, responseOutcome: "rejected" });
+    expect(existsSync(result.jobDir)).toBe(false);
+    expect(result.xml).toBe(RESPONSES.nestedError);
+  });
+
+  it.each(["ok", "warningOnly"] as const)("applies keepSuccessfulJobs to %s responses", async (name) => {
+    const removed = await run(name, false, true);
+    expect(removed).toMatchObject({ jobRetained: false, responseOutcome: "ok" });
+    expect(existsSync(removed.jobDir)).toBe(false);
+    const kept = await run(name, true, false);
+    expect(kept).toMatchObject({ jobRetained: true, responseOutcome: "ok" });
+    expect(existsSync(join(kept.jobDir, "response.xml"))).toBe(true);
+  });
+
+  it("reports whether a failed job without response was retained", async () => {
+    const workDir = await mkdtemp(join(tmpdir(), "pohoda-retain-"));
+    retainedDirs.push(workDir);
+    const make = (keepFailedJobs: boolean) => new CliXmlTransport({
+      exePath: process.execPath, username: "Admin", password: "secret-pw", workDir, keepFailedJobs, timeoutSeconds: 0.01,
+      processRunner: async () => 1
+    });
+    await expect(make(true).exchange("<x />", "Db")).rejects.toThrow(/Job directory: .*jobs/);
+    const error = await make(false).exchange("<x />", "Db").catch((e: Error) => e);
+    expect(String(error)).toMatch(/Job directory removed \(keepFailedJobs=false\)/);
+    expect(String(error)).not.toContain("secret-pw");
   });
 });
 

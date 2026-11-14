@@ -4,7 +4,7 @@ import { readFile } from 'node:fs/promises';
 import type { PohodaClient, WriteBatchOperation } from '../pohoda/client.js';
 import type { TransportOptions } from '../pohoda/transport.js';
 import { toMinorUnits, moneyValue, sumHomeCurrency, sumHomeCurrencyMinor, homeSummaryFields } from '../pohoda/money.js';
-import { SETTLEMENT_AGENDAS, statementMonthNumber, type SettlementAgenda } from '../pohoda/bank-settlement.js';
+import { SETTLEMENT_AGENDAS, statementMonthNumber, validateBankHeaderText, type SettlementAgenda } from '../pohoda/bank-settlement.js';
 import { recordsIn, scanExpenseAgendas } from './expense-import.js';
 import { loadStatementPdf, markSettledPayments, type StatementMark } from './bank-statement-pdf.js';
 
@@ -264,7 +264,8 @@ export class BankStatementService {
       if (!Number.isInteger(p.movement) || p.movement < 1 || p.movement > 999999 || movements.has(p.movement)) throw new Error('Statement movement numbers must be unique positive integers.');
       movements.add(p.movement);
       if (!validDate(p.date) || !['expense', 'receipt'].includes(p.direction) || minor(p.amount) <= 0) throw new Error('Invalid payment date, direction or amount.');
-      if (p.text && p.text.length > 240) throw new Error('Payment text exceeds 240 characters.');
+      try { validateBankHeaderText({ text: p.text, symVar: p.variableSymbol }); }
+      catch (error) { throw new Error(`Pohyb ${p.movement}: ${(error as Error).message}`); }
     }
     const pdf = await loadStatementPdf(input.sourcePdfPath, input.payments.map(p => p.mark));
     const groups = [{ agenda: 'bankAccount', subType: '' }, { agenda: 'bank', subType: '' }, ...SETTLEMENT_AGENDAS.map(subType => ({ agenda: 'invoice', subType }))];
@@ -324,6 +325,7 @@ export class BankStatementService {
     }
     if (checksum(await readFile(input.sourcePdfPath)) !== pdf.sha256) throw new Error('Source statement changed; nothing was written.');
     const reportedIds = new Set<number>();
+    let writeSummary: Fields | undefined, reconciliation: Fields | undefined;
     if (toWrite.length) {
       // Re-read exact targets once before writing. A changed currency, date,
       // symbol or balance invalidates the plan instead of silently rematching it.
@@ -343,18 +345,18 @@ export class BankStatementService {
           ...(input.currency !== 'CZK' ? { currency: input.currency } : {}), liquidations: [{ agenda: row.document.agenda, id: row.document.id, amount: row.payment.amount }]
         }, items: []
       }));
-      try {
-        // Markers and full read-back are the duplicate guard. The transport pack
-        // is per-attempt so a previously rejected item can be safely retried.
-        const result = await this.client.writeBatch(operations, `bank-${randomBytes(12).toString('hex')}`, target);
-        for (const item of result.items) { const id = Number(item.data.producedDetails?.id); if (id > 0) reportedIds.add(id); }
-        toWrite.forEach((row, i) => {
-          const item = result.items[i]; row.bankId = Number(item?.data.producedDetails?.id) || undefined;
-          row.status = row.bankId ? 'created' : 'write_uncertain'; row.doNotRetry = true; row.importDetails = item?.data.importDetails;
-        });
-      } catch (error) {
-        for (const row of toWrite) { row.status = 'write_uncertain'; row.doNotRetry = true; row.reason = (error as Error).message; }
-      }
+      // Markers and full read-back are the duplicate guard. The transport pack
+      // is per-attempt so a previously rejected item can be safely retried.
+      const packId = `bank-${randomBytes(12).toString('hex')}`;
+      let response: BankWriteResponse | undefined, transportError = '';
+      try { response = await this.client.writeBatch(operations, packId, target); }
+      catch (error) { transportError = (error as Error).message; }
+      const outcomes = classifyBankWriteResponse(response, packId, operations.length, transportError);
+      toWrite.forEach((row, i) => applyWriteOutcome(row, outcomes[i]!));
+      for (const o of outcomes) if (o.bankId) reportedIds.add(o.bankId);
+      const unresolved = toWrite.filter(r => r.writeOutcome !== 'created');
+      if (unresolved.length) reconciliation = await this.reconcile(unresolved, input, account, target);
+      writeSummary = summarizeWrite(packId, response, transportError, toWrite, reconciliation);
     }
     const verify = rows.filter(r => ['created', 'existing'].includes(r.status) && r.document && r.bankId);
     if (verify.length) {
@@ -368,8 +370,11 @@ export class BankStatementService {
           const expectedMarker = `${this.marker(input, row.payment, account.id)}|${key(row.document)}`;
           const state = raw && classifySettlementDocument(raw, row.document.agenda, true);
           const valid = state?.kind === 'known' && state.document.currency === input.currency && state.document.remaining === 0 && links.length > 0 && linkAmount === minor(row.payment.amount) && links.every(link => text(link.date) === row.payment.date) && !!bank && this.bankFactsMatch(bank, input, row.payment, account) && text(header(bank).intNote).split(/\r?\n/).includes(expectedMarker);
-          row.status = valid ? 'settled' : 'needs_review'; row.verified = valid; row.doNotRetry = !valid;
+          // A record POHODA reported as failed (or found only by read-back) stays a review case even when verified.
+          const settledOk = valid && !row.responseConflict;
+          row.status = settledOk ? 'settled' : 'needs_review'; row.verified = valid; row.doNotRetry = !settledOk;
           if (!valid) row.reason = 'Likvidace nebo uložené údaje nebyly potvrzeny; platbu znovu nezapisovat.';
+          else if (!settledOk) row.reason = 'Bankovní záznam a likvidace jsou ověřeny čtením, ale odpověď POHODA hlásila chybu nebo chyběla; zkontrolujte importErrors, znovu nezapisovat.';
         }
       } catch (error) {
         for (const row of verify) { row.status = 'needs_review'; row.doNotRetry = true; row.reason = (error as Error).message; }
@@ -382,7 +387,39 @@ export class BankStatementService {
     let annotated: Fields;
     try { annotated = await markSettledPayments(pdf, input.sourcePdfPath, output, settled.map(r => r.payment.mark)); }
     catch (error) { annotated = { error: (error as Error).message }; }
-    return { ok: !rows.some(r => ['needs_review', 'write_uncertain'].includes(r.status)) && !annotated.error, state: 'processed', account: { id: account.id, ids: account.ids }, statementNumber, settled: settled.length, unmatched: rows.filter(r => r.status === 'unmatched').length, needsReview: rows.filter(r => r.status === 'needs_review').length, createdIds: [...reportedIds], rows: rows.map(publicRow), ...(diagnostics ? { diagnostics } : {}), annotatedPdf: annotated };
+    const rejected = rows.filter(r => r.status === 'rejected').length, uncertain = rows.filter(r => r.status === 'write_uncertain').length;
+    return { ok: !rows.some(r => ['needs_review', 'write_uncertain', 'rejected'].includes(r.status)) && !annotated.error, state: 'processed', account: { id: account.id, ids: account.ids }, statementNumber, settled: settled.length, unmatched: rows.filter(r => r.status === 'unmatched').length, needsReview: rows.filter(r => r.status === 'needs_review').length, rejected, writeUncertain: uncertain, createdIds: [...reportedIds], rows: rows.map(publicRow), ...(writeSummary ? { write: writeSummary } : {}), ...(diagnostics ? { diagnostics } : {}), annotatedPdf: annotated,
+      ...(writeSummary ? { message: writeMessage(writeSummary, settled.length) } : {}) };
+  }
+  /**
+   * Read-only reconciliation after a rejected or uncertain write: one bank scan
+   * for this run's per-movement markers. A found record is reported with its ID
+   * (a later run verifies it as existing); nothing is ever written or retried here.
+   */
+  private async reconcile(rows: Fields[], input: StatementInput, account: Fields, target: TransportOptions): Promise<Fields> {
+    let banks: Fields[];
+    try { banks = (await scanExpenseAgendas(this.client, [{ agenda: 'bank', subType: '' }], {}, target, false, 2000)).get('bank|') || []; }
+    catch (error) {
+      const message = `Kontrolní čtení bankovních záznamů selhalo: ${(error as Error).message}`;
+      for (const row of rows) row.reconciliation = { performed: false, error: message };
+      return { performed: false, error: message };
+    }
+    let found = 0;
+    for (const row of rows) {
+      const expected = `${this.marker(input, row.payment, account.id)}|${key(row.document)}`;
+      const hits = banks.filter(raw => { const h = header(raw); return (Number(h.account?.id) === Number(account.id) || text(h.account?.ids) === text(account.ids)) && text(h.intNote).split(/\r?\n/).includes(expected); });
+      row.reconciliation = { performed: true, bankRecordFound: hits.length > 0, ...(hits.length ? { bankIds: hits.map(raw => Number(header(raw).id)) } : {}) };
+      if (!hits.length) {
+        if (row.status === 'rejected') row.reason += ' Kontrolní čtení potvrdilo, že bankovní záznam s touto značkou neexistuje; likvidace tímto pohybem neproběhla.';
+        else row.reason += ' Kontrolní čtení po zápisu záznam s touto značkou nenašlo; nový náhled execute=false značky znovu prohledá. Neopakovat zápis jiným nástrojem.';
+        continue;
+      }
+      found++; row.responseConflict = true; row.bankId = Number(header(hits[0]!).id);
+      if (hits.length > 1) { row.status = 'needs_review'; row.reason = `Kontrolní čtení našlo ${hits.length} bankovní záznamy se stejnou značkou; znovu nezapisovat.`; continue; }
+      if (row.status === 'rejected') { row.status = 'needs_review'; row.reason += ` Přesto kontrolní čtení našlo bankovní záznam ID ${row.bankId} s touto značkou; zkontrolujte jej ručně, znovu nezapisovat.`; continue; }
+      if (row.status === 'write_uncertain') { row.reason += ` Kontrolní čtení našlo bankovní záznam ID ${row.bankId} s touto značkou; nový běh jej ověří jako existující bez dalšího zápisu.`; continue; }
+    }
+    return { performed: true, scannedBankRecords: banks.length, foundAfterRejectedOrUncertain: found };
   }
   private marker(input: StatementInput, payment: StatementPayment, accountId: unknown): string {
     return `MCP-BANK:${checksum(JSON.stringify([String(accountId), input.statementPeriod, payment.movement, payment.date, payment.direction, minor(payment.amount), input.currency, normalizeSymbol(payment.variableSymbol)])).slice(0, 32)}`;
@@ -456,8 +493,93 @@ export class BankStatementService {
   }
 }
 function publicRow(row: Fields): Fields {
-  return { movement: row.movement, status: row.status, reason: row.reason, bankId: row.bankId, verified: row.verified, doNotRetry: row.doNotRetry, document: row.document ? { id: row.document.id, agenda: row.document.agenda, number: row.document.number } : undefined, ...(row.blockedBy ? { blockedBy: row.blockedBy } : {}) };
+  return { movement: row.movement, status: row.status, reason: row.reason, bankId: row.bankId, verified: row.verified, doNotRetry: row.doNotRetry, document: row.document ? { id: row.document.id, agenda: row.document.agenda, number: row.document.number } : undefined, ...(row.blockedBy ? { blockedBy: row.blockedBy } : {}),
+    ...(row.writeOutcome ? { write: { outcome: row.writeOutcome, responseItemId: row.responseItemId, itemState: row.itemState, documentState: row.documentState, ...(row.importErrors?.length ? { importErrors: row.importErrors } : {}), ...(row.importWarnings?.length ? { importWarnings: row.importWarnings } : {}), ...(row.reconciliation ? { reconciliation: row.reconciliation } : {}) } } : {}) };
 }
+
+/** Parsed POHODA response as produced by PohodaResponse (only the fields used here). */
+export type BankWriteResponse = { state: string; programVersion?: string; transport?: Record<string, unknown>; items: { id: string; state: string; attributes?: Record<string, string>; data: Fields }[] };
+export type ImportMessage = { state: string; errno?: string; note: string; xpath?: string; valueRequested?: string; valueProduced?: string };
+/**
+ * created: POHODA returned a positive record ID (verified by read-back afterwards).
+ * rejected: POHODA explicitly refused the item (item or document state error, no ID).
+ * missing: no usable answer for the item (transport failure, unparsable/absent/duplicate
+ * item, ok without ID): the write is uncertain. conflict: an ID together with an error.
+ */
+export type BankWriteOutcome = { index: number; itemId: string; outcome: 'created' | 'rejected' | 'missing' | 'conflict'; bankId?: number | undefined; itemState?: string | undefined; documentState?: string | undefined; errors: ImportMessage[]; warnings: ImportMessage[]; detail: string };
+const MAX_ROW_MESSAGES = 5, MAX_NOTE = 300;
+const clip = (v: string, n = MAX_NOTE) => v.length > n ? `${v.slice(0, n)}…` : v;
+const scalar = (v: unknown): string => v != null && typeof v === 'object' ? text((v as Fields)['#text'] ?? '') : text(v);
+/** Item-level notes echo the request XML (schema errors); keep only the diagnostic lines. */
+function itemNote(note: string): string {
+  // fast-xml-parser keeps numeric references (live notes use &#xA; as line breaks).
+  return clip(note.replace(/&#(?:x0*[ad]|0*1[03]);/gi, '\n').split(/\r?\n/).map(l => l.trim()).filter(l => l && !l.startsWith('<')).join(' '), 600);
+}
+function importMessages(data: Fields | undefined): { errors: ImportMessage[]; warnings: ImportMessage[] } {
+  const errors: ImportMessage[] = [], warnings: ImportMessage[] = [];
+  for (const d of asArray<Fields>(data?.importDetails?.detail)) {
+    if (!d || typeof d !== 'object') continue;
+    const state = scalar(d.state), entry: ImportMessage = { state, note: clip(scalar(d.note)) };
+    for (const [k, v] of [['errno', d.errno], ['xpath', d.XPath], ['valueRequested', d.valueRequested], ['valueProduced', d.valueProduced]] as const) { const t = scalar(v); if (t) entry[k] = clip(t, 200); }
+    if (state === 'error') errors.push(entry); else if (state === 'warning') warnings.push(entry);
+  }
+  return { errors, warnings };
+}
+/** Maps response items to operations by dataPackItem ID (`${packId}-${n}`), never by position. */
+export function classifyBankWriteResponse(response: BankWriteResponse | undefined, packId: string, count: number, transportError = ''): BankWriteOutcome[] {
+  const byId = new Map<string, BankWriteResponse['items']>();
+  for (const item of response?.items ?? []) byId.set(item.id, [...(byId.get(item.id) || []), item]);
+  return Array.from({ length: count }, (_, index) => {
+    const itemId = `${packId}-${index + 1}`, base = { index, itemId, errors: [] as ImportMessage[], warnings: [] as ImportMessage[] };
+    if (!response) return { ...base, outcome: 'missing' as const, detail: `Odpověď POHODA nebyla získána: ${clip(transportError, 600)}` };
+    const list = byId.get(itemId) || [];
+    if (list.length !== 1) return { ...base, outcome: 'missing' as const, detail: list.length ? `Odpověď obsahuje ${list.length} položky s ID ${itemId}.` : `Odpověď POHODA (stav ${response.state || 'neznámý'}, ${response.items.length} položek) neobsahuje položku ${itemId}.` };
+    const item = list[0]!, data = item.data ?? {}, documentState = scalar(data.state) || undefined;
+    const rawId = scalar(data.producedDetails?.id), id = Number(rawId), bankId = Number.isSafeInteger(id) && id > 0 ? id : undefined;
+    const { errors, warnings } = importMessages(data);
+    if (item.state === 'error' && item.attributes?.note) errors.unshift({ state: 'error', note: itemNote(item.attributes.note) });
+    const common = { ...base, itemState: item.state, documentState, errors: errors.slice(0, MAX_ROW_MESSAGES), warnings: warnings.slice(0, MAX_ROW_MESSAGES), ...(bankId ? { bankId } : {}) };
+    const failed = item.state === 'error' || documentState === 'error';
+    if (bankId) return failed || errors.length ? { ...common, outcome: 'conflict' as const, detail: `POHODA vrátila ID ${bankId} a zároveň chybu.` } : { ...common, outcome: 'created' as const, detail: '' };
+    if (failed && (rawId === '' || id === 0)) {
+      if (!common.errors.length) common.errors.push({ state: 'error', note: 'POHODA vrátila stav error bez detailu chyby.' });
+      return { ...common, outcome: 'rejected' as const, detail: 'POHODA zápis odmítla.' };
+    }
+    return { ...common, outcome: 'missing' as const, detail: `Položka ${itemId} má stav ${item.state}/${documentState ?? '-'} bez platného ID záznamu.` };
+  });
+}
+function applyWriteOutcome(row: Fields, o: BankWriteOutcome): void {
+  Object.assign(row, { writeOutcome: o.outcome, responseItemId: o.itemId, itemState: o.itemState, documentState: o.documentState, importErrors: o.errors, importWarnings: o.warnings, doNotRetry: true });
+  const causes = o.errors.map(e => [e.errno && `errno ${e.errno}`, e.note, e.xpath && `(${fieldOf(e.xpath)})`].filter(Boolean).join(' ')).join('; ');
+  if (o.outcome === 'created') { row.bankId = o.bankId; row.status = 'created'; return; }
+  if (o.outcome === 'conflict') { row.bankId = o.bankId; row.status = 'created'; row.responseConflict = true; row.reason = `${o.detail} ${causes}`.trim(); return; }
+  if (o.outcome === 'rejected') { row.status = 'rejected'; row.reason = `POHODA zápis odmítla a nevrátila ID bankovního pohybu: ${causes}.`; return; }
+  row.status = 'write_uncertain'; row.reason = `Výsledek zápisu není prokázán: ${o.detail}`;
+}
+const fieldOf = (xpath: string) => xpath.replace(/\[\d+\]/g, '').replace(/^\/dat:dataPack\/dat:dataPackItem\//, '');
+const MAX_CAUSES = 10, MAX_CAUSE_MOVEMENTS = 20;
+function summarizeWrite(packId: string, response: BankWriteResponse | undefined, transportError: string, rows: Fields[], reconciliation: Fields | undefined): Fields {
+  const causes = new Map<string, Fields>();
+  for (const row of rows) for (const e of (row.importErrors || []) as ImportMessage[]) {
+    // Group by errno, field and note without document numbers so 34 equal rejections read as one cause.
+    const field = e.xpath ? fieldOf(e.xpath) : undefined, k = `${e.errno ?? ''}|${field ?? ''}|${e.note.replace(/\d{5,}/g, '#')}`;
+    const c = causes.get(k) || { errno: e.errno, note: e.note, ...(field ? { field } : {}), count: 0, movements: [] as number[] };
+    c.count++; if (c.movements.length < MAX_CAUSE_MOVEMENTS) c.movements.push(row.movement); causes.set(k, c);
+  }
+  const by = (o: string) => rows.filter(r => r.writeOutcome === o).length, transport = response?.transport as Fields | undefined;
+  const list = [...causes.values()].sort((a, b) => b.count - a.count);
+  return { dataPackId: packId, responseState: response?.state ?? 'none', ...(response?.programVersion ? { programVersion: response.programVersion } : {}), ...(transport?.jobId ? { jobId: transport.jobId } : {}), ...(transportError ? { transportError: clip(transportError, 600) } : {}),
+    ...(transport?.responseOutcome ? { responseOutcome: transport.responseOutcome } : {}), ...(typeof transport?.jobRetained === 'boolean' ? { jobRetained: transport.jobRetained, ...(transport.jobRetained && transport.jobDir ? { jobDirectory: transport.jobDir } : {}) } : {}),
+    attempted: rows.length, created: by('created'), rejected: by('rejected'), uncertain: by('missing'), conflicting: by('conflict'), causes: list.slice(0, MAX_CAUSES), causesTruncated: list.length > MAX_CAUSES, ...(reconciliation ? { reconciliation } : {}) };
+}
+function writeMessage(w: Fields, settled: number): string {
+  const parts = [`Zápis: ${w.attempted} pokusů, ověřeně zlikvidováno ${settled}.`];
+  if (w.rejected) parts.push(`POHODA odmítla ${w.rejected} pohybů (příčiny v write.causes a rows[].write.importErrors); výsledek kontrolního čtení je v reconciliation. Zůstatek dokladu rovný platbě znamená neuhrazený doklad, ne provedenou likvidaci.`);
+  if (w.uncertain || w.conflicting) parts.push(`${w.uncertain + w.conflicting} pohybů nemá prokázaný výsledek; viz reconciliation. Znovu nezapisovat jiným nástrojem; nový náhled execute=false značky znovu prohledá.`);
+  parts.push('Příčinu odmítnutí uveďte přesně podle chybové zprávy POHODA; nedomýšlejte jinou.');
+  return parts.join(' ');
+}
+
 const MAX_TARGETED_READS = 1000, MAX_LISTED_ISSUES = 50;
 /** Structured, bounded data diagnostics: agenda/ID/number/field only, no partner data or raw XML. */
 function publicDiagnostics(issues: SettlementIssue[]): Fields | undefined {

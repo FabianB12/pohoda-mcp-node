@@ -149,6 +149,29 @@ nothing. Entry point: `tests/pohoda-bank-variants.integration.test.ts`.
 After the change, the original live bank suites passed again: `pohoda-bank` 4/4
 (`bvreg1`) and `pohoda-bank-rules` 7/7 (`bvreg2`, evidence `tests/output/bankrules-bvreg2*`).
 
+### Write results and input limits (`wfix11141941`, 14 November 2026)
+
+`tests/pohoda-bank-write-results.integration.test.ts` passed 5/5 on the current
+working tree (POHODA 14302.10, verified `12345678_2026.mdb`, ICO 12345678, seven
+identity checks). Through the registered MCP tool, a 59-movement statement
+matched 34 targets across all six liquidable agendas. Execute wrote one 34-item
+pack (`write`: 34 created, 0 rejected, 0 uncertain). Read-back confirmed 34
+links with zero remaining balance. A renamed retry wrote nothing.
+
+Bank `text` is limited to 96 characters (`string96`) and `symVar` to 20
+(`string20`). With 97-character text or a 21-character VS, the MCP tool returned
+a schema error for both preview and execute, with zero POHODA exchanges. Text of
+exactly 96 characters and a VS of exactly 20 characters were stored unchanged
+(bank IDs 236 and 238), and settled with links and zero remaining balance.
+
+A demo-only raw XML pack in the test harness (not an MCP tool) sent the oversized
+values directly. POHODA answered item `state="error"` with “violates maxLength
+constraint of '96'/'20'” and no record ID. `classifyBankWriteResponse` classified
+both items as `rejected`; no bank record was created, and both target documents
+stayed unpaid with no links. Evidence: `tests/output/bankwrite-wfix11141941*`.
+These limits are proven POHODA schema rejections. This run does not show that
+they caused any client failure.
+
 Official schema references: [bank liquidation items](https://www.stormware.cz/schema/version_2/bank.xsd),
 [invoice liquidation state](https://www.stormware.cz/schema/version_2/invoice.xsd),
 and [bank account rate modes](https://www.stormware.cz/schema/version_2/bankAccount.xsd).

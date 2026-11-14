@@ -6,6 +6,15 @@ import { dirname, join } from "node:path";
 import { finished } from "node:stream/promises";
 import iconv from "iconv-lite";
 import lockfile from "proper-lockfile";
+import { XMLValidator } from "fast-xml-parser";
+import { PohodaResponse } from "./response.js";
+
+/**
+ * Retention class of a returned response: `ok` (pack and every item ok or warning),
+ * `rejected` (pack, item or nested agenda state error) or `malformed` (unparseable,
+ * no responsePack, or a state other than ok/warning/error).
+ */
+export type ResponseOutcome = "ok" | "rejected" | "malformed";
 
 export type CliXmlJobResult = {
   xml: string;
@@ -17,6 +26,8 @@ export type CliXmlJobResult = {
   durationMs: number;
   exitCode: number;
   jobRetained: boolean;
+  /** Set by CliXmlTransport; decides whether keepSuccessfulJobs or keepFailedJobs applies. */
+  responseOutcome?: ResponseOutcome;
 };
 
 export type ProcessRunnerContext = {
@@ -241,6 +252,8 @@ export class CliXmlTransport implements XmlTransport {
     const durationMs = Math.round(performance.now() - started);
     await waitForNonEmptyFile(responseXml, Math.min(5000, timeoutSeconds * 1000));
     const response = existsSync(responseXml) ? iconv.decode(await readFile(responseXml), "win1250") : "";
+    const failed = processError !== "" || response.trim() === "";
+    const responseOutcome = failed ? undefined : classifyResponseOutcome(response);
     const metadata = {
       jobId,
       database,
@@ -249,6 +262,7 @@ export class CliXmlTransport implements XmlTransport {
       durationMs,
       exitCode,
       processError,
+      ...(responseOutcome ? { responseOutcome } : {}),
       requestXml,
       responseXml,
       iniPath,
@@ -258,24 +272,22 @@ export class CliXmlTransport implements XmlTransport {
     };
     await writeAtomic(metadataPath, JSON.stringify(metadata, null, 2));
 
-    if (processError !== "" || response.trim() === "") {
-      if (!this.keepFailedJobs) {
-        await rm(jobDir, { recursive: true, force: true });
-      }
-      const stderr = existsSync(stderrPath) ? (await readFile(stderrPath, "utf8")).trim() : "";
-      const stdout = existsSync(stdoutPath) ? (await readFile(stdoutPath, "utf8")).trim() : "";
+    // A returned response that rejects anything or cannot be read is failure evidence:
+    // keep it under keepFailedJobs, not keepSuccessfulJobs.
+    const keep = failed || responseOutcome !== "ok" ? this.keepFailedJobs : this.keepSuccessfulJobs;
+    const jobRetained = keep || !(await removeJobDir(jobDir));
+
+    if (failed) {
+      const stderr = jobRetained && existsSync(stderrPath) ? (await readFile(stderrPath, "utf8")).trim() : "";
+      const stdout = jobRetained && existsSync(stdoutPath) ? (await readFile(stdoutPath, "utf8")).trim() : "";
       throw new Error(`Pohoda /XML job failed (jobId=${jobId}, exitCode=${exitCode}, durationMs=${durationMs}, queueWaitMs=${queueWaitMs}, processSlotWaitMs=${slotWaitMs}).`
         + (processError ? ` error: ${processError}` : "")
         + (stderr ? ` stderr: ${stderr}` : "")
         + (stdout ? ` stdout: ${stdout}` : "")
-        + ` Job directory: ${jobDir}`);
+        + (jobRetained ? ` Job directory: ${jobDir}` : " Job directory removed (keepFailedJobs=false)."));
     }
 
-    const result = { xml: response, jobId, database, jobDir, queueWaitMs, processSlotWaitMs: slotWaitMs, durationMs, exitCode, jobRetained: this.keepSuccessfulJobs };
-    if (!this.keepSuccessfulJobs) {
-      await rm(jobDir, { recursive: true, force: true });
-    }
-    return result;
+    return { xml: response, jobId, database, jobDir, queueWaitMs, processSlotWaitMs: slotWaitMs, durationMs, exitCode, jobRetained, responseOutcome: responseOutcome ?? "malformed" };
   }
 
   private async ensureRuntimeDirs(): Promise<void> {
@@ -366,6 +378,42 @@ export function waitForStreamFinished(stream: NodeJS.WritableStream): Promise<vo
     return Promise.resolve();
   }
   return finished(stream);
+}
+
+export function classifyResponseOutcome(xml: string): ResponseOutcome {
+  if (XMLValidator.validate(xml) !== true || !/<(?:[\w.-]+:)?responsePack[\s>/]/.test(xml)) {
+    return "malformed";
+  }
+  const response = new PohodaResponse(xml);
+  const known = (state: string) => ["ok", "warning", "error"].includes(state);
+  if (!known(response.state) || response.items.some((item) => !known(item.state))) {
+    return "malformed";
+  }
+  if (response.state === "error" || response.items.some((item) => item.state === "error" || hasNestedError(item.data))) {
+    return "rejected";
+  }
+  return "ok";
+}
+
+function hasNestedError(value: unknown): boolean {
+  if (Array.isArray(value)) {
+    return value.some(hasNestedError);
+  }
+  if (!value || typeof value !== "object") {
+    return false;
+  }
+  const object = value as Record<string, unknown>;
+  return String(object.state ?? "") === "error" || Object.values(object).some(hasNestedError);
+}
+
+/** Best effort: a cleanup failure must not turn a returned POHODA response into an error. */
+async function removeJobDir(jobDir: string): Promise<boolean> {
+  try {
+    await rm(jobDir, { recursive: true, force: true });
+    return !existsSync(jobDir);
+  } catch {
+    return false;
+  }
 }
 
 async function withLock<T>(path: string, timeoutMs: number, fn: () => Promise<T>): Promise<T> {
