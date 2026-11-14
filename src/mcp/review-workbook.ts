@@ -11,14 +11,15 @@
  *   returned separately and are never copied into `data`/`intNote`.
  * - Formulas, error cells and merged cells in recognised columns are rejected; strings that
  *   start with "=" are written as literal text. Nothing is ever evaluated.
- * - Display-only columns (planned import transformations, source PDF path) are ignored on
- *   read; the import workflow recomputes the plan from the edited source cells and decides
+ * - Display-only columns (planned import transformations, computed POHODA Doklad/VS, source
+ *   PDF path) are ignored on read; the import workflow recomputes the plan from the edited source cells and decides
  *   allowed source paths from its own manifest.
  */
 import { promises as fs } from "node:fs";
 import { createHash, randomBytes } from "node:crypto";
 import path from "node:path";
 import ExcelJS from "exceljs";
+import JSZip from "jszip"; // ExcelJS's own ZIP dependency
 import { resolveExpensePolicy } from "../pohoda/expense-policy.js";
 import type { ReviewAction, ReviewRow, ReviewTool, ReviewWorkbook, ReviewWorkbookRead } from "./review-contract.js";
 import { withDuplicateReviewNote, type PreviewDuplicateCheck } from "./expense-duplicates.js";
@@ -58,7 +59,7 @@ const BOOLEAN_LABELS = { true: "Ano", false: "Ne" } as const;
 
 export type ReviewColumnKind = "rowId" | "action" | "reviewNotes" | "tool" | "plan" | "display"
   | "text" | "id" | "date" | "money" | "number" | "integer" | "boolean" | "taxMode" | "pages";
-type ColumnGroup = "control" | "plan" | "source" | "advanced" | "trace";
+type ColumnGroup = "control" | "plan" | "source" | "target" | "posting" | "advanced" | "trace";
 
 export type ReviewColumn = {
   /** Internal key. For data columns this is the `ReviewRow.data` field name. */
@@ -87,11 +88,12 @@ export const REVIEW_COLUMNS: readonly ReviewColumn[] = [
   col("partnerIco", "IČO", "id", "source", 11, "Uloženo jako text, aby se zachovaly úvodní nuly."),
   col("partnerDic", "DIČ", "id", "source", 13),
   col("partnerCountry", "Země", "text", "source", 7),
-  col("sourceDocumentNumber", "Číslo dokladu dodavatele", "id", "source", 18),
-  col("sourceSymVar", "Variabilní symbol (zdroj)", "id", "source", 14),
+  col("sourceDocumentNumber", "Číslo dokladu dodavatele", "id", "source", 18, "Číslo přesně podle zdroje (účtenky/faktury). Nemusí být totéž co pole Doklad v POHODĚ – to ukazuje sloupec Doklad v POHODĚ (vypočteno)."),
+  col("sourceSymVar", "Variabilní symbol (zdroj)", "id", "source", 14, "VS jen pokud je uveden na dokladu; prázdné = zdroj VS nemá. Výsledný VS ukazuje sloupec VS v POHODĚ (vypočteno)."),
+  col("targetDocument", "Doklad v POHODĚ (vypočteno)", "display", "target", 15, "Hodnota pole Doklad, kterou zapíše import podle pravidel (např. hotovost do 10 000 Kč bez čísla, karta do 10 000 Kč K + další číslo řady PK). Jen pro čtení: nečte se, import ji přepočítá z upravených zdrojových údajů. Zdrojové číslo zůstává v interní poznámce."),
+  col("targetSymVar", "VS v POHODĚ (vypočteno)", "display", "target", 13, "Variabilní symbol, který zapíše import (ze zdroje, odvozený z čísla faktury, nebo číslo řady PK u karty). Jen pro čtení; import jej přepočítá."),
   col("sourceIssueDate", "Datum vystavení (zdroj)", "date", "source", 12, "Datum přesně podle dokladu. Pozdní doklad se při importu přesune na 1. den zvoleného období DPH; původní datum se zachová."),
   col("sourceTaxDate", "DUZP (zdroj)", "date", "source", 12, "DUZP přesně podle dokladu. Nikdy jej neodvozujte z data vystavení."),
-  col("sourcePaymentDate", "Datum úhrady (zdroj)", "date", "source", 12, "U pokladních výdajů skutečné datum platby."),
   col("dateDue", "Datum splatnosti (zdroj)", "date", "source", 12),
   col("taxMode", "Režim DPH", "taxMode", "source", 17, "Daňový = nárok na odpočet. PN = celá částka do 0 % sazby bez data KH. Automaticky = rozhodne import podle ověřených údajů o dodavateli."),
   col("sourceChargesVat", "Doklad účtuje DPH", "boolean", "source", 10, "Ano/Ne podle dokladu; prázdné = neznámo. Chybějící DIČ samo o sobě neprokazuje neplátce."),
@@ -107,6 +109,9 @@ export const REVIEW_COLUMNS: readonly ReviewColumn[] = [
   col("roundingAmount", "Zaokrouhlení (zdroj)", "money", "source", 12),
   col("total", "Celkem k úhradě (zdroj)", "money", "source", 14, "Přesná částka k úhradě PO zaokrouhlení."),
   col("homePayableCZK", "K úhradě v CZK (zdroj)", "money", "source", 14, "Ověřená částka v CZK u cizí měny. Nikdy ji neodhadujte kurzem 1."),
+  col("accounting", "Předkontace", "text", "posting", 12),
+  col("classificationVAT", "Členění DPH", "text", "posting", 11),
+  col("cashAccount", "Pokladna", "text", "posting", 10),
   col("price3", "Základ 3. sazba (zdroj)", "money", "advanced", 13),
   col("price3VAT", "DPH 3. sazba (zdroj)", "money", "advanced", 12),
   col("price3Sum", "Celkem 3. sazba (zdroj)", "money", "advanced", 13),
@@ -118,23 +123,30 @@ export const REVIEW_COLUMNS: readonly ReviewColumn[] = [
   col("partnerZip", "PSČ dodavatele", "id", "advanced", 10),
   col("partnerVatStatus", "Status DPH dodavatele", "text", "advanced", 18),
   col("vatStatusEvidence", "Podklad statusu DPH", "text", "advanced", 32),
-  col("accounting", "Předkontace", "text", "advanced", 12),
   col("dateAccounting", "Datum účetního případu", "date", "advanced", 14),
   col("accountIds", "Účet dokladu", "text", "advanced", 14),
   col("paymentAccountNumber", "Číslo bankovního účtu", "id", "advanced", 24),
   col("paymentBankCode", "Kód banky", "id", "advanced", 10),
   col("note", "Poznámka v POHODĚ (importuje se)", "text", "advanced", 32),
-  col("classificationVAT", "Členění DPH", "text", "advanced", 11),
   col("classificationKVDPH", "Členění KH DPH", "text", "advanced", 14),
   col("paymentType", "Forma úhrady", "text", "advanced", 14),
   col("centre", "Středisko", "text", "advanced", 11),
   col("activity", "Činnost", "text", "advanced", 11),
   col("contract", "Zakázka", "text", "advanced", 11),
-  col("cashAccount", "Pokladna", "text", "advanced", 10),
   col("sourcePages", "Strany PDF", "pages", "advanced", 10, "Čísla stran zdrojového PDF, např. 1, 2 nebo 3-4."),
   col("sourcePdfPath", "Zdrojové PDF (jen pro dohledání)", "display", "trace", 42, "Jen pro dohledání. Povolené zdrojové soubory určuje manifest přípravy, ne tato buňka."),
   col("sourceType", "Způsob zadání (jen pro dohledání)", "display", "trace", 16),
   col("intNote", "Zdrojová interní poznámka (jen pro dohledání)", "display", "trace", 40)
+];
+
+/**
+ * Columns no longer written but still read when an older workbook contains them, so an
+ * edit made there is not silently dropped. Datum úhrady is not reviewed in the XLSX: the
+ * prepared actual payment date stays in the manifest (cash datePayment) and is never
+ * derived here from issue, due or tax dates.
+ */
+export const REVIEW_LEGACY_COLUMNS: readonly ReviewColumn[] = [
+  col("sourcePaymentDate", "Datum úhrady (zdroj)", "date", "source", 12)
 ];
 
 const DATA_KINDS = new Set<ReviewColumnKind>(["text", "id", "date", "money", "number", "integer", "boolean", "taxMode", "pages"]);
@@ -163,6 +175,8 @@ const HEADER_COLORS: Record<ColumnGroup, string> = {
   control: "FF1F2937",
   plan: "FF6B7280",
   source: "FF1E3A8A",
+  target: "FF0F766E",
+  posting: "FF1E40AF",
   advanced: "FF475569",
   trace: "FF6B7280"
 };
@@ -170,6 +184,8 @@ const BAND_LABELS: Record<ColumnGroup, string> = {
   control: "KONTROLA",
   plan: "PLÁN",
   source: "ZDROJOVÉ ÚDAJE",
+  target: "POHODA (vypočteno)",
+  posting: "ZAÚČTOVÁNÍ",
   advanced: "DALŠÍ POLE (rozbalte +)",
   trace: "DOHLEDÁNÍ"
 };
@@ -231,7 +247,8 @@ export async function updateReviewDuplicateChecks(filePath: string, checks: Reco
   const hash = (bytes: Uint8Array) => createHash("sha256").update(bytes).digest("hex");
   const bytes = await fs.readFile(filePath);
   if (hash(bytes) !== expectedSha256) throw new Error("Workbook changed during duplicate checking; retry the refresh.");
-  const workbook = new ExcelJS.Workbook(); await workbook.xlsx.load(bytes as any);
+  inspectZip(bytes);
+  const workbook = await loadXlsx(bytes);
   const sheet = workbook.getWorksheet(REVIEW_SHEET_NAME)!;
   const keys = new Map<string, number>();
   let headerRow = 0;
@@ -287,18 +304,102 @@ function validateWriteInput(input: ReviewWorkbook): void {
   if (issues.length) throw new ReviewWorkbookError(issues);
 }
 
+// ---------------------------------------------------------------------------------------
+// Column visibility contract (written once at preparation; never changed on refresh).
+//
+// 1. Always visible: control, identity, source dates/amount facts used by every row,
+//    Předkontace/Členění DPH and the computed POHODA Doklad/VS. Blank values stay visible.
+//    Datum úhrady is not a workbook column (see REVIEW_LEGACY_COLUMNS).
+// 2. Applicable: shown when any row has a value (0 counts) or the field applies to any row
+//    (CONDITIONAL_COLUMNS). Otherwise collapsed into an outline group, still editable.
+// 3. Collapsed groups (advanced, plan, trace) stay collapsed by default.
+// 4. A field the import policy flags as needing correction on a non-skipped row is always
+//    shown, whatever its group, so a yellow cell is never hidden.
+
+type RowPredicate = (row: ReviewRow) => boolean;
+const blank = (value: unknown) => value === undefined || value === null || (typeof value === "string" && value.trim() === "");
+const isCashVoucher: RowPredicate = (row) => row.tool === "create_cash_voucher";
+const isCardPayment: RowPredicate = (row) => row.data?.cardPayment === true;
+const isPaidReceipt: RowPredicate = (row) => isCashVoucher(row) || isCardPayment(row)
+  || ["cash", "creditcard", "card"].includes(String(row.data?.paymentType ?? "").trim().toLowerCase());
+const isForeign: RowPredicate = (row) => !blank(row.data?.currency) && String(row.data.currency).trim().toUpperCase() !== "CZK";
+const SUMMARY_KEYS = ["priceNone", "priceLow", "priceLowVAT", "priceHigh", "priceHighVAT", "price3", "price3VAT"];
+const lacksSummary: RowPredicate = (row) => SUMMARY_KEYS.every((key) => blank(row.data?.[key]));
+
+/** Optional source fields shown only when relevant to some row. Rate groups move together. */
+const CONDITIONAL_COLUMNS: ReadonlyArray<{ keys: readonly string[]; appliesTo: RowPredicate }> = [
+  { keys: ["sourceSymVar"], appliesTo: (row) => !isCashVoucher(row) && !isCardPayment(row) },
+  { keys: ["dateDue"], appliesTo: (row) => !isPaidReceipt(row) },
+  { keys: ["priceNone"], appliesTo: lacksSummary },
+  { keys: ["priceLow", "priceLowVAT", "priceLowSum"], appliesTo: lacksSummary },
+  { keys: ["priceHigh", "priceHighVAT", "priceHighSum"], appliesTo: lacksSummary },
+  { keys: ["roundingAmount"], appliesTo: () => false },
+  { keys: ["homePayableCZK"], appliesTo: isForeign },
+  { keys: ["cashAccount"], appliesTo: isCashVoucher }
+];
+const COLLAPSED_GROUPS = new Set<ColumnGroup>(["plan", "advanced", "trace"]);
+
+function policyHeader(row: ReviewRow, vatPeriod: string): Record<string, any> {
+  const header: Record<string, any> = { ...row.data, type: row.data?.type ?? DOCUMENT_TYPE_FOR_TOOL[row.tool], vatPeriod, ...(row.data?.cardPayment === true ? { cardSequence: 1 } : {}) };
+  delete header._expensePolicy;
+  return header;
+}
+const policyKind = (row: ReviewRow) => row.tool === "create_cash_voucher" ? "voucher" : "invoice";
+
+/** The data column the import policy rejects for this row, if any. */
+function flaggedField(row: ReviewRow, vatPeriod: string): string | undefined {
+  if (row.action === "skip") return undefined;
+  try { resolveExpensePolicy(policyHeader(row, vatPeriod), [], policyKind(row)); }
+  catch (error) { const field = (error as { field?: string }).field; if (field) return field; }
+  if (isCashVoucher(row) && blank(row.data?.cashAccount)) return "cashAccount";
+  return undefined;
+}
+
+/** Keys of columns hidden in a newly written workbook (see the contract above). */
+export function collapsedReviewColumns(rows: readonly ReviewRow[], vatPeriod: string): Set<string> {
+  const flagged = new Set(rows.map((row) => flaggedField(row, vatPeriod)).filter((key): key is string => Boolean(key)));
+  const hidden = new Set(REVIEW_COLUMNS.filter((c) => COLLAPSED_GROUPS.has(c.group)).map((c) => c.key));
+  if (rows.length) {
+    for (const { keys, appliesTo } of CONDITIONAL_COLUMNS) {
+      if (!rows.some(appliesTo) && rows.every((row) => keys.every((key) => blank(row.data?.[key])))) keys.forEach((key) => hidden.add(key));
+    }
+  }
+  for (const key of flagged) hidden.delete(key);
+  return hidden;
+}
+
+const CARD_SEQUENCE_PLACEHOLDER = "K + další č. PK";
+const CARD_SYMVAR_PLACEHOLDER = "další č. PK";
+
+/** Doklad/VS the import will write, from the same policy; card numbers are assigned at import. */
+function targetReferences(row: ReviewRow, vatPeriod: string): { targetDocument: string | null; targetSymVar: string | null } {
+  const none = { targetDocument: null, targetSymVar: null };
+  if (row.action === "skip") return none;
+  try {
+    const result = resolveExpensePolicy(policyHeader(row, vatPeriod), [], policyKind(row));
+    if (result._expensePolicy?.originalDocumentRule === "card-sequence") return { targetDocument: CARD_SEQUENCE_PLACEHOLDER, targetSymVar: CARD_SYMVAR_PLACEHOLDER };
+    return { targetDocument: blank(result.originalDocument) ? null : String(result.originalDocument), targetSymVar: blank(result.symVar) ? null : String(result.symVar) };
+  } catch {
+    return none;
+  }
+}
+
 function writeMainSheet(workbook: ExcelJS.Workbook, input: ReviewWorkbook): void {
   const ws = workbook.addWorksheet(REVIEW_SHEET_NAME, {
     views: [{ state: "frozen", xSplit: FROZEN_COLUMNS, ySplit: 2, topLeftCell: "C3", activeCell: "C3", zoomScale: 100 }],
     properties: { tabColor: { argb: "FF1E3A8A" }, defaultRowHeight: 18, outlineLevelCol: 1 }
   });
-  ws.columns = REVIEW_COLUMNS.map((c) => ({
-    key: c.key,
-    width: c.width,
-    hidden: c.group === "advanced" || c.group === "plan" || c.group === "trace",
-    outlineLevel: c.group === "advanced" || c.group === "plan" || c.group === "trace" ? 1 : 0,
-    style: NUM_FMT[c.kind] ? { numFmt: NUM_FMT[c.kind]! } : {}
-  }));
+  const collapsed = collapsedReviewColumns(input.rows, input.vatPeriod);
+  ws.columns = REVIEW_COLUMNS.map((c) => {
+    const hidden = collapsed.has(c.key);
+    return {
+      key: c.key,
+      width: c.width,
+      hidden,
+      outlineLevel: hidden ? 1 : 0,
+      style: NUM_FMT[c.kind] ? { numFmt: NUM_FMT[c.kind]! } : {}
+    };
+  });
 
   // Row 1: group band. Row 2: field headers.
   const band = ws.getRow(1);
@@ -327,12 +428,13 @@ function writeMainSheet(workbook: ExcelJS.Workbook, input: ReviewWorkbook): void
   input.rows.forEach((row, index) => {
     const excelRow = ws.getRow(index + 3);
     const plan = describePlan(row, input.vatPeriod);
+    const targets = targetReferences(row, input.vatPeriod);
     const note = withDuplicateReviewNote(row.reviewNotes || "", row.duplicateCheck);
     const lineCount = (value: string, width: number) => value.split("\n").reduce((sum, line) => sum + Math.max(1, Math.ceil(line.length / width)), 0);
     excelRow.height = Math.min(96, Math.max(28, 14 * Math.max(lineCount(note, 34), lineCount(String(row.data.text || ""), 40), lineCount(String(row.data.partnerName || ""), 30))));
     REVIEW_COLUMNS.forEach((c, colIndex) => {
       const cell = excelRow.getCell(colIndex + 1);
-      const value = cellValueFor(c, row, plan);
+      const value = c.group === "target" ? targets[c.key as keyof typeof targets] : cellValueFor(c, row, plan);
       cell.value = value;
       if (NUM_FMT[c.kind]) cell.numFmt = NUM_FMT[c.kind]!;
       cell.border = THIN_BORDER;
@@ -394,7 +496,7 @@ function applyReviewHighlights(row: ExcelJS.Row, columns: Map<string, number>, c
     // Loaded XLSX cells can share a style object; detach it before colouring.
     cell.style = { ...cell.style };
     cell.fill = FILL(skipped ? "FFF1F5F9" : duplicate ? "FFFFF1F2" : "FFFFFFFF");
-    if (key === "rowId" || key === "plannedImport") cell.fill = FILL(skipped ? "FFF1F5F9" : duplicate ? "FFFFF1F2" : "FFF8FAFC");
+    if (key === "rowId" || key === "plannedImport" || key === "targetDocument" || key === "targetSymVar") cell.fill = FILL(skipped ? "FFF1F5F9" : duplicate ? "FFFFF1F2" : "FFF8FAFC");
   }
   if (skipped) return;
   const mark = (key: string, color: string) => { const cell = value(key); if (cell) cell.fill = FILL(color); };
@@ -410,9 +512,9 @@ function applyReviewHighlights(row: ExcelJS.Row, columns: Map<string, number>, c
     for (const key of keys) mark(key, "FFFFCDD2");
   } else if (check?.status === "incomplete" || action === "review") mark("reviewNotes", "FFFEF3C7");
   if (source && vatPeriod) {
-    try { resolveExpensePolicy({ ...source.data, type: source.data.type ?? DOCUMENT_TYPE_FOR_TOOL[source.tool], vatPeriod, ...(source.data.cardPayment ? { cardSequence: 1 } : {}) }, [], source.tool === "create_cash_voucher" ? "voucher" : "invoice"); }
-    catch (error) { const field = (error as { field?: string }).field; if (field) mark(field, "FFFEF3C7"); }
-    if (source.tool === "create_cash_voucher" && !source.data.cashAccount) mark("cashAccount", "FFFEF3C7");
+    const field = flaggedField(source, vatPeriod);
+    // A field without a workbook column (e.g. Datum úhrady) is flagged on the review note.
+    if (field) mark(columns.has(field) ? field : "reviewNotes", "FFFEF3C7");
   }
   const actionCell = value("action");
   if (actionCell) actionCell.fill = FILL(actionCell.text === REVIEW_ACTION_LABELS.import ? "FFDCFCE7" : "FFFEF3C7");
@@ -466,17 +568,9 @@ function dataCellValue(column: ReviewColumn, value: unknown): ExcelJS.CellValue 
 /** Human-readable preview of what the import policy would do with the prepared source values. */
 function describePlan(row: ReviewRow, vatPeriod: string): string {
   if (row.action === "skip") return "Vynecháno – nic se neimportuje.";
-  const data = row.data ?? {};
-  const kind = row.tool === "create_cash_voucher" ? "voucher" : "invoice";
-  const header: Record<string, any> = {
-    ...data,
-    type: data.type ?? DOCUMENT_TYPE_FOR_TOOL[row.tool],
-    vatPeriod,
-    ...(data.cardPayment === true ? { cardSequence: 1 } : {})
-  };
-  delete header._expensePolicy;
+  const kind = policyKind(row);
   try {
-    const result = resolveExpensePolicy(header, [], kind);
+    const result = resolveExpensePolicy(policyHeader(row, vatPeriod), [], kind);
     const policy = result._expensePolicy ?? {};
     const lines: string[] = [];
     if (policy.lateSource) lines.push(`Pozdní doklad → data na 1. den období ${czDate(`${vatPeriod}-01`)}; původní data zůstanou v interní poznámce.`);
@@ -640,12 +734,7 @@ export async function readReviewWorkbook(filePath: string, suppliedBytes?: Uint8
   if (buffer.length > REVIEW_MAX_FILE_BYTES) throw new ReviewWorkbookError([{ code: "FILE_TOO_LARGE", message: "Review workbook exceeds the size limit." }]);
   inspectZip(buffer);
 
-  const workbook = new ExcelJS.Workbook();
-  try {
-    await workbook.xlsx.load(buffer as any);
-  } catch (error) {
-    throw new ReviewWorkbookError([{ code: "MALFORMED_WORKBOOK", message: `The file could not be read as an .xlsx workbook: ${error instanceof Error ? error.message : String(error)}` }]);
-  }
+  const workbook = await loadXlsx(buffer);
 
   const issues: ReviewWorkbookIssue[] = [];
   const meta = readMeta(workbook, issues);
@@ -657,6 +746,76 @@ export async function readReviewWorkbook(filePath: string, suppliedBytes?: Uint8
   const rows = readMainSheet(ws, issues);
   if (issues.length) throw new ReviewWorkbookError(issues);
   return { reviewId: meta.reviewId, databaseId: meta.databaseId, vatPeriod: meta.vatPeriod, rows };
+}
+
+/** Loads an .xlsx; valid OOXML from other writers (e.g. Open XML SDK) may use spellings
+ * ExcelJS cannot parse, so one retry uses an in-memory normalized copy. Cell guards
+ * (formulas, hidden rows, metadata) run afterwards on the parsed result either way. */
+async function loadXlsx(buffer: Uint8Array): Promise<ExcelJS.Workbook> {
+  try {
+    const workbook = new ExcelJS.Workbook();
+    await workbook.xlsx.load(buffer as any);
+    return workbook;
+  } catch (error) {
+    try {
+      const workbook = new ExcelJS.Workbook();
+      await workbook.xlsx.load(await normalizeOoxmlPackage(buffer) as any);
+      return workbook;
+    } catch {
+      throw new ReviewWorkbookError([{ code: "MALFORMED_WORKBOOK", message: `The file could not be read as an .xlsx workbook: ${error instanceof Error ? error.message : String(error)}` }]);
+    }
+  }
+}
+
+const SPREADSHEET_NS = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+
+/**
+ * Rewrites equivalent OOXML spellings that ExcelJS 4.4 does not understand, without
+ * changing content: a prefixed SpreadsheetML namespace (<x:worksheet xmlns:x=...>) becomes
+ * the default namespace, absolute relationship targets (/xl/...) become relative, and
+ * comment/VML parts get ExcelJS's expected names. Called only after a failed load, on a
+ * copy that has already passed inspectZip.
+ */
+export async function normalizeOoxmlPackage(buffer: Uint8Array): Promise<Buffer> {
+  const zip = await JSZip.loadAsync(buffer);
+  const names = Object.keys(zip.files).filter((name) => !zip.files[name]!.dir);
+  for (const name of names.filter((n) => /\.xml$/i.test(n))) {
+    const xml = await zip.file(name)!.async("string");
+    const root = /^\uFEFF?(?:<\?xml[^>]*\?>\s*)?<([A-Za-z_][\w.-]*):[\w.-]+\b[^>]*?\sxmlns:\1="([^"]+)"/.exec(xml);
+    if (!root || root[2] !== SPREADSHEET_NS) continue;
+    const prefix = root[1]!;
+    zip.file(name, xml
+      .replace(new RegExp(`<(/?)${prefix}:`, "g"), "<$1")
+      .replaceAll(`xmlns:${prefix}="${SPREADSHEET_NS}"`, `xmlns="${SPREADSHEET_NS}"`));
+  }
+  // Rename parts ExcelJS only recognizes by conventional names (numbers chosen not to collide).
+  const renames = new Map<string, string>();
+  for (const name of names) {
+    if (/^xl\/drawings\/[^/]+\.vml$/i.test(name) && !/^xl\/drawings\/vmlDrawing\d+\.vml$/.test(name)) renames.set(name, `xl/drawings/vmlDrawing${900 + renames.size}.vml`);
+    else if (/^xl\/[^/]*comments[^/]*\.xml$/i.test(name) && !/^xl\/comments\d+\.xml$/.test(name)) renames.set(name, `xl/comments${900 + renames.size}.xml`);
+  }
+  for (const [from, to] of renames) {
+    zip.file(to, await zip.file(from)!.async("uint8array"));
+    zip.remove(from);
+  }
+  for (const name of Object.keys(zip.files).filter((n) => /\.rels$/i.test(n))) {
+    const sourceDir = path.posix.dirname(path.posix.dirname(name));
+    const resolveTarget = (target: string) => target.startsWith("/") ? target.slice(1) : path.posix.normalize(path.posix.join(sourceDir === "." ? "" : sourceDir, target));
+    const xml = await zip.file(name)!.async("string");
+    const out = xml.replace(/<Relationship\b[^>]*>/g, (tag) => /TargetMode="External"/.test(tag) ? tag : tag.replace(/\bTarget="([^"]*)"/, (_m, target: string) => {
+      const absolute = resolveTarget(target);
+      const final = renames.get(absolute) ?? absolute;
+      return `Target="${path.posix.relative(sourceDir === "." ? "" : sourceDir, final)}"`;
+    }));
+    if (out !== xml) zip.file(name, out);
+  }
+  const types = zip.file("[Content_Types].xml");
+  if (types && renames.size) {
+    let xml = await types.async("string");
+    for (const [from, to] of renames) xml = xml.replaceAll(`PartName="/${from}"`, `PartName="/${to}"`);
+    zip.file("[Content_Types].xml", xml);
+  }
+  return zip.generateAsync({ type: "nodebuffer" });
 }
 
 /** Structural ZIP checks before handing the file to the XML parser (size bombs, macros, non-OOXML). */
@@ -741,7 +900,7 @@ const normalizeHeader = (value: string): string => value.normalize("NFC").replac
 
 function readMainSheet(ws: ExcelJS.Worksheet, issues: ReviewWorkbookIssue[]): ReviewRow[] {
   const byHeader = new Map<string, ReviewColumn>();
-  for (const column of REVIEW_COLUMNS) {
+  for (const column of [...REVIEW_COLUMNS, ...REVIEW_LEGACY_COLUMNS]) {
     byHeader.set(normalizeHeader(column.label), column);
     byHeader.set(normalizeHeader(column.key), column);
   }
@@ -775,7 +934,9 @@ function readMainSheet(ws: ExcelJS.Worksheet, issues: ReviewWorkbookIssue[]): Re
     }
   }
   if (issues.some((i) => i.code === "MISSING_COLUMN" || i.code === "DUPLICATE_COLUMN")) return [];
-  const columns = REVIEW_COLUMNS.filter((c) => !DISPLAY_KINDS.has(c.kind)).map((c) => ({ column: c, position: positions.get(c.key)! }));
+  const columns = [...REVIEW_COLUMNS, ...REVIEW_LEGACY_COLUMNS]
+    .filter((c) => !DISPLAY_KINDS.has(c.kind) && positions.has(c.key))
+    .map((c) => ({ column: c, position: positions.get(c.key)! }));
 
   const rows: ReviewRow[] = [];
   const seen = new Map<string, string>();

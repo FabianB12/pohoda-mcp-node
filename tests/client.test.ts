@@ -305,6 +305,7 @@ describe("PohodaClient", () => {
       cashAccount: "HLAVNI",
       date: "2026-08-05",
       dateTax: "2026-08-05",
+      datePayment: "2026-08-05",
       text: "Cash expense",
       vatPeriod: "2026-08",
       taxMode: "taxable", classificationVAT: "PD",
@@ -348,7 +349,7 @@ describe("PohodaClient", () => {
       {
         requestId: "voucher",
         tool: "create_cash_voucher",
-        header: { type: "expense", cashAccount: "HLAVNI", date: "2026-07-02", dateTax: "2026-07-02", text: "Cash expense", vatPeriod: "2026-07", taxMode: "taxable", classificationVAT: "PD", priceHigh: 50, priceHighVAT: 10.5, total: 60.5 },
+        header: { type: "expense", cashAccount: "HLAVNI", date: "2026-07-02", dateTax: "2026-07-02", datePayment: "2026-07-02", text: "Cash expense", vatPeriod: "2026-07", taxMode: "taxable", classificationVAT: "PD", priceHigh: 50, priceHighVAT: 10.5, total: 60.5 },
         items: []
       },
       {
@@ -804,4 +805,37 @@ describe("PohodaClient", () => {
     expect(transport.calls[1]?.xml).not.toContain("typ:file");
   });
 
+});
+
+describe('typed bank liquidation imports', () => {
+  it('writes an explicit target link and derives the padded statement month on single and batch paths', async () => {
+    const transport = new FakeTransport();
+    const client = new PohodaClient({ transport, ico: '12345678', database: 'Default' });
+    const header = { type: 'expense', account: '', bankAccount: 'KB', statementPeriod: '2026-01', statementNumber: 'wrong', numberMovement: '5', dateStatement: '2026-01-31', datePayment: '2026-01-20', liquidations: [{ agenda: 'receivedInvoice', id: 42, amount: '12.34' }] };
+    await client.createBankDocument(header, [], 'bank-settle-single', 'Db');
+    await client.writeBatch([{ tool: 'create_bank_document', header, items: [] }], 'bank-settle-batch', 'Db');
+    for (const call of transport.calls) {
+      expect(call.xml).toContain('<bnk:account><typ:ids>KB</typ:ids></bnk:account>');
+      expect(call.xml).toContain('<bnk:statementNumber>001</bnk:statementNumber>');
+      expect(call.xml).toContain('<bnk:numberMovement>5</bnk:numberMovement>');
+      expect(call.xml).toContain('<bnk:sourceAgenda>receivedInvoice</bnk:sourceAgenda>');
+      expect(call.xml).toContain('<bnk:sourceDocument><typ:id>42</typ:id></bnk:sourceDocument>');
+      expect(call.xml).toContain('<bnk:liquidationPrice>12.34</bnk:liquidationPrice>');
+      expect(call.xml).toContain('<bnk:quantity>1</bnk:quantity>');
+      expect(call.xml).not.toContain('<bnk:bankItem>');
+    }
+  });
+  it('uses the bank-account rate mode enum rather than writing a numeric exchange rate', async () => {
+    const transport = new FakeTransport();
+    const client = new PohodaClient({ transport, ico: '12345678', database: 'Default' });
+    await client.manageBankAccount('add', { ids: 'EUR', numberAccount: '123', codeBank: '0100', currency: 'EUR', rateType: 'daily' }, {}, 'fx-account', 'Db');
+    expect(transport.calls[0]!.xml).toContain('<bka:rate>daily</bka:rate>');
+    expect(transport.calls[0]!.xml).not.toContain('<bka:rate>1</bka:rate>');
+  });
+  it('rejects liquidation mixed with ordinary items before transport', async () => {
+    const transport = new FakeTransport();
+    const client = new PohodaClient({ transport, ico: '12345678', database: 'Default' });
+    await expect(client.createBankDocument({ account: 'KB', liquidations: [{ agenda: 'receivedInvoice', id: 42, amount: 100 }] }, [{ unitPrice: 100 }])).rejects.toThrow(/ordinary items/);
+    expect(transport.calls).toHaveLength(0);
+  });
 });

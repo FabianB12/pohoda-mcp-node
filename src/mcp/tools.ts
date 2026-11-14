@@ -23,6 +23,7 @@ import type { PohodaResponse } from "../pohoda/response.js";
 import { ExportStore, type CurrencyTotal, type ExportRecord, type ExportSnapshot, summarizeRecords } from "./export-store.js";
 import { preparePdfPages } from "./pdf-pages.js";
 import type { PdfArchive } from "../pohoda/pdf-archive.js";
+import { BankStatementService } from "./bank-statement.js";
 import { ExpenseReviewService } from "./expense-review.js";
 import { ExpenseImporter, lookupSupplierRegistry } from "./expense-import.js";
 import { CzechRegistryClient } from "../registry/czech-registry.js";
@@ -310,6 +311,8 @@ const documentHeaderSchema = z.object({
   extSystemName: z.string().default(""),
   number: z.string().default(""),
   statementNumber: z.string().default(""),
+  statementPeriod: z.string().regex(/^\d{4}-(0[1-9]|1[0-2])$/).optional(),
+  numberMovement: z.string().max(6).optional(),
   originalDocument: z.string().default(""),
   originalDocumentNumber: z.string().default(""),
   date: z.string().default(""),
@@ -495,6 +498,7 @@ const bankAccountManageSchema = z.object({
   analyticAccount: z.string().default(""),
   currency: z.string().default(""),
   currencyRate: z.number().default(0),
+  rateType: z.enum(["daily", "fixed"]).default("daily"),
   cancelled: z.string().default(""),
   homebanking: z.string().default(""),
   payTerminal: z.string().default(""),
@@ -705,6 +709,30 @@ export function registerPohodaTools(server: McpServer, context: PohodaServerCont
     annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false }
   }, async () => structuredResult(POHODA_USAGE_GUIDE));
 
+  server.registerTool("process_bank_statement", {
+    title: "Match and settle a bank statement",
+    description: "For bank-statement PDFs: read the statement account/IBAN, currency, period and all transactions first. Automatic execution currently supports CZK; foreign currency requires review and is blocked before writing until a verified bank rate is available. Matches only exact outstanding amounts, variable symbol first (oldest document first), otherwise a unique amount. execute=true creates real liquidation links and verifies fully paid invoices, then returns a checked copy of the PDF. Unmatched/ambiguous payments are never written. execute=false previews matches without accounting writes. Use instead of plain create_bank_document when the user asks to process and settle a statement.",
+    inputSchema: {
+      databaseId: databaseIdSchema,
+      sourcePdfPath: z.string().min(1),
+      statementPeriod: z.string().regex(/^\d{4}-(0[1-9]|1[0-2])$/).describe("YYYY-MM from the bank statement; generates statement number 001–012."),
+      dateStatement: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+      accountNumber: z.string().optional(), bankCode: z.string().optional(), iban: z.string().optional(),
+      currency: z.string().regex(/^[A-Z]{3}$/),
+      execute: z.boolean().default(false).describe("True only when the user requested actual processing/settlement, not just a preview."),
+      payments: z.array(z.object({
+        movement: z.number().int().min(1).max(999999).describe("Stable movement number from the statement, including unmatched rows; never renumber only matched rows."),
+        date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/), amount: z.union([z.number().positive(),z.string().min(1)]),
+        direction: z.enum(["expense","receipt"]), variableSymbol: z.string().optional(), text: z.string().max(240).optional(),
+        mark: z.object({page:z.number().int().min(1),x:z.number().min(0).max(.97),y:z.number().min(.03).max(.97)}).describe("Check-mark position in a blank margin beside this transaction; x/y are fractions of the displayed page from top-left.")
+      })).min(1).max(1000)
+    },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true }
+  }, async ({databaseId,...input}) => {
+    const target=await databaseTarget(databaseId);
+    return structuredResult(await new BankStatementService(client).process({...input,databaseId:target.database},targetOptions(target)));
+  });
+
   server.registerTool("lookup_supplier_registry", {
     title: "Look up a supplier in Czech public registries",
     description: "Read-only ARES identity/address lookup with current VAT-status evidence. Search by IČO or company name plus address; ambiguous results require a decision. Foreign suppliers bypass ARES. Current status does not prove historical VAT status.",
@@ -717,7 +745,7 @@ export function registerPohodaTools(server: McpServer, context: PohodaServerCont
   }, async (input) => structuredResult(await lookupSupplierRegistry(registryClient, input)));
   server.registerTool("prepare_expense_review", {
     title: "Prepare an Excel expense preview for user review",
-    description: "Required next step after extracting client PDFs, even if all documents already exist in POHODA. Deliver the returned workbookPath as a file link; a summary of findings alone is not completion. Checks POHODA and this batch for duplicates, reuses the batched results for similar-document examples, then creates an editable XLSX preview with coloured duplicate rows and short review notes; NEVER creates or changes POHODA records. Use short Czech descriptions (e.g. Materiál), and put uncertainty in reviewNotes. Wait for the user to review/edit and explicitly request import.",
+    description: "Required next step after extracting invoice/receipt PDFs, even if all documents already exist in POHODA. Bank statement PDFs use process_bank_statement instead. Deliver the returned workbookPath as a file link; a summary of findings alone is not completion. Checks POHODA and this batch for duplicates, reuses the batched results for similar-document examples, then creates an editable XLSX preview with coloured duplicate rows and short review notes; NEVER creates or changes POHODA records. Use short Czech descriptions (e.g. Materiál), and put uncertainty in reviewNotes. Wait for the user to review/edit and explicitly request import.",
     inputSchema: {
       databaseId: databaseIdSchema,
       vatPeriod: z.string().regex(/^\d{4}-(0[1-9]|1[0-2])$/),
@@ -747,7 +775,7 @@ export function registerPohodaTools(server: McpServer, context: PohodaServerCont
 
   server.registerTool("prepare_scanned_pdf", {
     title: "Render a scanned PDF into page images",
-    description: "Renders PDF pages into separate compact JPEG or lossless PNG files with bounded parallelism and cache reuse. By default all selected pages are also returned as MCP image content, allowing the model to inspect a scanned invoice/receipt bundle immediately. Render once and extract all source documents, then call prepare_expense_review and deliver its XLSX even when duplicates or discrepancies are found. Keep POHODA writes centralized behind user review.",
+    description: "Renders PDF pages into separate compact JPEG or lossless PNG files with bounded parallelism and cache reuse. By default all selected pages are also returned as MCP image content, allowing the model to inspect a scanned invoice/receipt bundle immediately. Render once and extract all source documents. Invoice/receipt PDFs then use prepare_expense_review and return the XLSX; bank statement PDFs use process_bank_statement and return the checked PDF after verified liquidation.",
     inputSchema: prepareScannedPdfSchema.shape,
     outputSchema: {
       pdfPath: z.string(),
@@ -798,7 +826,7 @@ export function registerPohodaTools(server: McpServer, context: PohodaServerCont
     return {
       content: [{
         type: "text" as const,
-        text: `Rendered ${prepared.selectedPageCount}/${prepared.pageCount} PDF pages to ${prepared.outputDirectory} in ${prepared.durationMs} ms${prepared.cached ? " (cache hit)" : ""}.${note} Next: extract the source documents, call prepare_expense_review, and deliver the XLSX. Duplicates or discrepancies must be included for review; do not stop at a findings summary.`
+        text: `Rendered ${prepared.selectedPageCount}/${prepared.pageCount} PDF pages to ${prepared.outputDirectory} in ${prepared.durationMs} ms${prepared.cached ? " (cache hit)" : ""}.${note} Next: extract all source documents. For invoice/receipt PDFs call prepare_expense_review and deliver the XLSX, including duplicates and discrepancies. For bank statement PDFs call process_bank_statement; return its checked PDF after verified settlement.`
       }, ...inlineContent],
       structuredContent
     };
@@ -1259,7 +1287,7 @@ export function registerPohodaTools(server: McpServer, context: PohodaServerCont
 
   server.registerTool("create_bank_document", {
     title: "Create Pohoda bank document",
-    description: "Creates one Banka document (bnk:bank) with header, items, VAT/accounting fields, partner, symbols, and optional schema-specific extraHeader/extraItem fields.",
+    description: "Creates a plain Banka record; this alone does not settle an invoice. For statement PDFs and actual liquidation use process_bank_statement. statementPeriod derives the statement number 001–012; supply the correct account explicitly.",
     inputSchema: { ...genericDocumentCreateSchema.shape, dataPackId: z.string().default(""), databaseId: databaseIdSchema },
     annotations: { destructiveHint: false, idempotentHint: false, openWorldHint: true }
   }, async ({ items, dataPackId, databaseId, ...header }) =>

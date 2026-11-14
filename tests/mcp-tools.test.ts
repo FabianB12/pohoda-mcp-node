@@ -110,7 +110,7 @@ describe("MCP tool helpers", () => {
     registerPohodaTools(fakeServer as any, { client, databaseRegistry: registry, exportStore });
 
     expect([...fakeServer.tools.keys()]).toEqual([
-      "get_usage_guide", "lookup_supplier_registry", "prepare_expense_review", "inspect_expense_review", "import_expense_review", "prepare_scanned_pdf", "status", "list_xml_databases", "current_database", "list_accounting_units",
+      "get_usage_guide", "process_bank_statement", "lookup_supplier_registry", "prepare_expense_review", "inspect_expense_review", "import_expense_review", "prepare_scanned_pdf", "status", "list_xml_databases", "current_database", "list_accounting_units",
       "list_documents", "list_stock", "list_contacts", "list_export_agenda", "batch_list_records", "list_balance", "create_invoice",
       "create_other_liability", "create_other_receivable", "create_address", "create_cash_voucher", "manage_activity",
       "batch_create_invoices", "batch_write", "create_stock", "create_order", "manage_address", "manage_stock",

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { ExpensePolicyError, isExpenseDocument, resolveExpensePolicy } from "../src/pohoda/expense-policy.js";
+import { ExpensePolicyError, deriveSymVarFromDocumentNumber, isExpenseDocument, resolveExpensePolicy } from "../src/pohoda/expense-policy.js";
 
 const taxable = {
   type: "receivedInvoice",
@@ -263,7 +263,7 @@ describe("resolveExpensePolicy", () => {
   });
 
   it("requires explicit CZK payable for foreign thresholds", () => {
-    const foreignCash = { ...taxable, type: "expense", taxMode: "nonTax", classificationVAT: "", currency: "EUR", priceHigh: undefined, priceHighVAT: undefined, priceNone: 50, total: 50 };
+    const foreignCash = { ...taxable, type: "expense", taxMode: "nonTax", classificationVAT: "", datePayment: "2026-07-20", currency: "EUR", priceHigh: undefined, priceHighVAT: undefined, priceNone: 50, total: 50 };
     const error = policyError(() => resolveExpensePolicy(foreignCash, [], "voucher"));
     expect(error.code).toBe("FOREIGN_THRESHOLD_NEEDS_CZK");
     expect(error.needsReview).toBe(true);
@@ -300,5 +300,89 @@ describe("resolveExpensePolicy", () => {
     expect(policyError(() => resolveExpensePolicy({ ...card, cardSequence: 1, paymentType: "cash" }, [], "invoice")).code).toBe("CARD_PAYMENT_TYPE_CONFLICT");
     expect(resolveExpensePolicy({ ...card, cardSequence: 1, paymentType: "KARTA" }, [], "invoice").paymentType).toBe("KARTA");
     expect(policyError(() => resolveExpensePolicy({ ...card, cardSequence: 1, currency: "EUR", taxMode: "nonTax", classificationVAT: "" }, [], "invoice")).code).toBe("FOREIGN_THRESHOLD_NEEDS_CZK");
+  });
+
+  describe("received invoice variable symbol", () => {
+    const received = { ...taxable, originalDocument: "FV-2026/0007" };
+
+    it("derives a missing VS from the supplier document number, ASCII digits only, keeping leading zeros", () => {
+      const result = resolveExpensePolicy(received, [], "invoice");
+      expect(result.symVar).toBe("20260007");
+      expect(result.originalDocument).toBe("FV-2026/0007");
+      expect(result.sourceDocumentNumber).toBe("FV-2026/0007");
+      expect(result.sourceSymVar).toBeUndefined();
+      expect(result._expensePolicy.symVarRule).toBe("derived-from-source-document");
+      expect(result._expensePolicy.original.symVar).toBeUndefined();
+      expect(result._expensePolicy.warnings.join(" ")).toContain('derived from supplier document number "FV-2026/0007"');
+      expect(resolveExpensePolicy({ ...taxable, originalDocument: "00-12/A.3 b" }, [], "invoice").symVar).toBe("00123");
+      expect(resolveExpensePolicy({ ...taxable, originalDocument: "0007" }, [], "invoice").symVar).toBe("0007");
+      expect(resolveExpensePolicy({ ...taxable, originalDocument: "FA\u00a0٣12" }, [], "invoice").symVar).toBe("12");
+      // A blank explicit symVar counts as missing.
+      expect(resolveExpensePolicy({ ...received, symVar: "  ", sourceSymVar: "" }, [], "invoice").symVar).toBe("20260007");
+    });
+
+    it("keeps an explicit VS unchanged", () => {
+      for (const extra of [{ symVar: "0001" }, { sourceSymVar: "0042026" }, { sourceSymVar: "123", symVar: "999" }]) {
+        const result = resolveExpensePolicy({ ...received, ...extra }, [], "invoice");
+        expect(result.symVar).toBe(extra.sourceSymVar ?? extra.symVar);
+        expect(result.sourceSymVar).toBe(result.symVar);
+        expect(result._expensePolicy.symVarRule).toBe("source");
+      }
+    });
+
+    it("uses the supplier number, never internal numbering, and is idempotent", () => {
+      const first = resolveExpensePolicy({ ...received, number: "FP260001" }, [], "invoice");
+      expect(first.symVar).toBe("20260007");
+      const again = resolveExpensePolicy(first, [], "invoice");
+      expect(again.symVar).toBe("20260007");
+      expect(again.sourceSymVar).toBeUndefined();
+      expect(again._expensePolicy).toEqual(first._expensePolicy);
+      // A changed persisted supplier number re-derives; the stale derived symVar is not treated as source.
+      const changed = resolveExpensePolicy({ ...first, sourceDocumentNumber: "FV-2026/0008" }, [], "invoice");
+      expect(changed.symVar).toBe("20260008");
+      const explicit = resolveExpensePolicy({ ...received, symVar: "55" }, [], "invoice");
+      expect(resolveExpensePolicy(explicit, [], "invoice").symVar).toBe("55");
+    });
+
+    it("leaves VS empty for review when the number has no digits or too many digits", () => {
+      const none = resolveExpensePolicy({ ...taxable, originalDocument: "ABC-X" }, [], "invoice");
+      expect(none.symVar).toBeUndefined();
+      expect(none.originalDocument).toBe("ABC-X");
+      expect(none._expensePolicy.symVarRule).toBe("missing-no-digits");
+      expect(none._expensePolicy.warnings.join(" ")).toContain("has no digits");
+      const long = `FV-${"1".repeat(21)}`;
+      const overflow = resolveExpensePolicy({ ...taxable, originalDocument: long }, [], "invoice");
+      expect(overflow.symVar).toBeUndefined();
+      expect(overflow._expensePolicy.symVarRule).toBe("missing-too-long");
+      expect(overflow._expensePolicy.warnings.join(" ")).toContain("not truncated");
+      // POHODA allows 20 characters; above 10 digits it warns about Czech bank payment limits.
+      const twenty = resolveExpensePolicy({ ...taxable, originalDocument: "9".repeat(20) }, [], "invoice");
+      expect(twenty.symVar).toBe("9".repeat(20));
+      expect(twenty._expensePolicy.warnings.join(" ")).toContain("at most 10");
+      // A stale symVar on a re-applied header is removed when nothing can be derived.
+      expect(resolveExpensePolicy({ ...none, symVar: "1" }, [], "invoice").symVar).toBeUndefined();
+      // Non-tax received invoice without any document number: nothing derived, no warning added.
+      const noNumber = resolveExpensePolicy({ ...taxable, originalDocument: "", taxMode: "nonTax", classificationVAT: "" }, [], "invoice");
+      expect(noNumber.symVar).toBeUndefined();
+      expect(noNumber._expensePolicy.symVarRule).toBe("none");
+    });
+
+    it("applies only to received invoices", () => {
+      expect(resolveExpensePolicy({ ...received, type: "commitment" }, [], "invoice").symVar).toBeUndefined();
+      expect(resolveExpensePolicy({ ...received, type: "commitment", symVar: "77" }, [], "invoice").symVar).toBe("77");
+      const cash = resolveExpensePolicy({ ...received, type: "expense", datePayment: "2026-11-03", priceHigh: 10000, priceHighVAT: 2100, total: 12100 }, [], "voucher");
+      expect(cash.originalDocument).toBe("FV-2026/0007");
+      expect(cash.symVar).toBeUndefined();
+      const card = resolveExpensePolicy({ ...received, type: "commitment", cardPayment: true, cardSequence: 4, priceHigh: 10000, priceHighVAT: 2100, total: 12100 }, [], "invoice");
+      expect(card.symVar).toBeUndefined();
+      expect(resolveExpensePolicy({ ...received, type: "issuedInvoice" }, [], "invoice").symVar).toBeUndefined();
+    });
+  });
+
+  it("deriveSymVarFromDocumentNumber never invents or truncates", () => {
+    expect(deriveSymVarFromDocumentNumber("FV-2026/0007")).toMatchObject({ symVar: "20260007", reason: "derived-from-source-document" });
+    expect(deriveSymVarFromDocumentNumber(" ")).toEqual({ reason: "none" });
+    expect(deriveSymVarFromDocumentNumber("ŘÁD-Č.")).toMatchObject({ reason: "missing-no-digits" });
+    expect(deriveSymVarFromDocumentNumber("1".repeat(21)).symVar).toBeUndefined();
   });
 });

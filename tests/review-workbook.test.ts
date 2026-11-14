@@ -12,9 +12,15 @@ import {
   REVIEW_META_SHEET_NAME,
   REVIEW_SHEET_NAME,
   ReviewWorkbookError,
+  collapsedReviewColumns,
+  REVIEW_LEGACY_COLUMNS,
   readReviewWorkbook,
+  updateReviewDuplicateChecks,
   writeReviewWorkbook
 } from "../src/mcp/review-workbook.js";
+import { createHash } from "node:crypto";
+import JSZip from "jszip";
+import type { ReviewRow } from "../src/mcp/review-contract.js";
 
 /** Synthetic data only. Suppliers and numbers are invented; nothing comes from a live POHODA. */
 export function syntheticReview(): ReviewWorkbook {
@@ -167,7 +173,6 @@ describe("review workbook round trip", () => {
       sourceSymVar: "0042026",
       sourceIssueDate: "2026-02-14",
       sourceTaxDate: "2026-02-14",
-      sourcePaymentDate: "",
       taxMode: "taxable", classificationVAT: "PD",
       sourceChargesVat: true,
       cardPayment: false,
@@ -231,6 +236,49 @@ describe("review workbook round trip", () => {
     expect(metaKeys).toEqual(["format", "schemaVersion", "reviewId", "databaseId", "vatPeriod", "generatedAt", "notice"]);
   });
 
+  it("collapses an unused due-date column for cash/card receipts without changing blank values", async () => {
+    const input = syntheticReview();
+    input.rows = input.rows.slice(1); // one card receipt and one cash receipt
+    const target = await written(input);
+    const wb = new ExcelJS.Workbook(); await wb.xlsx.readFile(target);
+    const sheet = wb.getWorksheet(REVIEW_SHEET_NAME)!;
+    expect(sheet.getColumn(colOf("dateDue")).hidden).toBe(true);
+    expect(sheet.getColumn(colOf("dateDue")).outlineLevel).toBe(1);
+    expect(sheet.getColumn(colOf("total")).hidden).toBe(false);
+    expect(sheet.getColumn(colOf("sourceTaxDate")).hidden).toBe(false);
+    expect((await readReviewWorkbook(target)).rows.map((row) => row.data.dateDue)).toEqual(["", ""]);
+
+    // It remains an ordinary editable source column; hiding never drops an edit.
+    const changed = await edit(target, (ws) => {
+      ws.getColumn(colOf("dateDue")).hidden = false;
+      ws.getCell(3, colOf("dateDue")).value = "2026-03-20";
+    });
+    expect((await readReviewWorkbook(changed)).rows[0]!.data.dateDue).toBe("2026-03-20");
+  });
+
+  it.each(["create_invoice", "create_other_liability"] as const)("keeps a blank due date available for an unpaid %s in a mixed batch", async (tool) => {
+    const input = syntheticReview();
+    input.rows = input.rows.slice(1);
+    input.rows.push({ ...input.rows[0]!, rowId: "unpaid", tool, data: { ...input.rows[0]!.data, cardPayment: false, paymentType: "draft" } });
+    const wb = new ExcelJS.Workbook(); await wb.xlsx.readFile(await written(input));
+    expect(wb.getWorksheet(REVIEW_SHEET_NAME)!.getColumn(colOf("dateDue")).hidden).toBe(false);
+  });
+
+  it("keeps any populated due date visible even in an otherwise cash/card-only batch", async () => {
+    const input = syntheticReview(); input.rows = input.rows.slice(1);
+    input.rows[0]!.data.dateDue = "2026-03-20";
+    const target = await written(input), wb = new ExcelJS.Workbook(); await wb.xlsx.readFile(target);
+    expect(wb.getWorksheet(REVIEW_SHEET_NAME)!.getColumn(colOf("dateDue")).hidden).toBe(false);
+    expect((await readReviewWorkbook(target)).rows[0]!.data.dateDue).toBe("2026-03-20");
+  });
+
+  it("recognizes a card commitment supplied through create_invoice as a paid receipt", async () => {
+    const input = syntheticReview();
+    input.rows = [{ ...input.rows[1]!, tool: "create_invoice", data: { ...input.rows[1]!.data, type: "commitment" } }];
+    const wb = new ExcelJS.Workbook(); await wb.xlsx.readFile(await written(input));
+    expect(wb.getWorksheet(REVIEW_SHEET_NAME)!.getColumn(colOf("dateDue")).hidden).toBe(true);
+  });
+
   it("keeps ordinary rows quiet and highlights duplicates and invalid amounts without another status column", async () => {
     const input = syntheticReview();
     input.rows.push({ ...input.rows[0]!, rowId: "bad-total", duplicateCheck: undefined, action: "review", data: { ...input.rows[0]!.data, total: 1 }, reviewNotes: "Ověřit součet." });
@@ -280,7 +328,7 @@ describe("user edits", () => {
       ws.getCell(r, colOf("priceNone")).value = 1234.5;
       ws.getCell(r, colOf("sourceIssueDate")).value = "06.03.2026";
       ws.getCell(r, colOf("sourceTaxDate")).value = new Date(Date.UTC(2026, 2, 7));
-      ws.getCell(r, colOf("sourcePaymentDate")).value = "2026-03-08";
+      ws.getCell(r, colOf("dateDue")).value = "2026-03-08";
       ws.getCell(r, colOf("taxMode")).value = "Daňový (odpočet DPH)";
       ws.getCell(r, colOf("sourceChargesVat")).value = null;
       ws.getCell(r, colOf("currencyRate")).value = "25,125";
@@ -297,7 +345,7 @@ describe("user edits", () => {
       priceNone: 1234.5,
       sourceIssueDate: "2026-03-06",
       sourceTaxDate: "2026-03-07",
-      sourcePaymentDate: "2026-03-08",
+      dateDue: "2026-03-08",
       taxMode: "taxable",
       sourceChargesVat: null,
       currencyRate: 25.125,
@@ -511,5 +559,175 @@ describe.runIf(process.env.REVIEW_SAMPLE_OUT)("synthetic visual sample", () => {
   it("writes the synthetic QA sample", async () => {
     await writeReviewWorkbook(syntheticReview(), process.env.REVIEW_SAMPLE_OUT!);
     expect((await readReviewWorkbook(process.env.REVIEW_SAMPLE_OUT!)).rows).toHaveLength(3);
+  });
+});
+
+describe("column visibility contract", () => {
+  const [invoice, card, cash] = syntheticReview().rows as [ReviewRow, ReviewRow, ReviewRow];
+  const asImport = (row: ReviewRow): ReviewRow => ({ ...row, action: "import", data: { ...row.data } });
+  const scenarios: Record<string, ReviewRow[]> = {
+    invoice: [asImport(invoice)],
+    card: [asImport(card)],
+    cash: [asImport(cash)],
+    mixed: [asImport(invoice), asImport(card), asImport(cash)]
+  };
+  const visible = async (rows: ReviewRow[]) => {
+    const input = syntheticReview(); input.rows = rows;
+    const wb = new ExcelJS.Workbook(); await wb.xlsx.readFile(await written(input));
+    const ws = wb.getWorksheet(REVIEW_SHEET_NAME)!;
+    return new Set(REVIEW_COLUMNS.filter((c) => !ws.getColumn(colOf(c.key)).hidden).map((c) => c.key));
+  };
+  const ALWAYS = ["rowId", "action", "reviewNotes", "tool", "text", "partnerName", "partnerIco", "partnerDic", "partnerCountry",
+    "sourceDocumentNumber", "targetDocument", "targetSymVar", "sourceIssueDate", "sourceTaxDate", "taxMode", "sourceChargesVat",
+    "cardPayment", "currency", "total", "accounting", "classificationVAT"];
+
+  it.each(Object.keys(scenarios))("keeps essential review and accounting fields visible for %s previews, even when blank", async (name) => {
+    const rows = scenarios[name]!.map((row) => ({ ...row, data: { ...row.data, accounting: "" } }));
+    const shown = await visible(rows);
+    for (const key of ALWAYS) expect(shown, key).toContain(key);
+    expect(shown.has("cashAccount")).toBe(rows.some((row) => row.tool === "create_cash_voucher"));
+    for (const key of ["plannedImport", "sourcePdfPath", "intNote", "partnerStreet", "price3"]) expect(shown.has(key), key).toBe(false);
+  });
+
+  it("collapses optional fields that are empty and inapplicable, per document kind", () => {
+    const hidden = (rows: ReviewRow[]) => collapsedReviewColumns(rows, "2026-03");
+    // Invoice: CZ so no CZK equivalent, no 12 % bucket, no rounding.
+    for (const key of ["homePayableCZK", "priceLow", "priceLowVAT", "priceLowSum", "roundingAmount", "cashAccount"]) expect(hidden(scenarios.invoice!), key).toContain(key);
+    for (const key of ["dateDue", "sourceSymVar", "priceNone", "priceHigh"]) expect(hidden(scenarios.invoice!), key).not.toContain(key);
+    // Card and cash receipts: no due date or source VS.
+    for (const name of ["card", "cash"]) {
+      expect(hidden(scenarios[name]!)).toContain("dateDue");
+      expect(hidden(scenarios[name]!)).toContain("sourceSymVar");
+    }
+    // Mixed batches keep fields relevant to any row; a zero rounding is a value, not a blank.
+    const mixed = hidden(scenarios.mixed!);
+    for (const key of ["dateDue", "sourceSymVar", "priceLow", "priceHigh", "priceNone", "roundingAmount", "cashAccount"]) expect(mixed, key).not.toContain(key);
+    expect(mixed).toContain("homePayableCZK");
+  });
+
+  it("shows populated optional values and blank fields required by policy", () => {
+    const hidden = (data: Record<string, unknown>, row: ReviewRow = invoice) => collapsedReviewColumns([{ ...asImport(row), data: { ...row.data, ...data } }], "2026-03");
+    expect(hidden({ paymentType: "draft", dateDue: "2026-03-01" }, card)).not.toContain("dateDue");
+    expect(hidden({ roundingAmount: 0 })).not.toContain("roundingAmount");
+    expect(hidden({ priceLow: 0, priceLowVAT: 0 })).not.toContain("priceLowSum");
+    expect(hidden({ currency: "EUR" })).not.toContain("homePayableCZK"); // required for foreign threshold rules
+    // No summary amount at all: every rate group stays open for entry.
+    const empty = hidden({ priceNone: null, priceHigh: null, priceHighVAT: null, priceHighSum: null });
+    for (const key of ["priceNone", "priceLow", "priceHigh"]) expect(empty).not.toContain(key);
+    // A collapsed advanced field flagged by the import policy is revealed.
+    const flagged = hidden({ taxMode: "auto", partnerVatStatus: "payer", vatStatusEvidence: "" });
+    expect(flagged).not.toContain("vatStatusEvidence");
+    expect(flagged).toContain("partnerStreet");
+    expect(collapsedReviewColumns([{ ...asImport(cash), data: { ...cash.data, cashAccount: "" } }], "2026-03")).not.toContain("cashAccount");
+  });
+
+  it("labels computed POHODA values as read-only output and never reads them back", async () => {
+    const target = await written({ ...syntheticReview(), rows: [asImport(invoice), asImport(card), asImport(cash)] });
+    const wb = new ExcelJS.Workbook(); await wb.xlsx.readFile(target);
+    const ws = wb.getWorksheet(REVIEW_SHEET_NAME)!;
+    expect(ws.getCell(2, colOf("targetDocument")).value).toBe("Doklad v POHODĚ (vypočteno)");
+    expect(ws.getCell(2, colOf("targetSymVar")).value).toBe("VS v POHODĚ (vypočteno)");
+    expect([3, 4, 5].map((r) => [ws.getCell(r, colOf("targetDocument")).value, ws.getCell(r, colOf("targetSymVar")).value])).toEqual([
+      ["0042026", "0042026"], ["K + další č. PK", "další č. PK"], [null, null]
+    ]);
+    const before = await readReviewWorkbook(target);
+    const changed = await edit(target, (sheet) => { sheet.getCell(3, colOf("targetDocument")).value = "HACK"; sheet.getCell(3, colOf("targetSymVar")).value = "1"; });
+    const after = await readReviewWorkbook(changed);
+    expect(after.rows.map((r) => r.data)).toEqual(before.rows.map((r) => r.data));
+    expect(after.rows[0]!.data.sourceDocumentNumber).toBe("0042026");
+    expect(after.rows[0]!.data).not.toHaveProperty("targetDocument");
+    // Older previews without computed columns remain readable.
+    const legacy = await edit(target, (sheet) => { sheet.spliceColumns(colOf("targetDocument"), 2); });
+    expect((await readReviewWorkbook(legacy)).rows.map((r) => r.data)).toEqual(before.rows.map((r) => r.data));
+  });
+
+  it("keeps edits in a collapsed column and the reviewer's visibility choices on duplicate refresh", async () => {
+    const input = syntheticReview(); input.rows = [asImport(invoice)];
+    const original = await written(input);
+    const changed = await edit(original, (ws) => {
+      ws.getColumn(colOf("roundingAmount")).hidden = false; // reviewer expands a collapsed field
+      ws.getCell(3, colOf("roundingAmount")).value = 0.4;
+      ws.getColumn(colOf("partnerDic")).hidden = true; // and hides one they do not need
+      ws.getCell(3, colOf("accounting")).value = "518";
+    });
+    const sha = createHash("sha256").update(await fs.readFile(changed)).digest("hex");
+    await updateReviewDuplicateChecks(changed, { [invoice.rowId]: { status: "clear", checkedAt: "2026-03-21T10:00:00Z", message: "", matches: [], matchCount: 0 } }, sha);
+    const wb = new ExcelJS.Workbook(); await wb.xlsx.readFile(changed);
+    const ws = wb.getWorksheet(REVIEW_SHEET_NAME)!;
+    expect(ws.getColumn(colOf("roundingAmount")).hidden).toBe(false);
+    expect(ws.getColumn(colOf("partnerDic")).hidden).toBe(true);
+    expect(ws.getColumn(colOf("homePayableCZK")).hidden).toBe(true);
+    expect((await readReviewWorkbook(changed)).rows[0]!.data).toMatchObject({ roundingAmount: 0.4, accounting: "518" });
+  });
+
+  it("does not write Datum úhrady, yet still reads it from an older workbook that has it", async () => {
+    const target = await written();
+    const wb = new ExcelJS.Workbook(); await wb.xlsx.readFile(target);
+    const headers = (wb.getWorksheet(REVIEW_SHEET_NAME)!.getRow(2).values as unknown[]).map(String);
+    expect(headers).not.toContain("Datum úhrady (zdroj)");
+    expect(REVIEW_COLUMNS.map((c) => c.key)).not.toContain("sourcePaymentDate");
+    expect(REVIEW_DATA_FIELDS).not.toContain("sourcePaymentDate");
+    // Absent column: the parser returns no value, so the import keeps the prepared date.
+    expect((await readReviewWorkbook(target)).rows.every((r) => !("sourcePaymentDate" in r.data))).toBe(true);
+    const legacy = await edit(target, (ws) => {
+      const column = ws.columnCount + 1;
+      ws.getCell(2, column).value = REVIEW_LEGACY_COLUMNS[0]!.label;
+      ws.getCell(rowNumberOf(ws, "r003"), column).value = "2026-03-11";
+    });
+    const rows = (await readReviewWorkbook(legacy)).rows;
+    expect(rows.find((r) => r.rowId === "r003")!.data.sourcePaymentDate).toBe("2026-03-11");
+    expect(rows.find((r) => r.rowId === "r001")!.data.sourcePaymentDate).toBe("");
+  });
+});
+
+/** Re-saves a workbook the way Open XML SDK writers do: x:-prefixed SpreadsheetML,
+ * absolute relationship targets and a non-conventional VML part name. Synthetic data. */
+async function asOpenXmlSdkPackage(source: string, mutateSheetXml: (xml: string) => string = (x) => x): Promise<string> {
+  const zip = await JSZip.loadAsync(await fs.readFile(source));
+  const MAIN = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+  for (const name of Object.keys(zip.files).filter((n) => n.endsWith(".xml") && n.startsWith("xl/"))) {
+    let xml = await zip.file(name)!.async("string");
+    if (!xml.includes(`xmlns="${MAIN}"`)) continue;
+    xml = xml.replace(/<(\/?)(?![?!])([A-Za-z])/g, "<$1x:$2").replace(`xmlns="${MAIN}"`, `xmlns:x="${MAIN}"`);
+    zip.file(name, name === "xl/worksheets/sheet1.xml" ? mutateSheetXml(xml) : xml);
+  }
+  for (const name of Object.keys(zip.files).filter((n) => n.endsWith(".rels"))) {
+    const dir = path.posix.dirname(path.posix.dirname(name));
+    const xml = await zip.file(name)!.async("string");
+    zip.file(name, xml.replace(/Target="([^"]+)"/g, (_m, t: string) => `Target="/${path.posix.normalize(path.posix.join(dir === "." ? "" : dir, t))}"`.replace("vmlDrawing1.vml", "vmldrawing.vml")));
+  }
+  const vml = Object.keys(zip.files).find((n) => /vmlDrawing1\.vml$/.test(n));
+  if (vml) { zip.file("xl/drawings/vmldrawing.vml", await zip.file(vml)!.async("uint8array")); zip.remove(vml); }
+  const target = file();
+  await fs.writeFile(target, await zip.generateAsync({ type: "nodebuffer" }));
+  return target;
+}
+
+describe("workbooks re-saved by other OOXML writers", () => {
+  it("reads prefixed-namespace packages with absolute relationship targets", async () => {
+    const original = await written();
+    const converted = await asOpenXmlSdkPackage(original);
+    await expect(new ExcelJS.Workbook().xlsx.readFile(converted)).rejects.toThrow(); // the ExcelJS limitation
+    const [a, b] = [await readReviewWorkbook(original), await readReviewWorkbook(converted)];
+    expect(b).toEqual(a);
+  });
+
+  it("keeps formula and hidden-row guards on normalized packages", async () => {
+    const original = await written();
+    const totalRef = `${new ExcelJS.Workbook().addWorksheet("x").getColumn(colOf("total")).letter}3`;
+    const formula = await asOpenXmlSdkPackage(original, (xml) => xml.replace(new RegExp(`<x:c r="${totalRef}"([^>]*?)(/>|>.*?</x:c>)`), `<x:c r="${totalRef}"$1><x:f>100+21</x:f><x:v>121</x:v></x:c>`));
+    expect((await rejection(formula)).issues.map((i) => i.code)).toContain("FORMULA_NOT_ALLOWED");
+    const hidden = await asOpenXmlSdkPackage(original, (xml) => xml.replace('<x:row r="3"', '<x:row r="3" hidden="1"'));
+    expect((await rejection(hidden)).issues.map((i) => i.code)).toContain("HIDDEN_ROW");
+  });
+
+  it("refreshes duplicate checks on such a package without losing edits", async () => {
+    const converted = await asOpenXmlSdkPackage(await written());
+    const sha = createHash("sha256").update(await fs.readFile(converted)).digest("hex");
+    await updateReviewDuplicateChecks(converted, { r001: { status: "possible", checkedAt: "2026-03-21T10:00:00Z", message: "", matches: [{ location: "pohoda", reason: "reference", agenda: "invoice", type: "receivedInvoice", id: "9", number: "FP1", date: "2026-02-14", total: 1210, currency: "CZK" }], matchCount: 1 } }, sha);
+    const row = (await readReviewWorkbook(converted)).rows.find((r) => r.rowId === "r001")!;
+    expect(row.action).toBe("review");
+    expect(row.reviewNotes).toContain("FP1");
+    expect(row.data.sourceDocumentNumber).toBe("0042026");
   });
 });

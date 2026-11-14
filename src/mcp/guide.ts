@@ -6,8 +6,9 @@ export const POHODA_GUIDE_URI = "pohoda://guide";
 /** Sent during MCP initialization; hosts decide how to present it to the model. */
 export const POHODA_SERVER_INSTRUCTIONS = [
   "POHODA accounting server using the XML CLI. Before processing documents, read pohoda://guide; if resource access is unavailable, call get_usage_guide. Read it once per conversation and again after a context reset.",
-  "A request to process client PDFs is complete only after delivering a linked editable XLSX preview, then waiting for user review. Duplicates and discrepancies belong in that preview, even if every document is already in POHODA; they are not reasons to stop before creating it. Use prepare_expense_review -> inspect_expense_review -> import_expense_review with approved=true and the inspected workbook hash. Processing documents alone is not approval to import.",
+  "A request to process invoice/receipt PDFs is complete only after delivering a linked editable XLSX preview, then waiting for user review. Duplicates and discrepancies belong in that preview, even if every document is already in POHODA; they are not reasons to stop before creating it. Use prepare_expense_review -> inspect_expense_review -> import_expense_review with approved=true and the inspected workbook hash. Processing documents alone is not approval to import.",
   "Discover the correct client/year and pass databaseId explicitly; obtain the VAT period. Preserve source amounts, use short document descriptions, and keep review notes out of POHODA. PDF imports must archive and link the original source.",
+  "Bank statement PDFs use process_bank_statement: settle exact matches, verify liquidation and return the checked PDF; leave unmatched payments untouched.",
   "The server validates expense policy and reports stored-field differences. Do not blindly retry created or uncertain writes. Full rules, supported tools, limitations and client-specific conventions are in the guide."
 ].join("\n");
 
@@ -20,7 +21,7 @@ export const POHODA_USAGE_GUIDE = {
   },
   integration: "Use only the POHODA XML CLI workflow. Old HTTP, mServer, PHP and profile-based instructions are legacy.",
   clientContext: {
-    period: "Confirm the client/year and VAT period YYYY-MM. Never infer the VAT month from the database filename. If a critical fact is missing, ask a focused question rather than guessing.",
+    period: "Confirm the client/year and VAT period YYYY-MM. Use the VAT period specified by the user or an explicit client/batch setting; never infer it from invoice contents or the database filename. If a critical fact is missing, ask a focused question rather than guessing.",
     codebooks: "Read the client's own codebooks, cash registers, accounting assignments and number series. Historical examples from another client/year are not defaults.",
     localConventions: "Keep client-specific accounting mappings in the client's workspace configuration, explicitly scoped to client and year. A workspace AGENTS.md may hold those local facts and a pointer to this guide; do not duplicate the full general guide there."
   },
@@ -31,12 +32,12 @@ export const POHODA_USAGE_GUIDE = {
     currencies: "Distinguish the actual document/payment currency from an informational CZK/EUR conversion printed on the source."
   },
   authorization: {
-    preparation: "Preparing or inspecting a workbook does not authorize accounting writes. A request to process client documents means preview first.",
+    preparation: "Preparing or inspecting a workbook does not authorize accounting writes. A request to process invoice/receipt documents means preview first; bank statement settlement follows bankStatements.",
     otherActions: "Create or edit accounting records only when requested. Printing and email require an explicit target, accounting unit, report and recipient as applicable.",
     limits: "approved=true is a tool argument, not independent proof of human consent. The agent must obtain an explicit import instruction from the user."
   },
   defaultExpenseWorkflow: {
-    intent: "A request to process PDFs for a client means prepare an editable XLSX preview, not permission to import.",
+    intent: "A request to process invoice/receipt PDFs for a client means prepare an editable XLSX preview, not permission to import. Bank statement PDFs follow bankStatements instead.",
     completion: "Deliver the actual editable XLSX using workbookPath as a file link, with a brief count of rows needing review. A chat summary, duplicate counts or findings alone do not complete preparation. Include every extracted source document, even when all documents already exist in POHODA. Mark duplicates and discrepancies Prověřit; never silently omit them or change the source to match POHODA.",
     stopping: "During preparation, stop for review means flag the affected row and continue creating the workbook, not end the task or wait for permission to prepare it. Unknown VAT treatment, rounding discrepancies, missing nonessential fields and uncertain extraction belong in the preview. Ask only for context essential to select the client/year or VAT period, or explain a technical failure that prevents producing the file. An explicit user stop, cancellation or request for analysis only overrides preview delivery.",
     prepare: "Discover the unit and VAT month, extract source fields, then call prepare_expense_review. It checks existing received invoices, other liabilities and cash expenses for duplicates across the selected database, reuses those records for similar-client examples, and writes a workbook without changing POHODA.",
@@ -44,7 +45,7 @@ export const POHODA_USAGE_GUIDE = {
     performance: "Prepare all extracted documents for one client in one call (up to 500 rows). The server batches paged POHODA reads, reuses the snapshot for history, indexes matches locally and hashes each source PDF once. Do not issue per-document duplicate searches. The full workbook contains all rows; the initial tool response limits detailed row previews to 20.",
     review: "First deliver the workbook, then wait for user review and edits. Use inspect_expense_review to read the edited file. Keep uncertainties in the review-notes column; never copy these notes into POHODA text or intNote.",
     import: "Only after an explicit user instruction to import, call import_expense_review with approved=true, reviewId, the edited workbookPath, the same databaseId and expectedWorkbookSha256 from the latest inspect_expense_review. It reads the exact inspected version and rejects unresolved or hidden rows, formulas and invalid data. A cleared cell must stay cleared; never restore cached extraction values.",
-    presentation: "Keep the review concise: no extra status columns, no success messages or per-row timestamps, and no routine explanations. Use short actionable notes only; normal rows stay blank. Yellow marks fields needing correction, pink marks duplicates, grey marks skipped rows. Keep the detailed import plan collapsed; full evidence remains in the manifest and tool results.",
+    presentation: "Keep the review concise: no extra status columns, no success messages or per-row timestamps, and no routine explanations. Use short actionable notes only; normal rows stay blank. Yellow marks fields needing correction, pink marks duplicates, grey marks skipped rows. Columns follow the contract in review-workbook.ts: identity, source dates/amounts, Předkontace, Členění DPH and the computed read-only Doklad/VS in POHODA stay visible even when blank; source number/VS columns are source facts, not the POHODA values. Optional fields empty and inapplicable to every row (e.g. receipt due date/VS, CZK equivalent for CZK, unused VAT rates) are collapsed; anything flagged for correction is shown. Datum úhrady is not a review column: pass it only when the source proves the actual payment (cash receipts keep their actual date); never copy it from issue, due or tax dates. Keep the detailed import plan collapsed; full evidence remains in the manifest and tool results.",
     descriptions: "Prefer short category descriptions, e.g. Materiál instead of a list of cement, concrete and timber. Historical examples inform conventions but never override source amounts, VAT or explicit user rules."
   },
   listing: {
@@ -60,11 +61,19 @@ export const POHODA_USAGE_GUIDE = {
     efficiency: "Tools default server-side count to limit. Increase count only when needed; use idFrom for paging.",
     filters: "Prefer explicit filters first. extId requires extSystemName, but invoice extId filters are unreliable on POHODA 14302. Never infer that a document is absent from an extId filter alone."
   },
+  bankStatements: {
+    workflow: "For a PDF bank statement, extract its own account/IBAN, currency, statement period/date and every movement with a stable number and check-mark position. Call process_bank_statement; execute=true when the user requests processing and liquidation, execute=false for a preview. Return the resulting PDF and concise settled/unmatched counts. This bank workflow does not require the expense XLSX review flow.",
+    matching: "Match the client's own bank account exactly from the statement header, never the counterparty account or a default account. Match same-currency outstanding invoices by variable symbol, oldest issue date first, then a unique exact amount if no symbol match exists. Only the exact remaining amount is allowed. An amount mismatch on the oldest same-VS document stays unmatched; never split, partially settle or fall back to a different amount match.",
+    completion: "A bank entry alone is not liquidation. Use the typed import-only bankLiquidationItem with the target invoice ID; verify the bank-to-invoice link and zero remaining balance. Never write unmatched or ambiguous movements. Mark only verified settlements in a separate PDF copy; preserve the original. On uncertain writes retain IDs and inspect before retrying.",
+    numbering: "Statement number comes from the month printed on the bank statement: January 001 through December 012. It is separate from the bank record number and movement number. Keep actual transaction dates; expense VAT-date shifting does not apply.",
+    foreignCurrency: "Automatic bank settlement currently supports CZK. Foreign-currency statements can be matched read-only, but execution is blocked before writing until a verified bank exchange rate is supported. Never substitute rate 1 or infer the bank rate from the invoice. POHODA requires an explicit rate for this liquidation import path.",
+    retry: "Reuse a matching existing bank movement only after verifying its stored source marker and invoice linkage. A legacy bank entry without a verified settlement is a review case, not permission to duplicate it."
+  },
   scannedDocuments: {
     tool: "prepare_scanned_pdf",
     use: "Call once for PDFs containing scanned invoices or receipts. It renders pages concurrently, caches unchanged inputs, writes numbered page images, and inlines images by default. Reuse the images. Empty text extraction does not prove a blank scan. Defaults: JPEG, 180 DPI, quality 82; use explicit page ranges for large PDFs.",
     delegation: "When there are at least four independent pages/documents and sub-agents are available, give each sub-agent a disjoint set of returned page paths. Sub-agents extract only and return structured fields plus confidence and page-boundary notes. The parent reconciles multi-page documents, duplicates, totals, VAT, supplier/customer identity, and target accounting unit before any POHODA write.",
-    writing: "After extraction, group expenses by databaseId and call prepare_expense_review. Return the editable workbook, wait for user review and an explicit import instruction, then call import_expense_review. Reader agents never create contacts or documents."
+    writing: "Route by document type after extraction: bank statement PDFs use process_bank_statement; invoice/receipt PDFs use prepare_expense_review grouped by databaseId. Return the editable workbook, wait for user review and an explicit import instruction, then call import_expense_review. Reader agents never create contacts or documents."
   },
   vatDates: {
     dateTax: "For received taxable documents, the deduction/delivery date that determines the VAT-return and control-statement reporting period.",
@@ -77,9 +86,9 @@ export const POHODA_USAGE_GUIDE = {
     inputs: "receivedInvoice, commitment and cash expense require vatPeriod, short header text, source dates, exact summary buckets and final total; provide roundingAmount when present. Items must be empty. Taxable expenses require classificationVAT from the client's codebook; POHODA's default can incorrectly be PN.",
     sourcePdfs: `PDF imports require sourcePdfPath and non-empty sourcePages. Originals are archived under ${DEFAULT_PDF_ARCHIVE_ROOT} in client/year subfolders and linked through the Documents tab. Archive once and link every document from that PDF. Do not substitute rendered page images for the original. sourceType=manual is only for non-PDF sources. Copy/link failure is not a completed import.`,
     suppliers: "Use lookup_supplier_registry for ARES identity and current VAT evidence. Expense creates resolve and verify supplier links; uncertain identities require review.",
-    nonTax: "Automatically use PN only for a sufficiently confirmed Czech non-payer and a source with no VAT. Missing DIČ alone proves nothing. Foreign/EU documents need an explicit tax-mode decision. PN puts the whole original gross into priceNone and omits dateKHDPH. Registry status is current and does not independently prove status on an older source date.",
-    dates: "Late invoice date/dateTax/dateAccounting/dateKHDPH use vatPeriod day one. PN has no KH. Cash datePayment stays actual.",
-    numbering: "Cash expense Doklad only above CZK 10000 payable. cardPayment commitments use PK suffix N for KN/VS N at or below threshold, otherwise source references.",
+    nonTax: "Automatically use PN only for a sufficiently confirmed Czech non-payer and a source with no VAT. Missing DIČ alone proves nothing. Foreign/EU documents need an explicit tax-mode decision; a foreign country never implies PN. A foreign DIČ with no partnerCountry stays review until the country is taken from the source or a registry; a VAT prefix is not the establishment country and is never used as a guess. PN puts the whole original gross into priceNone and omits dateKHDPH. Registry status is current and does not independently prove status on an older source date.",
+    dates: "Late invoice date/dateTax/dateAccounting/dateKHDPH use vatPeriod day one. PN has no KH. Cash datePayment is the actual source payment date only, never issue/due/DUZP; if missing, the row stays review: re-read the source, pass sourcePaymentDate and prepare a new review (the XLSX has no payment-date column). Received invoices send no datePayment.",
+    numbering: "Cash expense Doklad only above CZK 10000 payable. cardPayment commitments use PK suffix N for KN/VS N at or below threshold, otherwise source references. An explicit source VS must be digits only (e.g. CZ10260279 stays review; never stripped or rewritten). receivedInvoice only: an explicit valid source VS is kept; a missing VS is derived from the supplier document number's ASCII digits with leading zeros (FV-2026/0007 -> 20260007), never from FP/PK numbering. No digits or over 20 digits leaves VS empty with a warning; preview planned.symVar/symVarRule show the import value.",
     foreignCurrency: "Omit currencyRate for POHODA configured rate. Read back applied rate/amount. Do not drop unrepresentable foreign VAT splits or silently change currency.",
     rounding: "Preserve source VAT and rounding exactly. POHODA recomputes rounding from its mode; when no mode reproduces the source payable, flag the row Prověřit, still deliver the preview, and block that row from import until resolved. Summary-only XML cannot preserve foreign VAT buckets or a separate foreign rounding adjustment; these cases are not automatic imports.",
     verification: "Inspect ok, verified, differences, warnings and created IDs. Import acceptance does not prove the source was preserved. POHODA warnings never authorize changing source amounts. Preserve the generated MCP-ID: internal-note line for retry detection. If creation succeeded but verification failed, inspect the record rather than blindly re-import. After an authorized deletion, verify absence and refresh number series before a corrected import.",
@@ -100,7 +109,8 @@ export const POHODA_USAGE_GUIDE = {
       create_stock: "One stock card.",
       manage_stock: "Add/update/delete one stock card with id/extId/code matching.",
       create_order: "One order.",
-      create_bank_document: "One Banka document.",
+      process_bank_statement: "Match a bank-statement PDF, settle matched documents, verify liquidation and mark only verified transactions in a PDF copy.",
+      create_bank_document: "One plain Banka record; does not by itself settle invoices. Use process_bank_statement for statement settlement.",
       create_internal_document: "One Interni doklad.",
       create_stock_receipt: "One Prijemka warehouse receipt.",
       create_stock_issue: "One Vydejka warehouse issue.",

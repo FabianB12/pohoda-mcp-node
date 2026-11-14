@@ -29,7 +29,7 @@ describe("Canonical MCP operator guide", () => {
       // initialize delivers instructions without a separate resource read.
       expect(client.getInstructions()).toBe(POHODA_SERVER_INSTRUCTIONS);
       expect(client.getInstructions()).toContain("Before processing documents, read pohoda://guide");
-      expect(POHODA_SERVER_INSTRUCTIONS.split(/\s+/).length).toBeLessThan(220);
+      expect(POHODA_SERVER_INSTRUCTIONS.split(/\s+/).length).toBeLessThan(260);
 
       const resources = await client.listResources();
       expect(resources.resources.find((r) => r.uri === POHODA_GUIDE_URI)?.description).toContain("Canonical");

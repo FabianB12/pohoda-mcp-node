@@ -250,6 +250,12 @@ writes. The workflow is:
 Duplicate rows are pink, with a short reference in the existing review note. Matching
 fields receive a stronger tint; yellow identifies fields needing correction. Ordinary
 rows have no status text, and the detailed import plan is collapsed by default.
+Předkontace, Členění DPH and read-only computed `Doklad`/`VS v POHODĚ` stay visible;
+the latter show what import writes (e.g. no Doklad for cash ≤ 10 000 Kč, `K` + PK number
+for cards) while `Číslo dokladu dodavatele` keeps the source number. Optional fields that
+are empty and irrelevant to every row are collapsed but remain editable.
+`Datum úhrady` is not shown: a documented payment date passed to preparation is kept and
+used for cash `datePayment`; it is never derived from issue, due or tax dates.
 It checks source PDF/pages, supplier and document reference, and possible matches by
 supplier, exact amount, currency and date when a reference is missing. Matches and
 incomplete checks are marked **Prověřit**; nothing is silently removed. Re-preparing
@@ -265,6 +271,36 @@ are preferred (for example, `Materiál` rather than a list of all materials). Ex
 records inform accounting conventions but never replace source VAT or amounts.
 Direct expense create/batch MCP calls are blocked; the lower-level TypeScript client
 remains available for implementation and controlled integration tests.
+
+### Bank statement settlement
+
+Bank statement PDFs use `process_bank_statement`, separately from the invoice/receipt
+XLSX workflow. Extract the account number/IBAN from the statement header, its currency,
+statement date and month, and each transaction's stable movement number, date, positive
+amount, direction, variable symbol and margin position for a check mark.
+
+- `execute: false` previews matches without accounting writes.
+- `execute: true`, when requested by the user, imports only exact matches and actually
+  settles the target invoices. Unmatched or ambiguous payments are left untouched.
+- The statement's own account must match exactly one account in the selected unit;
+  no default or counterparty account is substituted.
+- Matching tries the variable symbol first, oldest unpaid document first. If that
+  document's remaining amount differs, nothing is done. With no matching symbol,
+  an exact amount is accepted only when there is one eligible same-currency match.
+- Statement numbers are `001`–`012` from the statement month. Original transaction
+  numbers and payment dates are retained.
+- Completion requires both zero invoice balance and its link to the new bank record.
+  Only verified payments get a check in a separate PDF copy; the original stays intact.
+- Retrying recognizes prior marked bank records. An old, unverified bank entry is
+  reported for review and is never silently duplicated.
+
+Automatic bank settlement currently supports CZK. Foreign-currency statements may be
+matched read-only; execution stops before writing because this XML liquidation path
+requires an explicit verified bank exchange rate. It never substitutes rate 1.
+
+Check coordinates are fractions of the displayed PDF crop box from its top-left,
+placed in a blank margin beside the transaction. Supply every movement, including
+unmatched ones, so movement numbers do not shift.
 
 ### Strict expense imports (version 2)
 
@@ -287,6 +323,10 @@ VAT evidence. Expense writes resolve/create contacts, mark suppliers and verify 
 Cash expense `Doklad` is populated only above CZK 10,000 payable after rounding.
 For `cardPayment=true` commitments, the live PK sequence drives `KN`/variable symbol N
 at or below CZK 10,000; above it the source references are used.
+For received invoices only, an explicit variable symbol is kept unchanged; a missing one
+is derived from the supplier document number's ASCII digits, keeping leading zeros
+(`FV-2026/0007` -> `20260007`). A number without digits or with more than 20 digits
+(POHODA `symVarType` limit) leaves the symbol empty with a review warning.
 
 Omit `currencyRate` to let POHODA use its configured rate. There is no fallback of 1.
 Foreign summaries cannot encode every VAT split: unsupported combinations fail clearly

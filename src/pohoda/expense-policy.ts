@@ -4,6 +4,7 @@
  * cash voucher expenses. Everything here runs before any XML transport.
  */
 import { formatMinorUnits, fromMinorUnits, isMoneyInput, MoneyError, toMinorUnits, vatBuckets } from "./money.js";
+import { normalizeDic } from "../registry/czech-registry.js";
 
 export type ExpenseKind = "invoice" | "voucher";
 export type TaxMode = "taxable" | "nonTax";
@@ -174,17 +175,20 @@ export function resolveExpensePolicy(header: Record<string, any>, items: Record<
   }
   if (kind === "voucher") {
     delete result.dateAccounting;
-    const paymentDate = sourcePaymentDate || sourceIssueDate;
-    if (sourcePaymentDate === "") {
-      warnings.push(`datePayment not supplied; using the source receipt date ${sourceIssueDate} as the actual payment date.`);
-    }
-    result.datePayment = paymentDate;
+    // The actual cash payment date is a source fact; it is never taken from the
+    // receipt, due or tax date. A missing date is a review issue (expenseSourceIssues).
+    setOrDelete(result, "datePayment", sourcePaymentDate);
+  }
+  const cash = kind === "voucher" || text(header.paymentType) === "cash";
+  if (cash && !foreign && amounts.payableCzkMinor !== undefined && amounts.payableCzkMinor % 100 !== 0) {
+    warnings.push(`Cash payable ${formatMinorUnits(amounts.payableCzkMinor)} CZK has haléře; CZK cash is normally settled in whole crowns. Verify the payment method and rounding on the source; amounts are kept as the source states.`);
   }
 
   // originalDocument / symVar / payment type rules.
   const payableMinor = amounts.payableCzkMinor;
   const aboveThreshold = payableMinor !== undefined && payableMinor > ORIGINAL_DOCUMENT_THRESHOLD_MINOR;
   let originalDocumentRule: string;
+  let symVarRule = sourceSymVar !== "" ? "source" : "none";
   if (isCard) {
     if (kind !== "invoice" || type !== "commitment") {
       fail("CARD_NOT_COMMITMENT", "cardPayment is supported only for commitment (other liability) documents.", "cardPayment");
@@ -238,6 +242,19 @@ export function resolveExpensePolicy(header: Record<string, any>, items: Record<
     }
     if (sourceSymVar !== "") {
       result.symVar = sourceSymVar;
+      symVarRule = "source";
+    } else if (type === "receivedInvoice") {
+      // Received invoices only: a missing VS comes from the supplier's own document
+      // number (never internal FP/PK numbering), ASCII digits only, leading zeros kept.
+      const derived = deriveSymVarFromDocumentNumber(sourceDocumentNumber);
+      if (derived.symVar !== undefined) {
+        result.symVar = derived.symVar;
+        symVarRule = "derived-from-source-document";
+      } else {
+        delete result.symVar;
+        symVarRule = derived.reason;
+      }
+      if (derived.warning) warnings.push(derived.warning);
     }
     originalDocumentRule = sourceDocumentNumber !== "" ? "source-document" : "none";
   }
@@ -276,6 +293,12 @@ export function resolveExpensePolicy(header: Record<string, any>, items: Record<
     delete result.currencyAmount;
     delete result.currencyPriceSum;
   }
+  const identity = partnerIdentityWarning(header);
+  if (identity) warnings.push(identity);
+  // Source-evidence review issues are checked last so that earlier, more specific
+  // data errors are reported first; prepare_expense_review lists all of them at once.
+  const issue = expenseSourceIssues(header, kind)[0];
+  if (issue) fail(issue.code, issue.message, issue.field, true);
   result._expensePolicy = {
     kind,
     type,
@@ -286,6 +309,7 @@ export function resolveExpensePolicy(header: Record<string, any>, items: Record<
     card: isCard,
     payableCZK: payableMinor === undefined ? undefined : fromMinorUnits(payableMinor),
     originalDocumentRule,
+    symVarRule,
     sourceVatBreakdown: collapsedVat ? sourceVatBreakdown : undefined,
     original: {
       issueDate: sourceIssueDate,
@@ -474,6 +498,96 @@ function requireSourceNumber(value: string, label: string): void {
   if (value === "") {
     fail("SOURCE_DOCUMENT_NUMBER_REQUIRED", `${label} requires the source document number.`, "sourceDocumentNumber", true);
   }
+}
+
+export type ExpenseSourceIssue = { code: string; field: string; message: string };
+
+/**
+ * Source evidence that must be supplied or corrected by a reviewer before any write.
+ * Never guesses a value: no country from a VAT prefix, no digits stripped from an
+ * explicit VS, no cash payment date from the issue/due/tax date. Shared by the
+ * policy (fails on the first) and prepare_expense_review (lists all as notes).
+ */
+export function expenseSourceIssues(header: Record<string, any>, kind: ExpenseKind = "invoice"): ExpenseSourceIssue[] {
+  if (!isExpenseDocument(header, kind)) return [];
+  const applied = header._expensePolicy !== undefined && header._expensePolicy !== null;
+  const issues: ExpenseSourceIssue[] = [];
+  const dic = foreignVatId(header);
+  // An existing address-book contact (partnerId) carries its own country in POHODA.
+  if (dic && text(header.partnerCountry) === "" && !(Number(header.partnerId) > 0)) {
+    issues.push({
+      code: "PARTNER_COUNTRY_REQUIRED",
+      field: "partnerCountry",
+      message: `Supplier DIČ ${dic.normalized} is a foreign VAT registration but partnerCountry is empty. Enter the supplier's country from the source document or a registry; a VAT registration alone does not prove the country of establishment, so it is not guessed.`
+    });
+  }
+  const symVar = firstText(header.sourceSymVar, applied ? "" : header.symVar);
+  if (symVar !== "" && !/^\d+$/.test(symVar)) {
+    issues.push({
+      code: "SYMVAR_INVALID",
+      field: "sourceSymVar",
+      message: `Source VS "${symVar}" is not numeric; a variable symbol has digits only (it may be another identifier such as a DIČ). Enter the digits-only VS printed on the source, or clear it if the source has none; it is never rewritten automatically.`
+    });
+  }
+  if (kind === "voucher" && firstText(header.sourcePaymentDate, applied ? "" : header.datePayment) === "") {
+    issues.push({
+      code: "SOURCE_PAYMENT_DATE_REQUIRED",
+      field: "sourcePaymentDate",
+      message: "Cash expense has no actual payment date from the source. Correct the extracted source data (sourcePaymentDate) and prepare a new review; it is never taken from the issue, due or tax date."
+    });
+  }
+  return issues;
+}
+
+function foreignVatId(header: Record<string, any>) {
+  const parts = normalizeDic(text(header.partnerDic));
+  return parts && parts.vatPrefix !== "CZ" ? parts : undefined;
+}
+
+/** A VAT registration can differ from the establishment country; never blocks or corrects. */
+function partnerIdentityWarning(header: Record<string, any>): string | undefined {
+  const parts = normalizeDic(text(header.partnerDic));
+  const country = text(header.partnerCountry).toUpperCase();
+  if (!parts || !parts.isoCountry || country === "" || parts.isoCountry === country) return undefined;
+  return `Supplier DIČ ${parts.normalized} is a ${parts.isoCountry} VAT registration while partnerCountry is ${country}; kept as stated. Confirm the establishment country and VAT treatment from the source.`;
+}
+
+/** POHODA typ:symVarType is xsd:string maxLength 20 (Stormware type.xsd). */
+export const SYMVAR_MAX_LENGTH = 20;
+/** Czech domestic payment orders carry at most 10 digits of variable symbol. */
+export const BANK_SYMVAR_MAX_LENGTH = 10;
+
+export type DerivedSymVar = {
+  symVar?: string;
+  reason: "derived-from-source-document" | "none" | "missing-no-digits" | "missing-too-long";
+  warning?: string;
+};
+
+/**
+ * Derives a variable symbol from a supplier document number by keeping ASCII digits
+ * only, in order, with leading zeros (FV-2026/0007 -> 20260007). Never truncates or
+ * invents: no digits or more than SYMVAR_MAX_LENGTH digits yields no symbol.
+ */
+export function deriveSymVarFromDocumentNumber(documentNumber: string): DerivedSymVar {
+  const source = text(documentNumber);
+  if (source === "") {
+    return { reason: "none" };
+  }
+  const digits = source.replace(/[^0-9]/g, "");
+  if (digits === "") {
+    return { reason: "missing-no-digits", warning: `No variable symbol on the source and supplier document number "${source}" has no digits; symVar left empty for review.` };
+  }
+  if (digits.length > SYMVAR_MAX_LENGTH) {
+    return { reason: "missing-too-long", warning: `No variable symbol on the source; digits of supplier document number "${source}" (${digits.length}) exceed the POHODA limit of ${SYMVAR_MAX_LENGTH}; symVar left empty for review, not truncated.` };
+  }
+  const derived = `Variable symbol ${digits} derived from supplier document number "${source}" (source has no VS).`;
+  return {
+    symVar: digits,
+    reason: "derived-from-source-document",
+    warning: digits.length > BANK_SYMVAR_MAX_LENGTH
+      ? `${derived} It has ${digits.length} digits; Czech bank payments accept at most ${BANK_SYMVAR_MAX_LENGTH}, so verify before paying.`
+      : derived
+  };
 }
 
 export type SourceNoteFacts = {

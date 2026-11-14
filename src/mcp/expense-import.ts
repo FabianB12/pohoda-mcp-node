@@ -77,7 +77,7 @@ export function isExpenseOperation(op: WriteBatchOperation): op is ExpenseOperat
 
 export function recordsIn(data: Fields): Fields[] {
   if (!data || typeof data !== "object") return [];
-  for (const key of ["invoice", "voucher", "addressbook", "numericalSeries"]) {
+  for (const key of ["invoice", "voucher", "addressbook", "numericalSeries", "bank", "bankAccount"]) {
     if (data[key]) return array(data[key]);
   }
   for (const value of Object.values(data)) {
@@ -131,7 +131,7 @@ export async function lookupSupplierRegistry(registry: CzechRegistryClient | nul
   } catch (error) { return { status: "unavailable", supplier: input, message: text((error as Error).message) }; }
 }
 
-function headerOf(raw: Fields): Fields { return raw.invoiceHeader ?? raw.voucherHeader ?? raw.addressbookHeader ?? raw.numericalSeriesHeader ?? raw; }
+function headerOf(raw: Fields): Fields { return raw.invoiceHeader ?? raw.voucherHeader ?? raw.addressbookHeader ?? raw.numericalSeriesHeader ?? raw.bankHeader ?? raw.bankAccountHeader ?? raw; }
 function identityOf(raw: Fields): Fields { const h = headerOf(raw); return h.partnerIdentity ?? h.identity ?? {}; }
 function addressOf(raw: Fields): Fields { return identityOf(raw).address ?? {}; }
 function summaryOf(raw: Fields): Fields { return raw.invoiceSummary ?? raw.voucherSummary ?? {}; }

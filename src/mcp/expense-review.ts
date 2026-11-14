@@ -13,10 +13,10 @@ import { recordsIn } from "./expense-import.js";
 import type { ReviewAction, ReviewRow, ReviewTool, ReviewWorkbook, ReviewWorkbookRead } from "./review-contract.js";
 import type { ListRecordsBatchRequest, PohodaClient, WriteBatchOperation } from "../pohoda/client.js";
 import type { TransportOptions } from "../pohoda/transport.js";
-import { MAX_TEXT_LENGTH, resolveExpensePolicy } from "../pohoda/expense-policy.js";
+import { expenseSourceIssues, MAX_TEXT_LENGTH, resolveExpensePolicy } from "../pohoda/expense-policy.js";
 import { moneyValue, sumHomeCurrency, toMinorUnits } from "../pohoda/money.js";
 import * as workbookCodec from "./review-workbook.js";
-import { companyKey, decideNonPayerTreatment, normalizeIco } from "../registry/czech-registry.js";
+import { companyKey, decideNonPayerTreatment, normalizeDic, normalizeIco } from "../registry/czech-registry.js";
 import { checkPreviewDuplicates, duplicateReviewNote } from "./expense-duplicates.js";
 
 type Fields = Record<string, any>;
@@ -162,6 +162,12 @@ export class ExpenseReviewService {
           const filled: string[] = [];
           for (const [field, value] of Object.entries({ partnerName: s.name, partnerIco: s.ico, partnerDic: s.dic, partnerStreet: s.street, partnerCity: s.city, partnerZip: s.zip, partnerCountry: s.country })) if (empty(h[field]) && !empty(value)) { h[field] = value; filled.push(field); }
           h._registryFilled = filled;
+          // A registry country found by IČO can disagree with a foreign VAT id on the
+          // source (e.g. a non-Czech IČO). Neither is assumed correct; the reviewer decides.
+          const vatId = normalizeDic(text(h.partnerDic));
+          if (filled.includes("partnerCountry") && vatId?.isoCountry && vatId.vatPrefix !== "CZ" && vatId.isoCountry !== text(h.partnerCountry).toUpperCase()) {
+            draft.blocking = true; draft.notes.push(`Registry country ${h.partnerCountry} (by IČO) differs from the ${vatId.isoCountry} VAT id ${vatId.normalized}; confirm the supplier's country and IČO from the source.`);
+          }
           h._registryEvidence = { vat: lookup.vat, fetchedAt: lookup.fetchedAt };
           if (!h.taxMode || h.taxMode === "auto") {
             const hasVat = [h.priceLowVAT, h.priceHighVAT, h.price3VAT].some((v) => v !== undefined && Number(v) !== 0);
@@ -220,8 +226,11 @@ export class ExpenseReviewService {
       if (draft.tool === "create_cash_voucher" && empty(data.cashAccount)) { blocking = true; notes.push("cashAccount is required for a cash expense."); }
       const textLength = text(data.text).length;
       if (textLength > PREFERRED_TEXT_LENGTH && textLength <= MAX_TEXT_LENGTH) notes.push(`Text has ${textLength} characters; prefer a brief description up to ${PREFERRED_TEXT_LENGTH} (e.g. "Materiál").`);
+      // List every missing/invalid source fact at once; the policy itself stops at the first.
+      const issues = expenseSourceIssues(toolHeader(draft.tool, data), draft.tool === "create_cash_voucher" ? "voucher" : "invoice");
+      for (const issue of issues) { blocking = true; notes.push(`Needs data: ${issue.code}: ${issue.message}`); }
       const check = preflight(draft.tool, data);
-      if (!check.ok) { blocking = true; notes.push(`Needs data: ${check.error}`); }
+      if (!check.ok && !issues.some((issue) => check.error?.startsWith(`${issue.code}:`))) { blocking = true; notes.push(`Needs data: ${check.error}`); }
       if (data.sourcePdfPath && !(await fileExists(text(data.sourcePdfPath)))) { blocking = true; notes.push(`Source PDF not found: ${data.sourcePdfPath}`); }
       const reviewNotes = [draft.callerNotes, ...notes].filter(Boolean).join("\n");
       rows.push({ rowId: draft.rowId, tool: draft.tool, data, action: blocking ? "review" : "import", reviewNotes, duplicateCheck: duplicates });
@@ -599,7 +608,10 @@ function preflight(tool: ReviewTool, data: Fields): { ok: boolean; error?: strin
       priceNone: resolved.priceNone, sourceVatBreakdown: policy.sourceVatBreakdown,
       originalDocument: cardNumbered ? "assigned from the next PK number at import" : resolved.originalDocument,
       symVar: cardNumbered ? "assigned from the next PK number at import" : resolved.symVar,
-      originalDocumentRule: policy.originalDocumentRule
+      originalDocumentRule: policy.originalDocumentRule,
+      // Distinguishes a VS copied from the source from one derived by policy, so a
+      // derived value is never presented as a source fact.
+      symVarRule: cardNumbered ? undefined : policy.symVarRule
     };
     return { ok: true, preview: { sourceFacts, planned: Object.fromEntries(Object.entries(planned).filter(([, v]) => v !== undefined && v !== "")), warnings: policy.warnings ?? [] } };
   } catch (error) {

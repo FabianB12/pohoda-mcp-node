@@ -40,7 +40,37 @@ incomplete/failed paging, refresh without losing workbook edits, and a 500-row b
 using one shared POHODA read. Duplicate results use coloured rows and short review notes, without a separate status column, and are
 never imported as accounting fields. An all-duplicate 88-document batch also produces the full editable workbook, keeps
 source discrepancies and returns `nextAction: deliver_workbook`, including on reuse.
-The current offline suite passes 263 tests.
+After the preview-layout and source-evidence checks, the full offline suite passes 349 tests. The re-saved client XLSX also opens through the compatibility loader without modifying its source file.
+
+## Bank statement settlement
+
+The final `bankfinal001` live run on the same isolated demo passed all four tests
+(three CZK workflow checks plus the foreign-currency fail-before-write check):
+
+- A statement identifies the second bank account (`TSB2`, ID 3) instead of the default KB account.
+- January exports as statement number `001`, with source movement numbers unchanged.
+- Two equal variable symbols settle the older invoice first; unique exact-amount matching also works.
+- Only three exact matches create bank records. One wrong-amount transaction and one unmatched transaction stay untouched.
+- The invoice's remaining balance becomes zero, with an exported liquidation link to the corresponding bank ID.
+- The output PDF has checks only for those three verified payments, and the original bytes stay unchanged.
+- Repeating the same input adds no bank entries.
+
+Evidence: `tests/output/bankfinal001.json` and `tests/output/bankfinal001/`. Its new
+source invoice IDs are 47, 48, 49, 50; created bank IDs are 16, 18, 20. They are all
+`MCPTEST` fixtures, not client accounting data. `tests/pohoda-bank.integration.test.ts`
+reproduces the checks with explicit demo and write gates.
+
+A separate EUR experiment (`bankeur001`) found a real XML limitation: omitting the
+bank exchange rate produces error 130, “Zadejte kurz cizí měny”, even when the unit
+has a configured EUR rate. No EUR bank record was created; test invoice 46 remains
+unpaid. Therefore non-CZK **execution is blocked before any write** until a verified
+bank-rate path is implemented; read-only matching remains available. This differs
+from ordinary foreign-currency invoice import. The account builder also now uses
+the schema's `daily`/`fixed` rate mode instead of an invalid numeric value.
+
+Official schema references: [bank liquidation items](https://www.stormware.cz/schema/version_2/bank.xsd),
+[invoice liquidation state](https://www.stormware.cz/schema/version_2/invoice.xsd),
+and [bank account rate modes](https://www.stormware.cz/schema/version_2/bankAccount.xsd).
 
 ## Deployment requirements and limits
 

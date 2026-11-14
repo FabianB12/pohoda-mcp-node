@@ -1,3 +1,4 @@
+import { buildBankLiquidationDetail, statementMonthNumber } from './bank-settlement.js';
 import { buildPdfAttachment } from "./pdf-archive.js";
 import { agendaConfig } from "./constants.js";
 import { isExpenseDocument, isForeignCurrency, resolveExpensePolicy } from "./expense-policy.js";
@@ -529,6 +530,11 @@ function buildGenericDocumentData(config: DocumentConfig, header: Record<string,
       [`${prefix}:${config.itemName}`]: buildGenericItem(config, item, String(header.currency ?? "").trim())
     }));
   }
+  if (prefix === "bnk" && header.liquidations?.length) {
+    if (items.length) throw new Error("Liquidation bank records cannot also contain ordinary items.");
+    if (!String(header.account || header.bankAccount || "").trim()) throw new Error("Liquidation requires an explicit bank account.");
+    data["bnk:bankDetail"] = buildBankLiquidationDetail(header.liquidations, header.currency || "CZK");
+  }
   if (config.summaryName) {
     const summary = buildDocumentSummary(prefix, header);
     if (Object.keys(summary).length > 0) {
@@ -559,7 +565,7 @@ function buildGenericHeader(config: DocumentConfig, header: Record<string, any>)
     [`${prefix}:extId`]: buildExtId(header),
     ...(config.typeField ? { [`${prefix}:${config.typeField}`]: documentType } : {}),
     [`${prefix}:storno`]: header.storno,
-    [`${prefix}:account`]: ref(header.account ?? header.bankAccount ?? header.accountIds ?? ""),
+    [`${prefix}:account`]: ref(header.account || header.bankAccount || header.accountIds || ""),
     [`${prefix}:cashAccount`]: ref(header.cashAccount ?? ""),
     [`${prefix}:number`]: buildDocumentNumber(prefix, header.number),
     [`${prefix}:statementNumber`]: buildBankStatementNumber(header),
@@ -798,7 +804,7 @@ function buildDocumentNumber(prefix: string, value: unknown): XmlObject | string
 }
 
 function buildBankStatementNumber(header: Record<string, any>): XmlObject | undefined {
-  const statementNumber = String(header.statementNumber ?? "").trim();
+  const statementNumber = header.statementPeriod ? statementMonthNumber(header.statementPeriod) : String(header.statementNumber ?? "").trim();
   const numberMovement = String(header.numberMovement ?? "").trim();
   if (statementNumber === "" && numberMovement === "") {
     return undefined;
@@ -951,6 +957,7 @@ function buildBankAccountData(action: "add", data: Record<string, any>, match: R
     result["bka:actionType"] = { "bka:add": addFilter };
   }
   requireFields(data, ["ids", "numberAccount", "codeBank"], "manage_bank_account add");
+  if (data.currency && data.rateType && !["daily", "fixed"].includes(data.rateType)) throw new Error("Bank account rateType must be daily or fixed.");
   result["bka:bankAccountHeader"] = filterEmpty({
     "bka:id": Number(data.id ?? 0) > 0 ? Number(data.id) : undefined,
     "bka:extId": buildExtId(data),
@@ -962,7 +969,7 @@ function buildBankAccountData(action: "add", data: Record<string, any>, match: R
     "bka:IBAN": data.IBAN,
     "bka:SWIFT": data.SWIFT,
     "bka:analyticAccount": ref(data.analyticAccount ?? ""),
-    "bka:currencyBankAccount": data.currency ? { "bka:currency": ref(data.currency), "bka:rate": Number(data.currencyRate ?? 0) || 1 } : undefined,
+    "bka:currencyBankAccount": data.currency ? { "bka:currency": ref(data.currency), "bka:rate": data.rateType ?? "daily" } : undefined,
     "bka:cancelled": data.cancelled,
     "bka:homebanking": data.homebanking,
     "bka:payTerminal": data.payTerminal,
