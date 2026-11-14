@@ -51,6 +51,12 @@ describe("Canonical MCP operator guide", () => {
       expect(guide.defaultExpenseWorkflow.import).toContain("expectedWorkbookSha256");
       expect(guide.sourceExtraction.uncertainty).toContain("Never invent");
       expect(guide.expensePolicy.verification).toContain("MCP-ID:");
+      expect(client.getInstructions()).toContain("even if every document is already in POHODA");
+      expect(guide.defaultExpenseWorkflow.completion).toContain("chat summary");
+      expect(guide.defaultExpenseWorkflow.completion).toContain("Include every extracted source document");
+      expect(guide.defaultExpenseWorkflow.stopping).toContain("flag the affected row and continue creating the workbook");
+      expect(guide.defaultExpenseWorkflow.stopping).toContain("explicit user stop");
+      expect(tools.tools.find((tool) => tool.name === "prepare_expense_review")?.description).toContain("even if all documents already exist");
     } finally {
       await client.close();
       await rm(dir, { recursive: true, force: true });

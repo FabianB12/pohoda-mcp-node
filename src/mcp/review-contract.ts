@@ -1,3 +1,5 @@
+import type { PreviewDuplicateCheck } from "./expense-duplicates.js";
+
 export type ReviewTool = "create_invoice" | "create_other_liability" | "create_cash_voucher";
 export type ReviewAction = "import" | "review" | "skip";
 export type ReviewRow = {
@@ -6,6 +8,7 @@ export type ReviewRow = {
   data: Record<string, any>;
   action: ReviewAction;
   reviewNotes: string;
+  duplicateCheck?: PreviewDuplicateCheck;
 };
 export type ReviewWorkbook = {
   reviewId: string;

@@ -21,6 +21,7 @@ import { dirname, join } from "node:path";
 import ExcelJS from "exceljs";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { ExpenseImporter, recordsIn, retryMarkersIn } from "../src/mcp/expense-import.js";
+import { checkPreviewDuplicates } from "../src/mcp/expense-duplicates.js";
 import { ExpenseReviewService } from "../src/mcp/expense-review.js";
 import { REVIEW_COLUMNS } from "../src/mcp/review-workbook.js";
 import { PohodaClient } from "../src/pohoda/client.js";
@@ -269,6 +270,24 @@ run("POHODA production expense import (Parallels demo unit)", () => {
     expect(archive.archived).toHaveLength(0);
     const requests = transport.results.slice(before).map((r) => r.request);
     expect(requests.every((xml) => !/<(inv:invoice |adb:addressbook |vch:voucher )/.test(xml))).toBe(true);
+  }, 600_000);
+
+  it("finds an already posted document during preview without writing (read-only)", async () => {
+    const listed = await client.listRecordsBatch([{ agenda: "invoice", subType: "receivedInvoice", filter: {}, options: { count: 2000 } }], "", target);
+    expect(listed.isOk()).toBe(true);
+    const existing = recordsIn(listed.items[0]!.data).find((row) => headerOf(row).originalDocument && headerOf(row).partnerIdentity?.id);
+    expect(existing).toBeDefined();
+    const header = headerOf(existing!);
+    const before = transport.results.length;
+    const checked = await checkPreviewDuplicates(client, [{ rowId: "existing", tool: "create_invoice", data: {
+      type: "receivedInvoice", sourceType: "manual", partnerId: Number(header.partnerIdentity.id),
+      sourceDocumentNumber: header.originalDocument, sourceIssueDate: header.date
+    } }], target);
+    expect(checked.complete).toBe(true);
+    expect(checked.byRow.existing!.matches).toEqual(expect.arrayContaining([expect.objectContaining({ location: "pohoda", id: String(header.id), reason: "reference" })]));
+    expect(transport.results.length - before).toBe(1); // three agendas share one XML run
+    expect(transport.results.slice(before).every((r) => !/<(inv:invoice |adb:addressbook |vch:voucher )/.test(r.request))).toBe(true);
+    record("preview-duplicate", checked.byRow.existing);
   }, 600_000);
 
   describe.sequential("MCPTEST writes (verified demo unit only)", () => {

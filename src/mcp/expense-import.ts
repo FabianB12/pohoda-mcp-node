@@ -412,20 +412,9 @@ export class ExpenseImporter {
       const sourceKey = op.header.sourceDocumentNumber || (!op.header.cardPayment ? op.header.originalDocument : "") || (op.header.sourcePdfSha256 ? `pdf:${op.header.sourcePdfSha256}:${JSON.stringify(op.header.sourcePages)}` : "");
       if (!sourceKey && !op.header.extId) throw new Error("A source document number, explicit external ID, or archived PDF/page identity is required for safe expense retries.");
       const plan = contacts.get(op.header._contactKey)!;
-      const identities = [...new Set([
-        op.header.partnerIco ? `ico:${op.header.partnerIco}` : "",
-        op.header.partnerDic ? `dic:${normalizeDic(op.header.partnerDic)?.normalized || op.header.partnerDic}` : "",
-        plan.id ? `id:${plan.id}` : ""
-      ].filter(Boolean))];
-      const hash = (identity: string, key = sourceKey) => createHash("sha256").update(JSON.stringify([identity, op.header.type, key])).digest("hex").slice(0, 32);
-      if (op.header.extId) op.header._externalIdCandidates = [op.header.extId];
-      else {
-        const primary = op.header.sourcePdfSha256
-          ? hash("pdf", `${op.header.sourcePdfSha256}:${op.header.sourcePages.join(",")}`)
-          : hash(identities[0]!);
-        op.header.extId = primary;
-        op.header._externalIdCandidates = [...new Set([primary, ...identities.map((identity) => hash(identity))])];
-      }
+      const identity = expenseIdentityCandidates(op.header, plan.id);
+      op.header.extId = identity.extId;
+      op.header._externalIdCandidates = identity.candidates;
       op.header.extSystemName ||= "pohoda-mcp-expenses";
       // Validate early: every candidate must form a verifiable marker.
       for (const candidate of op.header._externalIdCandidates as string[]) retryMarker(op.header.extSystemName, candidate);
@@ -616,25 +605,65 @@ export class ExpenseImporter {
    * count limit simply returns a superset, which is still matched locally.
    */
   private async scanAgenda(agenda: string, subType: string, window: { dateFrom: string; dateTill: string }, target: TransportOptions): Promise<Fields[]> {
-    const rows: Fields[] = [], seen = new Set<number>();
-    const label = subType ? `${agenda}/${subType}` : agenda;
-    let idFrom = 0;
-    for (let page = 0; ; page++) {
-      if (page >= RETRY_SCAN_MAX_PAGES) throw new Error(`Duplicate scan of ${label} exceeded ${RETRY_SCAN_MAX_PAGES * RETRY_SCAN_PAGE_SIZE} records; cannot prove the documents are absent. No records were created.`);
-      const response = await this.client.listRecordsBatch([{ agenda, subType, filter: window, options: { count: RETRY_SCAN_PAGE_SIZE, ...(idFrom ? { idFrom } : {}), restrictions: { "lst:attachments": true } } }], "", target);
-      if (!response.isOk() || response.items.length !== 1) throw new Error(`Duplicate scan of ${label} failed; no records were created.`);
-      const pageRows = recordsIn(response.items[0]!.data);
-      let previous = 0, ascending = true;
-      for (const row of pageRows) {
-        const id = Number(headerOf(row).id);
-        if (!Number.isInteger(id) || id <= 0) throw new Error(`Duplicate scan of ${label} returned a record without a numeric ID; no records were created.`);
-        if (seen.has(id) || (idFrom && id < idFrom)) throw new Error(`POHODA ignored idFrom paging while scanning ${label}; cannot prove the documents are absent. No records were created.`);
-        if (id <= previous) ascending = false;
-        previous = id; seen.add(id); rows.push(row);
-      }
-      if (pageRows.length < RETRY_SCAN_PAGE_SIZE) return rows;
-      if (!ascending) throw new Error(`POHODA returned an unordered full page while scanning ${label}; cannot page safely. No records were created.`);
-      idFrom = previous + 1;
-    }
+    return (await scanExpenseAgendas(this.client, [{ agenda, subType }], window, target, true)).get(`${agenda}|${subType}`)!;
   }
+}
+
+
+/** Stable identity shared by preview duplicate checks and the actual importer. */
+export function expenseIdentityCandidates(header: Fields, partnerId?: number): { extId: string; candidates: string[] } {
+  const sourceKey = header.sourceDocumentNumber || (!header.cardPayment ? header.originalDocument : "")
+    || (header.sourcePdfSha256 ? `pdf:${header.sourcePdfSha256}:${JSON.stringify(header.sourcePages)}` : "");
+  if (header.extId) return { extId: text(header.extId), candidates: [text(header.extId)] };
+  const identities = [...new Set([
+    header.partnerIco ? `ico:${header.partnerIco}` : "",
+    header.partnerDic ? `dic:${normalizeDic(header.partnerDic)?.normalized || header.partnerDic}` : "",
+    Number(partnerId ?? header.partnerId) > 0 ? `id:${partnerId ?? header.partnerId}` : ""
+  ].filter(Boolean))];
+  const hash = (identity: string, key = sourceKey) => createHash("sha256").update(JSON.stringify([identity, header.type, key])).digest("hex").slice(0, 32);
+  const primary = header.sourcePdfSha256 ? hash("pdf", `${header.sourcePdfSha256}:${header.sourcePages.join(",")}`) : hash(identities[0] ?? "");
+  return { extId: primary, candidates: [...new Set([primary, ...identities.map((identity) => hash(identity))])] };
+}
+
+/** Complete paged scan; all active agendas share a single XML read per page round. */
+export async function scanExpenseAgendas(
+  client: Pick<PohodaClient, "listRecordsBatch">,
+  groups: Array<{ agenda: string; subType: string }>,
+  filter: Fields,
+  target: TransportOptions,
+  attachments = false,
+  pageSize = RETRY_SCAN_PAGE_SIZE
+): Promise<Map<string, Fields[]>> {
+  if (!Number.isInteger(pageSize) || pageSize < 1 || pageSize > 5_000) throw new Error("Invalid duplicate scan page size.");
+  const states = [...new Map(groups.map((group) => [`${group.agenda}|${group.subType}`, {
+    ...group, key: `${group.agenda}|${group.subType}`, rows: [] as Fields[], seen: new Set<number>(), idFrom: 0, pages: 0, done: false
+  }])).values()];
+  while (states.some((state) => !state.done)) {
+    const active = states.filter((state) => !state.done);
+    for (const state of active) if (state.pages >= RETRY_SCAN_MAX_PAGES) throw new Error(`Duplicate scan of ${state.key} exceeded its limit; cannot prove absence.`);
+    const response = await client.listRecordsBatch(active.map((state) => ({
+      agenda: state.agenda, subType: state.subType, filter,
+      options: { count: pageSize, ...(state.idFrom ? { idFrom: state.idFrom } : {}), ...(attachments ? { restrictions: { "lst:attachments": true } } : {}) }
+    })), "", target);
+    if (!response.isOk() || response.items.length !== active.length) throw new Error("Duplicate scan failed or returned incomplete results; cannot prove absence.");
+    active.forEach((state, index) => {
+      const item = response.items[index]!;
+      if (item.state && item.state !== "ok") throw new Error(`Duplicate scan of ${state.key} failed; cannot prove absence.`);
+      const page = recordsIn(item.data);
+      let last = 0, ascending = true;
+      for (const row of page) {
+        const id = Number(headerOf(row).id);
+        if (!Number.isSafeInteger(id) || id <= 0) throw new Error(`Duplicate scan of ${state.key} returned a record without a numeric ID.`);
+        if (state.seen.has(id) || (state.idFrom && id < state.idFrom)) throw new Error(`POHODA ignored idFrom paging while scanning ${state.key}; cannot prove absence.`);
+        if (id <= last) ascending = false;
+        last = id; state.seen.add(id); state.rows.push(row);
+      }
+      state.pages++;
+      if (state.rows.length > RETRY_SCAN_PAGE_SIZE * RETRY_SCAN_MAX_PAGES) throw new Error(`Duplicate scan of ${state.key} exceeded its record limit.`);
+      state.done = page.length < pageSize;
+      if (!state.done && !ascending) throw new Error(`POHODA returned an unordered full page while scanning ${state.key}; cannot page safely.`);
+      state.idFrom = last + 1;
+    });
+  }
+  return new Map(states.map((state) => [state.key, state.rows]));
 }

@@ -19,6 +19,14 @@ class FakeCodec implements ReviewWorkbookCodec {
     this.written.push(structuredClone(input));
     await writeFile(filePath, JSON.stringify(input));
   }
+  async updateReviewDuplicateChecks(filePath: string, checks: Record<string, any>) {
+    const workbook = JSON.parse(await readFile(filePath, "utf8"));
+    for (const row of workbook.rows) {
+      row.duplicateCheck = checks[row.rowId];
+      if (row.action === "import" && row.duplicateCheck?.status !== "clear") row.action = "review";
+    }
+    await writeFile(filePath, JSON.stringify(workbook));
+  }
   async readReviewWorkbook(filePath: string): Promise<ReviewWorkbookRead> {
     const { reviewId, databaseId, vatPeriod, rows } = JSON.parse(await readFile(filePath, "utf8"));
     return { reviewId, databaseId, vatPeriod, rows };
@@ -33,7 +41,13 @@ class FakeClient {
   async listRecordsBatch(requests: any[], _pack: string, options: any) {
     this.events.push("list");
     this.calls.push({ requests, options });
-    return ok(requests.map((r) => item({ invoice: this.history.filter((h) => r.filter.ico ? h.invoiceHeader.partnerIdentity.address.ico === r.filter.ico : false) })));
+    return ok(requests.map((r) => {
+      const key = r.agenda === "voucher" ? "voucher" : "invoice";
+      let records = this.history.filter((h) => key === "voucher" ? !!h.voucherHeader : !!h.invoiceHeader && h.invoiceHeader.invoiceType === r.subType);
+      if (r.filter.ico) records = records.filter((h) => (h.invoiceHeader ?? h.voucherHeader).partnerIdentity.address.ico === r.filter.ico);
+      if (r.options?.idFrom) records = records.filter((h) => Number((h.invoiceHeader ?? h.voucherHeader).id) >= r.options.idFrom);
+      return item({ [key]: records.slice(0, r.options?.count ?? records.length) });
+    }));
   }
   async writeBatch() { this.writes++; throw new Error("no writes allowed in tests"); }
 }
@@ -75,17 +89,21 @@ describe("ExpenseReviewService.prepare", () => {
     expect(events).toEqual(["list", "writeWorkbook"]);
     expect(importer.runs).toHaveLength(0);
     expect(client.writes).toBe(0);
-    // Same supplier/agenda/type: one deduplicated query, bounded by dates and count, on the explicit unit.
+    // One batched snapshot for duplicates and history, on the explicit unit.
     expect(client.calls).toHaveLength(1);
     expect(client.calls[0].options).toEqual(TARGET);
-    expect(client.calls[0].requests).toEqual([{ agenda: "invoice", subType: "receivedInvoice", filter: { ico: "25596641", dateFrom: "2025-11-01", dateTill: "2026-11-30" }, options: { count: 50 } }]);
+    expect(client.calls[0].requests).toEqual([
+      { agenda: "invoice", subType: "receivedInvoice", filter: {}, options: { count: 2000 } },
+      { agenda: "invoice", subType: "commitment", filter: {}, options: { count: 2000 } },
+      { agenda: "voucher", subType: "", filter: {}, options: { count: 2000 } }
+    ]);
     expect(out.status).toBe("readyForReview");
     expect(out.reviewId).toMatch(/^rv-[0-9a-f]{16}$/);
     const wb = codec.written[0]!;
     expect(wb.examples.map((e) => e.id)).toEqual(["4", "3"]);
     expect(wb.examples[0]).toMatchObject({ number: "FP264", text: "Materiál", accounting: "501/321", classificationVAT: "PD", paymentType: "draft", total: 121, rowIds: "A, B" });
     expect(wb.rows[0]).toMatchObject({ rowId: "A", action: "import", data: { accounting: "501/321", total: "1210.00", vatPeriod: "2026-11", sourceType: "pdf" } });
-    expect(wb.rows[0]!.reviewNotes).toContain("suggested from POHODA history (#4, #3)");
+    expect(wb.rows[0]!.reviewNotes).toBe("");
     const manifest = JSON.parse(await readFile(join(dir, "reviews", out.reviewId, "manifest.json"), "utf8"));
     expect(manifest).toMatchObject({ databaseId: DB, target: TARGET, vatPeriod: "2026-11", sourcePdfPaths: [pdfA, pdfB], imports: [] });
     expect(manifest.sources.A.suggestions).toEqual([{ field: "accounting", value: "501/321", fromIds: ["4", "3"], rule: "unanimous same-supplier POHODA history" }]);
@@ -100,7 +118,7 @@ describe("ExpenseReviewService.prepare", () => {
     expect(out.status).toBe("requiresReview");
     const [dup, nohist] = codec.written[0]!.rows;
     expect(dup!.action).toBe("review");
-    expect(dup!.reviewNotes).toContain("Possible duplicate: POHODA #3");
+    expect(dup!.reviewNotes).toContain("Duplicita: FP263 (#3)");
     expect(nohist!.action).toBe("review");
     expect(nohist!.data.total).toBe("999");
     expect(nohist!.reviewNotes).toContain("prefer a brief description");
@@ -123,7 +141,7 @@ describe("ExpenseReviewService.prepare", () => {
       }
     });
     const source = { taxMode: "auto", classificationVAT: "", sourceChargesVat: false, partnerCountry: "CZ", priceHigh: undefined, priceHighVAT: undefined, priceNone: 121, total: 121 };
-    const out = await enriched.prepare({ databaseId: DB, vatPeriod: "2026-11", target: TARGET, documents: [doc({ ...source, requestId: "A" }), doc({ ...source, requestId: "B", sourceDocumentNumber: "OTHER" })] });
+    const out = await enriched.prepare({ databaseId: DB, vatPeriod: "2026-11", target: TARGET, documents: [doc({ ...source, requestId: "A" }), doc({ ...source, requestId: "B", sourcePdfPath: pdfB, sourceDocumentNumber: "OTHER" })] });
     expect(lookups).toBe(1);
     expect(out.status).toBe("readyForReview");
     expect(codec.written[0]!.rows[0]!.data).toMatchObject({ partnerDic: "CZ25596641", partnerVatStatus: "non-payer" });
@@ -226,7 +244,7 @@ describe("ExpenseReviewService inspect/import", () => {
   });
 
   it("fails before any import while a non-skipped row is still marked review", async () => {
-    const out = await service.prepare({ databaseId: DB, vatPeriod: "2026-11", target: TARGET, documents: [doc({ requestId: "A" }), { ...doc({ sourceDocumentNumber: "FV-2", total: "1" }), requestId: "B" }] });
+    const out = await service.prepare({ databaseId: DB, vatPeriod: "2026-11", target: TARGET, documents: [doc({ requestId: "A" }), { ...doc({ sourceDocumentNumber: "FV-2", sourcePdfPath: pdfB, total: "1" }), requestId: "B" }] });
     await expect(service.importReviewed({ reviewId: out.reviewId, approved: true, target: TARGET, databaseId: DB })).rejects.toThrow(/Rows still marked review: B/);
     expect((await service.inspect({ reviewId: out.reviewId })).status).toBe("requiresReview");
     await edit(out.workbookPath, (wb) => { wb.rows[1].action = "skip"; });

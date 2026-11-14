@@ -26,6 +26,22 @@ The run's detailed local evidence is in `tests/output/production-p4root.json` an
 `tests/output/production-p4root/` (ignored by Git). The test entry point is
 `tests/pohoda-production.integration.test.ts`.
 
+## Preview duplicate checks
+
+A subsequent read-only demo run (`duppreview`, 14 November 2026) passed all three
+checks: list paging, preview preparation without accounting writes, and detection of
+an already posted invoice by supplier ID and source reference. The duplicate snapshot
+read all three expense agendas in one XML request. Evidence is in
+`tests/output/duplicate-preview.json` (ignored by Git).
+
+Offline coverage includes older entries outside recent examples, renamed source PDFs,
+reference-less receipts and internal K references, duplicate rows within a batch,
+incomplete/failed paging, refresh without losing workbook edits, and a 500-row batch
+using one shared POHODA read. Duplicate results use coloured rows and short review notes, without a separate status column, and are
+never imported as accounting fields. An all-duplicate 88-document batch also produces the full editable workbook, keeps
+source discrepancies and returns `nextAction: deliver_workbook`, including on reuse.
+The current offline suite passes 263 tests.
+
 ## Deployment requirements and limits
 
 - Enable **Používat složku dokumentů firmy** in the target POHODA unit.

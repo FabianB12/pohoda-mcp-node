@@ -25,6 +25,7 @@ export function syntheticReview(): ReviewWorkbook {
     rows: [
       {
         rowId: "r001",
+        duplicateCheck: { status: "clear", checkedAt: "2026-03-20T10:00:00Z", message: "Bez nalezené shody v POHODĚ a této dávce.", matches: [], matchCount: 0 },
         tool: "create_invoice",
         action: "import",
         reviewNotes: "",
@@ -54,6 +55,7 @@ export function syntheticReview(): ReviewWorkbook {
       },
       {
         rowId: "r002",
+        duplicateCheck: { status: "possible", checkedAt: "2026-03-20T10:00:00Z", message: "Možná duplicita: POHODA commitment #72 (PK26007) — stejný dodavatel a číslo dokladu, 250.00 CZK.", matches: [{ location: "pohoda", reason: "reference", agenda: "invoice", type: "commitment", id: "72", number: "PK26007", date: "2026-03-05", total: 250, currency: "CZK" }], matchCount: 1 },
         tool: "create_other_liability",
         action: "review",
         reviewNotes: "Ověřit, zda jde o platbu kartou",
@@ -180,7 +182,7 @@ describe("review workbook round trip", () => {
       partnerId: null,
       currencyRate: null
     });
-    expect(second!.reviewNotes).toBe("Ověřit, zda jde o platbu kartou");
+    expect(second!.reviewNotes).toBe("Duplicita: PK26007 (#72).\nOvěřit, zda jde o platbu kartou");
     expect(second!.data).toMatchObject({ taxMode: "nonTax", cardPayment: true, sourceChargesVat: false, priceNone: 250, total: 250, sourcePages: [3] });
     expect(third!.reviewNotes).toBe("=nejde o vzorec");
     expect(third!.data.text).toBe("=SUM(A1:A2) jen text");
@@ -227,6 +229,23 @@ describe("review workbook round trip", () => {
     const metaKeys: string[] = [];
     meta.eachRow((row) => metaKeys.push(String(row.getCell(1).value)));
     expect(metaKeys).toEqual(["format", "schemaVersion", "reviewId", "databaseId", "vatPeriod", "generatedAt", "notice"]);
+  });
+
+  it("keeps ordinary rows quiet and highlights duplicates and invalid amounts without another status column", async () => {
+    const input = syntheticReview();
+    input.rows.push({ ...input.rows[0]!, rowId: "bad-total", duplicateCheck: undefined, action: "review", data: { ...input.rows[0]!.data, total: 1 }, reviewNotes: "Ověřit součet." });
+    const wb = new ExcelJS.Workbook(); await wb.xlsx.readFile(await written(input));
+    const sheet = wb.getWorksheet(REVIEW_SHEET_NAME)!;
+    const color = (row: number, key: string) => (sheet.getCell(row, colOf(key)).fill as ExcelJS.FillPattern).fgColor?.argb;
+    expect(REVIEW_COLUMNS.some((c) => c.key === "duplicateCheck")).toBe(false);
+    expect(sheet.getCell(3, colOf("reviewNotes")).value).toBeNull();
+    expect(color(3, "total")).toBe("FFFFFFFF");
+    expect(color(4, "text")).toBe("FFFFF1F2");
+    expect(color(4, "sourceDocumentNumber")).toBe("FFFFCDD2");
+    expect(sheet.getCell(4, colOf("reviewNotes")).text).not.toContain("2026-03-20");
+    expect(color(5, "total")).toBe("FFF1F5F9");
+    expect(color(6, "total")).toBe("FFFEF3C7");
+    expect(sheet.getColumn(colOf("plannedImport")).hidden).toBe(true);
   });
 
   it("shows planned late-date and PN transformations in a read-only column that is never imported", async () => {

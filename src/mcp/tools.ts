@@ -717,7 +717,7 @@ export function registerPohodaTools(server: McpServer, context: PohodaServerCont
   }, async (input) => structuredResult(await lookupSupplierRegistry(registryClient, input)));
   server.registerTool("prepare_expense_review", {
     title: "Prepare an Excel expense preview for user review",
-    description: "Default first step after extracting client PDFs. Reads similar existing POHODA documents, then creates an editable XLSX preview; NEVER creates or changes POHODA records. Use short Czech descriptions (e.g. Materiál), and put uncertainty in reviewNotes. Wait for the user to review/edit and explicitly request import.",
+    description: "Required next step after extracting client PDFs, even if all documents already exist in POHODA. Deliver the returned workbookPath as a file link; a summary of findings alone is not completion. Checks POHODA and this batch for duplicates, reuses the batched results for similar-document examples, then creates an editable XLSX preview with coloured duplicate rows and short review notes; NEVER creates or changes POHODA records. Use short Czech descriptions (e.g. Materiál), and put uncertainty in reviewNotes. Wait for the user to review/edit and explicitly request import.",
     inputSchema: {
       databaseId: databaseIdSchema,
       vatPeriod: z.string().regex(/^\d{4}-(0[1-9]|1[0-2])$/),
@@ -747,7 +747,7 @@ export function registerPohodaTools(server: McpServer, context: PohodaServerCont
 
   server.registerTool("prepare_scanned_pdf", {
     title: "Render a scanned PDF into page images",
-    description: "Renders PDF pages into separate compact JPEG or lossless PNG files with bounded parallelism and cache reuse. By default all selected pages are also returned as MCP image content, allowing the model to inspect a scanned invoice/receipt bundle immediately. Render once, then delegate disjoint page paths to sub-agents for parallel extraction; keep POHODA writes centralized and batched after validation.",
+    description: "Renders PDF pages into separate compact JPEG or lossless PNG files with bounded parallelism and cache reuse. By default all selected pages are also returned as MCP image content, allowing the model to inspect a scanned invoice/receipt bundle immediately. Render once and extract all source documents, then call prepare_expense_review and deliver its XLSX even when duplicates or discrepancies are found. Keep POHODA writes centralized behind user review.",
     inputSchema: prepareScannedPdfSchema.shape,
     outputSchema: {
       pdfPath: z.string(),
@@ -798,7 +798,7 @@ export function registerPohodaTools(server: McpServer, context: PohodaServerCont
     return {
       content: [{
         type: "text" as const,
-        text: `Rendered ${prepared.selectedPageCount}/${prepared.pageCount} PDF pages to ${prepared.outputDirectory} in ${prepared.durationMs} ms${prepared.cached ? " (cache hit)" : ""}.${note}`
+        text: `Rendered ${prepared.selectedPageCount}/${prepared.pageCount} PDF pages to ${prepared.outputDirectory} in ${prepared.durationMs} ms${prepared.cached ? " (cache hit)" : ""}.${note} Next: extract the source documents, call prepare_expense_review, and deliver the XLSX. Duplicates or discrepancies must be included for review; do not stop at a findings summary.`
       }, ...inlineContent],
       structuredContent
     };

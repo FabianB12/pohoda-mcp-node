@@ -17,12 +17,14 @@ import { MAX_TEXT_LENGTH, resolveExpensePolicy } from "../pohoda/expense-policy.
 import { moneyValue, sumHomeCurrency, toMinorUnits } from "../pohoda/money.js";
 import * as workbookCodec from "./review-workbook.js";
 import { companyKey, decideNonPayerTreatment, normalizeIco } from "../registry/czech-registry.js";
+import { checkPreviewDuplicates, duplicateReviewNote } from "./expense-duplicates.js";
 
 type Fields = Record<string, any>;
 
 export type ReviewWorkbookCodec = {
   writeReviewWorkbook(input: ReviewWorkbook, filePath: string): Promise<unknown>;
   readReviewWorkbook(filePath: string, bytes?: Uint8Array): Promise<ReviewWorkbookRead>;
+  updateReviewDuplicateChecks?(filePath: string, checks: Record<string, import("./expense-duplicates.js").PreviewDuplicateCheck>, expectedSha256: string): Promise<void>;
 };
 
 export type ExpenseReviewOptions = {
@@ -113,13 +115,31 @@ export class ExpenseReviewService {
       return { rowId, tool: doc.tool, ...draftData(doc.tool, doc.data ?? {}, vatPeriod), callerNotes: text(doc.reviewNotes) };
     });
 
-    const reviewId = `rv-${sha256(JSON.stringify({ databaseId, target, vatPeriod, rows: drafts.map(({ rowId, tool, data }) => ({ rowId, tool, data })) })).slice(0, 16)}`;
+    const reviewId = `rv-${sha256(JSON.stringify({ duplicateCheckVersion: 1, databaseId, target, vatPeriod, rows: drafts.map(({ rowId, tool, data }) => ({ rowId, tool, data })) })).slice(0, 16)}`;
     const folder = join(this.directory, reviewId);
     const manifestPath = join(folder, "manifest.json");
     const existing = await readJson(manifestPath);
     if (existing) {
-      // Never overwrite a workbook the user may already be editing.
-      return { ...(await this.inspect({ reviewId })), reused: true, message: "This review was already prepared; the existing workbook was kept." };
+      // Re-check fresh POHODA state, but only update our result/action columns.
+      // User-edited input cells and helper columns are kept exactly as edited.
+      const codec = await this.codec();
+      const bytes = await readFile(existing.workbookPath);
+      const workbook = await codec.readReviewWorkbook(existing.workbookPath, bytes);
+      if (workbook.reviewId !== reviewId || workbook.databaseId !== databaseId || workbook.vatPeriod !== vatPeriod) throw new ReviewImportError("Existing workbook metadata differs from its prepared review.");
+      const originals = new Map<string, Fields>(existing.rows.map((row: Fields) => [row.rowId, row]));
+      const current = workbook.rows.map((row) => {
+        const original = originals.get(row.rowId);
+        if (!original || original.tool !== row.tool) throw new ReviewImportError("Existing workbook contains an unknown or changed document row.");
+        return { rowId: row.rowId, tool: row.tool, data: mergeRow(original.data, row.data).data };
+      });
+      const { snapshot: _snapshot, ...checks } = await checkPreviewDuplicates(this.client, current, target);
+      if (!codec.updateReviewDuplicateChecks) throw new ReviewImportError("This workbook codec cannot safely refresh duplicate checks.");
+      await codec.updateReviewDuplicateChecks(existing.workbookPath, checks.byRow, sha256(bytes));
+      existing.duplicateCheck = checks;
+      for (const row of existing.rows) row.duplicateCheck = checks.byRow[row.rowId] ?? row.duplicateCheck;
+      await writeJsonAtomic(manifestPath, existing);
+      // Row review issues do not make successful workbook preparation a tool error.
+      return { ...(await this.inspect({ reviewId })), ok: true, reused: true, nextAction: "deliver_workbook", message: "Deliver workbookPath as a linked XLSX for user review, including when all rows need review. Existing edits were preserved and duplicate checks refreshed. Wait for explicit import approval." };
     }
 
     // Resolve identity/VAT evidence while still read-only, so automatic PN appears
@@ -159,7 +179,10 @@ export class ExpenseReviewService {
       }
     }
     // History is read before any workbook is written, scoped to the explicit unit.
-    const history = await this.readHistory(drafts.map((d) => ({ rowId: d.rowId, tool: d.tool, data: d.data })), vatPeriod, target);
+    // Duplicate detection has its own complete snapshot; recent examples are not
+    // evidence of absence. This never archives PDFs or writes accounting data.
+    const { snapshot, ...duplicateCheck } = await checkPreviewDuplicates(this.client, drafts, target);
+    const history = await this.readHistory(drafts.map((d) => ({ rowId: d.rowId, tool: d.tool, data: d.data })), vatPeriod, target, snapshot);
     const rows: ReviewRow[] = [];
     const sources: Fields = {};
     for (const draft of drafts) {
@@ -168,6 +191,8 @@ export class ExpenseReviewService {
       const data = draft.data;
       const found = history.byRow.get(draft.rowId);
       const suggestions: Fields[] = [];
+      const duplicates = duplicateCheck.byRow[draft.rowId]!;
+      if (duplicates.status !== "clear") { blocking = true; notes.push(duplicateReviewNote(duplicates)); }
       if (found) {
         for (const field of ["accounting", "text", "classificationVAT"] as const) {
           if (!empty(data[field])) continue;
@@ -180,16 +205,10 @@ export class ExpenseReviewService {
             data[field] = value;
             const fromIds = found.records.filter((r) => text(r[field]) === value).map((r) => r.id);
             suggestions.push({ field, value, fromIds, rule: "unanimous same-supplier POHODA history" });
-            notes.push(`${field} "${value}" suggested from POHODA history (${fromIds.map((id) => `#${id}`).join(", ")}); confirm.`);
+
           } else if (values.length > 1) {
             notes.push(`History has ${values.length} different ${field} values (${values.slice(0, 4).join(" | ")}); choose one.`);
           }
-        }
-        const sourceNumber = text(data.sourceDocumentNumber || data.originalDocument);
-        const duplicates = sourceNumber ? found.records.filter((r) => text(r.originalDocument) === sourceNumber) : [];
-        if (duplicates.length) {
-          blocking = true;
-          notes.push(`Possible duplicate: POHODA ${duplicates.map((r) => `#${r.id} ${r.number}`).join(", ")} has source document ${sourceNumber}; skip it or confirm.`);
         }
         if (draft.tool === "create_cash_voucher" && empty(data.cashAccount)) {
           const accounts = [...new Set(found.records.map((r) => text(r.cashAccount)).filter(Boolean))];
@@ -205,7 +224,7 @@ export class ExpenseReviewService {
       if (!check.ok) { blocking = true; notes.push(`Needs data: ${check.error}`); }
       if (data.sourcePdfPath && !(await fileExists(text(data.sourcePdfPath)))) { blocking = true; notes.push(`Source PDF not found: ${data.sourcePdfPath}`); }
       const reviewNotes = [draft.callerNotes, ...notes].filter(Boolean).join("\n");
-      rows.push({ rowId: draft.rowId, tool: draft.tool, data, action: blocking ? "review" : "import", reviewNotes });
+      rows.push({ rowId: draft.rowId, tool: draft.tool, data, action: blocking ? "review" : "import", reviewNotes, duplicateCheck: duplicates });
       sources[draft.rowId] = { query: found?.key, exampleIds: found?.records.map((r) => r.id) ?? [], suggestions, registryFilled: data._registryFilled ?? [] };
     }
 
@@ -220,18 +239,21 @@ export class ExpenseReviewService {
     const manifest: Fields = {
       version: 1, reviewId, createdAt: new Date().toISOString(), databaseId, target, vatPeriod, workbookPath,
       preparedWorkbookSha256: sha256(await readFile(workbookPath)),
-      rows: rows.map((row) => ({ rowId: row.rowId, tool: row.tool, data: row.data, action: row.action, reviewNotes: row.reviewNotes })),
+      rows: rows.map((row) => ({ rowId: row.rowId, tool: row.tool, data: row.data, action: row.action, reviewNotes: row.reviewNotes, duplicateCheck: row.duplicateCheck })),
       sourcePdfPaths: [...new Set(rows.map((r) => text(r.data.sourcePdfPath)).filter(Boolean))],
       sources, history: { queries: history.queries, warnings: history.warnings, exampleCount: history.examples.length },
-      imports: []
+      duplicateCheck, imports: []
     };
     await writeJsonAtomic(manifestPath, manifest);
     const pending = rows.filter((r) => r.action === "review").map((r) => r.rowId);
     return {
       ok: true, status: pending.length ? "requiresReview" : "readyForReview", reviewId, databaseId, vatPeriod, workbookPath,
       manifestPath, rowCount: rows.length, requiresReview: pending, historyWarnings: history.warnings, exampleCount: history.examples.length,
-      rows: rows.map((row) => ({ rowId: row.rowId, tool: row.tool, action: row.action, reviewNotes: row.reviewNotes, preview: preflight(row.tool, row.data).preview })),
-      message: "Workbook prepared without POHODA writes. Ask the user to review/edit it; import only on the user's explicit instruction."
+      duplicateCheck: { complete: duplicateCheck.complete, checkedAt: duplicateCheck.checkedAt, scannedRecords: duplicateCheck.scannedRecords, warnings: duplicateCheck.warnings, matchedRowIds: rows.filter((row) => row.duplicateCheck!.matchCount > 0).map((row) => row.rowId) },
+      rowsTruncated: rows.length > 20,
+      rows: rows.slice(0, 20).map((row) => ({ rowId: row.rowId, tool: row.tool, action: row.action, reviewNotes: row.reviewNotes, duplicateCheck: row.duplicateCheck, preview: preflight(row.tool, row.data).preview })),
+      nextAction: "deliver_workbook",
+      message: "Preparation succeeded. Deliver workbookPath as a linked XLSX, including when all rows are duplicates or need review. requiresReview describes the rows, not a failed preparation. A findings summary alone is not completion. No POHODA records were changed. Wait for explicit import approval."
     };
   }
 
@@ -249,6 +271,7 @@ export class ExpenseReviewService {
       errors: evaluation.errors, unresolved: evaluation.unresolved, invalid: evaluation.invalid,
       importRowIds: evaluation.selected.map((r) => r.rowId), skippedRowIds: evaluation.skipped, omittedRowIds: evaluation.omitted,
       ignoredEdits: evaluation.ignored, rows: evaluation.report,
+      duplicateCheck: manifest.duplicateCheck,
       previousImports: (manifest.imports as Fields[]).map(({ at, workbookSha256, rowIds, ok, state, dataPackId }) => ({ at, workbookSha256, rowIds, ok, state, dataPackId }))
     };
   }
@@ -356,30 +379,44 @@ export class ExpenseReviewService {
   }
 
   /** Batched, deduplicated, bounded read of same-supplier documents on the explicit unit. */
-  private async readHistory(rows: Array<{ rowId: string; tool: ReviewTool; data: Fields }>, vatPeriod: string, target: TransportOptions) {
+  private async readHistory(rows: Array<{ rowId: string; tool: ReviewTool; data: Fields }>, vatPeriod: string, target: TransportOptions, snapshot?: Map<string, Fields[]>) {
     const year = Number(vatPeriod.slice(0, 4)), month = Number(vatPeriod.slice(5, 7));
     const dateFrom = new Date(Date.UTC(year, month - 1 - this.historyMonths, 1)).toISOString().slice(0, 10);
     const dateTill = new Date(Date.UTC(year, month, 0)).toISOString().slice(0, 10);
-    const queries = new Map<string, { request: ListRecordsBatchRequest; rowIds: string[]; voucher: boolean }>();
+    const queries = new Map<string, { request: ListRecordsBatchRequest; rowIds: string[]; voucher: boolean; partnerId: number }>();
     const rowKey = new Map<string, string>();
     const skipped = new Set<string>();
     for (const row of rows) {
       const ico = text(row.data.partnerIco).replace(/\s/g, "");
       const name = text(row.data.partnerName);
-      if (!ico && !name) { skipped.add(row.rowId); continue; }
+      const partnerId = Number(row.data.partnerId) || 0;
+      if (!ico && !name && !(snapshot && partnerId)) { skipped.add(row.rowId); continue; }
       const voucher = row.tool === "create_cash_voucher";
       const subType = voucher ? "" : row.tool === "create_other_liability" ? "commitment" : text(row.data.type) || "receivedInvoice";
       const request: ListRecordsBatchRequest = { agenda: voucher ? "voucher" : "invoice", subType, filter: { ...(ico ? { ico } : { company: name }), dateFrom, dateTill }, options: { count: HISTORY_COUNT } };
-      const key = JSON.stringify(request);
+      const key = JSON.stringify([request, !ico && !name ? partnerId : 0]);
       rowKey.set(row.rowId, key);
-      const entry = queries.get(key) ?? { request, rowIds: [], voucher };
+      const entry = queries.get(key) ?? { request, rowIds: [], voucher, partnerId };
       entry.rowIds.push(row.rowId);
       queries.set(key, entry);
     }
     const warnings: string[] = [];
     const results = new Map<string, Fields[]>();
     const list = [...queries.entries()];
-    for (let start = 0; start < list.length; start += LIST_BATCH) {
+    if (snapshot) for (const [key, q] of list) {
+      const matches = (snapshot.get(`${q.request.agenda}|${q.request.subType}`) ?? []).filter((raw) => {
+        const h = headerOf(raw), address = h.partnerIdentity?.address ?? {};
+        if (q.voucher && h.voucherType && h.voucherType !== "expense") return false;
+        const date = text(h.date);
+        if (date && (date < dateFrom || date > dateTill)) return false;
+        const filter = q.request.filter as Fields;
+        if (filter.ico) return text(address.ico).replace(/\s/g, "") === filter.ico;
+        if (filter.company) return companyKey(address.company) === companyKey(filter.company);
+        return Number(h.partnerIdentity?.id) === q.partnerId;
+      }).map((raw) => comparable(raw, q.request)).sort((a, b) => text(b.date).localeCompare(text(a.date)) || Number(b.id) - Number(a.id));
+      results.set(key, matches);
+    }
+    for (let start = 0; !snapshot && start < list.length; start += LIST_BATCH) {
       const chunk = list.slice(start, start + LIST_BATCH);
       try {
         const response = await this.client.listRecordsBatch(chunk.map(([, q]) => q.request), "", { ...target });

@@ -16,10 +16,12 @@
  *   allowed source paths from its own manifest.
  */
 import { promises as fs } from "node:fs";
+import { createHash, randomBytes } from "node:crypto";
 import path from "node:path";
 import ExcelJS from "exceljs";
 import { resolveExpensePolicy } from "../pohoda/expense-policy.js";
 import type { ReviewAction, ReviewRow, ReviewTool, ReviewWorkbook, ReviewWorkbookRead } from "./review-contract.js";
+import { withDuplicateReviewNote, type PreviewDuplicateCheck } from "./expense-duplicates.js";
 
 export const REVIEW_WORKBOOK_FORMAT = "pohoda-mcp-review-workbook";
 export const REVIEW_WORKBOOK_SCHEMA_VERSION = 1;
@@ -77,10 +79,10 @@ const col = (key: string, label: string, kind: ReviewColumnKind, group: ColumnGr
 export const REVIEW_COLUMNS: readonly ReviewColumn[] = [
   col("rowId", "ID řádku", "rowId", "control", 11, "Stabilní identifikátor řádku z přípravy. Neměňte jej. Řádky lze řadit, filtrovat i mazat; řádky s neznámým ID budou při importu odmítnuty."),
   col("action", "Akce", "action", "control", 13, "Importovat = řádek se importuje po vašem výslovném pokynu. Prověřit = zatím neimportovat. Vynechat = neimportovat."),
-  col("reviewNotes", "Poznámka ke kontrole (neimportuje se)", "reviewNotes", "control", 32, "Vaše poznámka pro kontrolu. Do POHODY se NEPŘENÁŠÍ (ani do interní poznámky)."),
+  col("reviewNotes", "Poznámka (neimportuje se)", "reviewNotes", "control", 28, "Vaše poznámka pro kontrolu. Do POHODY se NEPŘENÁŠÍ (ani do interní poznámky)."),
   col("tool", "Typ dokladu", "tool", "control", 17),
   col("plannedImport", "Plán importu (jen pro čtení, přepočítá se)", "plan", "plan", 44, "Informativní náhled úprav podle pravidel importu (pozdní DUZP, PN, číslování). Při importu se znovu spočítá z upravených zdrojových hodnot; tento sloupec se nikdy neimportuje."),
-  col("text", "Text dokladu v POHODĚ (krátký, max. 240 znaků)", "text", "source", 34, "Krátký text, který se zapíše do POHODY jako text dokladu. Nezaměňujte s Poznámkou ke kontrole."),
+  col("text", "Text dokladu v POHODĚ", "text", "source", 34, "Krátký text, který se zapíše do POHODY jako text dokladu. Nezaměňujte s Poznámkou ke kontrole."),
   col("partnerName", "Dodavatel", "text", "source", 26),
   col("partnerIco", "IČO", "id", "source", 11, "Uloženo jako text, aby se zachovaly úvodní nuly."),
   col("partnerDic", "DIČ", "id", "source", 13),
@@ -223,6 +225,45 @@ export async function writeReviewWorkbook(input: ReviewWorkbook, filePath: strin
   }
 }
 
+/** Refresh only duplicate results/action cells; preserve user edits, formulas in
+ * helper columns, formatting and row order. Reject concurrent workbook changes. */
+export async function updateReviewDuplicateChecks(filePath: string, checks: Record<string, PreviewDuplicateCheck>, expectedSha256: string): Promise<void> {
+  const hash = (bytes: Uint8Array) => createHash("sha256").update(bytes).digest("hex");
+  const bytes = await fs.readFile(filePath);
+  if (hash(bytes) !== expectedSha256) throw new Error("Workbook changed during duplicate checking; retry the refresh.");
+  const workbook = new ExcelJS.Workbook(); await workbook.xlsx.load(bytes as any);
+  const sheet = workbook.getWorksheet(REVIEW_SHEET_NAME)!;
+  const keys = new Map<string, number>();
+  let headerRow = 0;
+  for (let i = 1; i <= HEADER_SEARCH_ROWS && !headerRow; i++) sheet.getRow(i).eachCell((cell) => {
+    if (["rowid", normalizeHeader(REVIEW_COLUMNS[0]!.label)].includes(normalizeHeader(String(cell.value ?? "")))) headerRow = i;
+  });
+  sheet.getRow(headerRow).eachCell((cell, column) => {
+    const known = REVIEW_COLUMNS.find((c) => normalizeHeader(c.label) === normalizeHeader(String(cell.value)) || c.key.toLowerCase() === normalizeHeader(String(cell.value)));
+    if (known) keys.set(known.key, column);
+    else if (String(cell.value).startsWith("Kontrola duplicit")) keys.set("duplicateCheck", column);
+  });
+  if (!keys.has("rowId") || !keys.has("action") || !keys.has("reviewNotes")) throw new Error("Workbook has no review-notes column; prepare a fresh review.");
+  sheet.eachRow((row, index) => {
+    if (index <= headerRow) return;
+    const check = checks[String(row.getCell(keys.get("rowId")!).value ?? "")];
+    if (!check) return;
+    const notes = row.getCell(keys.get("reviewNotes")!);
+    notes.value = withDuplicateReviewNote(notes.text, check) || null;
+    // Migrate previews made by the previous layout without keeping a second status column.
+    const legacy = keys.get("duplicateCheck");
+    if (legacy) { row.getCell(legacy).value = null; sheet.getColumn(legacy).hidden = true; }
+    if (check.status !== "clear" && ["import", REVIEW_ACTION_LABELS.import.toLowerCase()].includes(row.getCell(keys.get("action")!).text.toLowerCase())) row.getCell(keys.get("action")!).value = REVIEW_ACTION_LABELS.review;
+    applyReviewHighlights(row, keys, check, row.getCell(keys.get("action")!).text === REVIEW_ACTION_LABELS.review ? "review" : "import");
+  });
+  const output = Buffer.from(await workbook.xlsx.writeBuffer() as ArrayBuffer);
+  if (hash(await fs.readFile(filePath)) !== expectedSha256) throw new Error("Workbook changed during duplicate checking; retry the refresh.");
+  const temp = `${filePath}.${randomBytes(6).toString("hex")}.tmp`;
+  try { await fs.writeFile(temp, output, { flag: "wx" }); await fs.rename(temp, filePath); }
+  finally { await fs.rm(temp, { force: true }); }
+}
+
+
 function validateWriteInput(input: ReviewWorkbook): void {
   const issues: ReviewWorkbookIssue[] = [];
   checkMetaValues({ reviewId: input?.reviewId, databaseId: input?.databaseId, vatPeriod: input?.vatPeriod }, issues);
@@ -254,8 +295,8 @@ function writeMainSheet(workbook: ExcelJS.Workbook, input: ReviewWorkbook): void
   ws.columns = REVIEW_COLUMNS.map((c) => ({
     key: c.key,
     width: c.width,
-    hidden: c.group === "advanced",
-    outlineLevel: c.group === "advanced" ? 1 : 0,
+    hidden: c.group === "advanced" || c.group === "plan" || c.group === "trace",
+    outlineLevel: c.group === "advanced" || c.group === "plan" || c.group === "trace" ? 1 : 0,
     style: NUM_FMT[c.kind] ? { numFmt: NUM_FMT[c.kind]! } : {}
   }));
 
@@ -277,7 +318,7 @@ function writeMainSheet(workbook: ExcelJS.Workbook, input: ReviewWorkbook): void
     cell.value = c.label;
     cell.numFmt = "General";
     cell.font = { bold: true, color: { argb: "FFFFFFFF" }, size: 10 };
-    cell.fill = FILL(c.key === "reviewNotes" ? "FFB45309" : HEADER_COLORS[c.group]);
+    cell.fill = FILL(HEADER_COLORS[c.group]);
     cell.alignment = { vertical: "middle", horizontal: "center", wrapText: true };
     cell.border = THIN_BORDER;
     if (c.note) cell.note = { texts: [{ text: c.note }] };
@@ -286,8 +327,9 @@ function writeMainSheet(workbook: ExcelJS.Workbook, input: ReviewWorkbook): void
   input.rows.forEach((row, index) => {
     const excelRow = ws.getRow(index + 3);
     const plan = describePlan(row, input.vatPeriod);
+    const note = withDuplicateReviewNote(row.reviewNotes || "", row.duplicateCheck);
     const lineCount = (value: string, width: number) => value.split("\n").reduce((sum, line) => sum + Math.max(1, Math.ceil(line.length / width)), 0);
-    excelRow.height = Math.min(180, Math.max(32, 13 * Math.max(lineCount(plan, 58), lineCount(row.reviewNotes || "", 40))));
+    excelRow.height = Math.min(96, Math.max(28, 14 * Math.max(lineCount(note, 34), lineCount(String(row.data.text || ""), 40), lineCount(String(row.data.partnerName || ""), 30))));
     REVIEW_COLUMNS.forEach((c, colIndex) => {
       const cell = excelRow.getCell(colIndex + 1);
       const value = cellValueFor(c, row, plan);
@@ -296,9 +338,11 @@ function writeMainSheet(workbook: ExcelJS.Workbook, input: ReviewWorkbook): void
       cell.border = THIN_BORDER;
       cell.alignment = { vertical: "top", wrapText: c.kind === "plan" || c.kind === "reviewNotes" || c.key === "text" || c.key === "partnerName" };
       if (c.kind === "rowId") { cell.fill = FILL("FFF1F5F9"); cell.font = { color: { argb: "FF475569" } }; }
-      if (c.kind === "reviewNotes") cell.fill = FILL("FFFEF3C7");
+      if (c.kind === "reviewNotes" && note) cell.fill = FILL("FFFFF7ED");
+      if (c.key === "total") cell.font = { bold: true };
       if (DISPLAY_KINDS.has(c.kind)) { cell.fill = FILL("FFF3F4F6"); cell.font = { italic: true, color: { argb: "FF4B5563" }, size: 9 }; }
     });
+    applyReviewHighlights(excelRow, new Map(REVIEW_COLUMNS.map((c, i) => [c.key, i + 1])), row.duplicateCheck, row.action, row, input.vatPeriod);
   });
 
   const lastRow = Math.max(3, input.rows.length + 2);
@@ -339,11 +383,46 @@ function writeMainSheet(workbook: ExcelJS.Workbook, input: ReviewWorkbook): void
   });
 }
 
+/** Neutral data cells, with attention drawn only to actionable problems. */
+function applyReviewHighlights(row: ExcelJS.Row, columns: Map<string, number>, check?: PreviewDuplicateCheck, action?: string, source?: ReviewRow, vatPeriod?: string): void {
+  const value = (key: string) => columns.has(key) ? row.getCell(columns.get(key)!) : undefined;
+  const skipped = action === "skip" || value("action")?.text === REVIEW_ACTION_LABELS.skip;
+  const duplicate = Boolean(check?.matchCount);
+  for (const [key, column] of columns) {
+    if (key === "duplicateCheck") continue;
+    const cell = row.getCell(column);
+    // Loaded XLSX cells can share a style object; detach it before colouring.
+    cell.style = { ...cell.style };
+    cell.fill = FILL(skipped ? "FFF1F5F9" : duplicate ? "FFFFF1F2" : "FFFFFFFF");
+    if (key === "rowId" || key === "plannedImport") cell.fill = FILL(skipped ? "FFF1F5F9" : duplicate ? "FFFFF1F2" : "FFF8FAFC");
+  }
+  if (skipped) return;
+  const mark = (key: string, color: string) => { const cell = value(key); if (cell) cell.fill = FILL(color); };
+  if (duplicate) {
+    mark("reviewNotes", "FFFFCDD2");
+    const keys = new Set<string>();
+    for (const match of check!.matches) {
+      if (match.reason === "identity") keys.add("sourcePages");
+      else { keys.add("partnerName"); keys.add("partnerIco"); }
+      if (match.reason === "reference") keys.add("sourceDocumentNumber");
+      if (match.reason === "amount_date") { keys.add("total"); keys.add("sourceIssueDate"); keys.add("sourceTaxDate"); }
+    }
+    for (const key of keys) mark(key, "FFFFCDD2");
+  } else if (check?.status === "incomplete" || action === "review") mark("reviewNotes", "FFFEF3C7");
+  if (source && vatPeriod) {
+    try { resolveExpensePolicy({ ...source.data, type: source.data.type ?? DOCUMENT_TYPE_FOR_TOOL[source.tool], vatPeriod, ...(source.data.cardPayment ? { cardSequence: 1 } : {}) }, [], source.tool === "create_cash_voucher" ? "voucher" : "invoice"); }
+    catch (error) { const field = (error as { field?: string }).field; if (field) mark(field, "FFFEF3C7"); }
+    if (source.tool === "create_cash_voucher" && !source.data.cashAccount) mark("cashAccount", "FFFEF3C7");
+  }
+  const actionCell = value("action");
+  if (actionCell) actionCell.fill = FILL(actionCell.text === REVIEW_ACTION_LABELS.import ? "FFDCFCE7" : "FFFEF3C7");
+}
+
 function cellValueFor(column: ReviewColumn, row: ReviewRow, plan: string): ExcelJS.CellValue {
   switch (column.kind) {
     case "rowId": return row.rowId;
     case "action": return REVIEW_ACTION_LABELS[row.action];
-    case "reviewNotes": return row.reviewNotes ? String(row.reviewNotes) : null;
+    case "reviewNotes": return withDuplicateReviewNote(row.reviewNotes || "", row.duplicateCheck) || null;
     case "tool": return REVIEW_TOOL_LABELS[row.tool];
     case "plan": return plan;
     default: return dataCellValue(column, row.data?.[column.key]);
@@ -507,7 +586,8 @@ async function writeGuideSheet(workbook: ExcelJS.Workbook, input: ReviewWorkbook
     ["11. Vzorce", "Vzorce nejsou povoleny. Pokud je použijete, vložte místo nich hodnoty (Vložit jinak → Hodnoty)."],
     ["12. Řádky", "Řádky lze řadit, filtrovat i mazat. Neměňte ID řádku. Nové řádky s neznámým ID budou odmítnuty."],
     ["13. Uložení", "Uložte soubor ve formátu .xlsx (ne .xls, .xlsm ani .csv)."],
-    ["14. Podobné doklady", "List Podobne doklady obsahuje jen vzory z této účetní jednotky pro porovnání; neimportuje se."]
+    ["14. Podobné doklady", "List Podobne doklady obsahuje jen vzory z této účetní jednotky pro porovnání; neimportuje se."],
+    ["15. Barvy", "Růžová = možná duplicita (odkaz v poznámce). Žlutá = pole k ověření. Šedá = vynecháno. Zelená akce = připraveno k importu. Kontrola duplicit se opakuje při importu."]
   ];
   lines.forEach(([a, b], index) => {
     const row = ws.getRow(index + 1);
@@ -655,7 +735,9 @@ function rowIdProblem(id: string): string | undefined {
   return undefined;
 }
 
-const normalizeHeader = (value: string): string => value.normalize("NFC").replace(/\s+/g, " ").trim().toLocaleLowerCase("cs-CZ");
+const normalizeHeader = (value: string): string => value.normalize("NFC").replace(/\s+/g, " ").trim().toLocaleLowerCase("cs-CZ")
+  .replace("poznámka ke kontrole (neimportuje se)", "poznámka (neimportuje se)")
+  .replace("text dokladu v pohodě (krátký, max. 240 znaků)", "text dokladu v pohodě");
 
 function readMainSheet(ws: ExcelJS.Worksheet, issues: ReviewWorkbookIssue[]): ReviewRow[] {
   const byHeader = new Map<string, ReviewColumn>();

@@ -238,11 +238,27 @@ A request to process PDFs prepares an editable `.xlsx`; it does not authorize ac
 writes. The workflow is:
 
 1. Extract source PDFs and call `prepare_expense_review` with the client, VAT month and
-   document rows. The service reads similar POHODA documents before saving the preview.
+   document rows. The service checks POHODA and the incoming batch for duplicates, and
+   reads similar client documents before saving the preview. Deliver the resulting
+   XLSX as a file link even if every source document already exists or needs review;
+   reporting findings in chat alone does not finish preparation.
 2. Review/edit the workbook. Use `inspect_expense_review` to inspect its current contents.
    Resolve rows marked for review or mark them to skip.
 3. Explicitly request import, then call `import_expense_review` with `approved: true` and the `expectedWorkbookSha256` returned by the latest inspection.
    The service rereads the reviewed cells and validates them before any accounting write.
+
+Duplicate rows are pink, with a short reference in the existing review note. Matching
+fields receive a stronger tint; yellow identifies fields needing correction. Ordinary
+rows have no status text, and the detailed import plan is collapsed by default.
+It checks source PDF/pages, supplier and document reference, and possible matches by
+supplier, exact amount, currency and date when a reference is missing. Matches and
+incomplete checks are marked **Prověřit**; nothing is silently removed. Re-preparing
+refreshes checks without discarding edits, and import checks POHODA again.
+
+For large batches, send up to 500 rows together. Duplicate detection and examples share
+one paged snapshot (all three expense agendas batched per page), PDFs are hashed once
+per file, and matching runs locally against indexes. Detailed tool previews are limited
+to 20 rows; the workbook retains every row.
 
 Review notes are not accounting data and are never imported. Short document descriptions
 are preferred (for example, `Materiál` rather than a list of all materials). Existing client
