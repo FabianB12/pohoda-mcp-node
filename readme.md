@@ -279,9 +279,14 @@ XLSX workflow. Extract the account number/IBAN from the statement header, its cu
 statement date and month, and each transaction's stable movement number, date, positive
 amount, direction, variable symbol and margin position for a check mark.
 
-- `execute: false` previews matches without accounting writes.
-- `execute: true`, when requested by the user, imports only exact matches and actually
-  settles the target invoices. Unmatched or ambiguous payments are left untouched.
+- Always run `execute: false` first. It returns the read-only plan: matched,
+  unmatched and `needs_review` rows, plus `diagnostics` for POHODA documents whose
+  liquidation state cannot be proven. Such a document never matches and blocks only
+  payments it could compete with (`blockedBy`); the rest of the plan stays usable.
+- `execute: true`, within the user's request and any host approval, imports only exact
+  matches and actually settles the target invoices. Unmatched, ambiguous and
+  `needs_review` payments are left untouched. A rejected write is never retried or
+  bypassed with raw XML or other tools.
 - The statement's own account must match exactly one account in the selected unit;
   no default or counterparty account is substituted.
 - Matching tries the variable symbol first, oldest unpaid document first. If that
@@ -321,8 +326,10 @@ VAT-treatment decision; current registry status does not prove historical status
 `lookup_supplier_registry` looks up Czech suppliers through ARES and returns current
 VAT evidence. Expense writes resolve/create contacts, mark suppliers and verify links.
 Cash expense `Doklad` is populated only above CZK 10,000 payable after rounding.
-For `cardPayment=true` commitments, the live PK sequence drives `KN`/variable symbol N
-at or below CZK 10,000; above it the source references are used.
+For commitments with `paymentType=creditcard` (legacy alias `cardPayment=true`), the live
+PK sequence drives `KN`/variable symbol N at or below CZK 10,000; above it the source
+references are used. The review workbook shows Forma úhrady (Hotově, Kartou, Převodem,
+Dobírkou, ...) and only the values written to POHODA; source facts stay in the manifest.
 For received invoices only, an explicit variable symbol is kept unchanged; a missing one
 is derived from the supplier document number's ASCII digits, keeping leading zeros
 (`FV-2026/0007` -> `20260007`). A number without digits or with more than 20 digits

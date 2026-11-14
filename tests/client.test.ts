@@ -349,7 +349,7 @@ describe("PohodaClient", () => {
       {
         requestId: "voucher",
         tool: "create_cash_voucher",
-        header: { type: "expense", cashAccount: "HLAVNI", date: "2026-07-02", dateTax: "2026-07-02", datePayment: "2026-07-02", text: "Cash expense", vatPeriod: "2026-07", taxMode: "taxable", classificationVAT: "PD", priceHigh: 50, priceHighVAT: 10.5, total: 60.5 },
+        header: { type: "expense", cashAccount: "HLAVNI", date: "2026-07-02", dateTax: "2026-07-02", datePayment: "2026-07-02", text: "Cash expense", vatPeriod: "2026-07", taxMode: "taxable", classificationVAT: "PD", priceHigh: 50, priceHighVAT: 10.5, roundingAmount: 0, total: 60.5 },
         items: []
       },
       {

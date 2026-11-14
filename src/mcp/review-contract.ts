@@ -9,6 +9,8 @@ export type ReviewRow = {
   action: ReviewAction;
   reviewNotes: string;
   duplicateCheck?: PreviewDuplicateCheck;
+  /** Visible POHODA target cells as read back (never data; see expense-review mapping). */
+  targets?: Record<string, unknown>;
 };
 export type ReviewWorkbook = {
   reviewId: string;

@@ -33,7 +33,11 @@ async function setup(overrides: Record<string, any> = {}, lookupSupplier?: (inpu
   const edit = async (values: Record<string, any>) => {
     const wb = new ExcelJS.Workbook(); await wb.xlsx.readFile(prepared.workbookPath);
     const sheet = wb.getWorksheet("Doklady")!;
-    for (const [key, value] of Object.entries(values)) sheet.getCell(3, REVIEW_COLUMNS.findIndex((c) => c.key === key) + 1).value = value;
+    for (const [key, value] of Object.entries(values)) {
+      const index = REVIEW_COLUMNS.findIndex((c) => c.key === key);
+      if (index < 0) throw new Error(`no workbook column ${key}`);
+      sheet.getCell(3, index + 1).value = value;
+    }
     await wb.xlsx.writeFile(prepared.workbookPath);
   };
   const submit = () => service.importReviewed({ reviewId: prepared.reviewId, approved: true, databaseId: target.databaseOverride, target });
@@ -46,12 +50,13 @@ describe("Real XLSX reviewed-import integration", () => {
     expect(prepared.status).toBe("readyForReview");
     expect(runs).toHaveLength(0);
     expect(reads).toHaveLength(1);
-    await edit({ text: "Oprava", priceHigh: "200,00", priceHighVAT: 42, total: 242, accounting: null, dateDue: null, sourceSymVar: null, reviewNotes: "PRIVATE REVIEW NOTE", action: "Importovat" });
+    await edit({ text: "Oprava", targetPriceHigh: "200,00", targetPriceHighVAT: 42, targetTotal: 242, accounting: null, dateDue: null, reviewNotes: "PRIVATE REVIEW NOTE", action: "Importovat" });
     expect((await submit()).ok).toBe(true);
     expect(runs).toHaveLength(1);
     const header = runs[0].ops[0].header;
-    expect(header).toMatchObject({ text: "Oprava", priceHigh: "200.00", priceHighVAT: 42, total: 242, sourceDocumentNumber: "000123", sourceIssueDate: "2026-10-10", intNote: "Source provenance" });
-    for (const field of ["accounting", "dateDue", "sourceSymVar", "symVar"]) expect(header[field]).toBeUndefined();
+    // Target amount edits become the source amounts the policy uses; other source facts stay.
+    expect(header).toMatchObject({ text: "Oprava", priceHigh: "200.00", priceHighVAT: 42, total: 242, sourceDocumentNumber: "000123", sourceSymVar: "00123", sourceIssueDate: "2026-10-10", intNote: "Source provenance" });
+    for (const field of ["accounting", "dateDue", "symVar"]) expect(header[field]).toBeUndefined();
     expect(JSON.stringify(runs)).not.toContain("PRIVATE REVIEW NOTE");
     expect((await submit()).repeated).toBe(true);
     expect(runs).toHaveLength(1);
@@ -70,14 +75,14 @@ describe("Real XLSX reviewed-import integration", () => {
 
   it("does not resurrect a cleared source document number through the originalDocument alias", async () => {
     const { edit, submit, runs } = await setup();
-    await edit({ sourceDocumentNumber: null });
+    await edit({ targetDocument: null });
     await expect(submit()).rejects.toThrow(/SOURCE_DOCUMENT_NUMBER_REQUIRED/);
     expect(runs).toHaveLength(0);
   });
 
   it("blocks formulas, even with a plausible cached result, before importing", async () => {
     const { edit, submit, runs } = await setup();
-    await edit({ total: { formula: "100+21", result: 121 } });
+    await edit({ targetTotal: { formula: "100+21", result: 121 } });
     await expect(submit()).rejects.toThrow(/FORMULA/);
     expect(runs).toHaveLength(0);
   });
@@ -92,10 +97,7 @@ describe("Real XLSX reviewed-import integration", () => {
   it("rechecks automatic PN when the reviewer adds VAT that extraction missed", async () => {
     const lookup = async () => ({ status: "matched", fetchedAt: "2026-11-14", supplier: { name: "Test supplier", ico: "25596641", country: "CZ" }, vat: { status: "registry-non-payer" } });
     const { edit, submit, runs } = await setup({ taxMode: "auto", classificationVAT: "", sourceChargesVat: false, priceHigh: undefined, priceHighVAT: undefined, priceNone: 121 }, lookup);
-    await edit({ priceNone: null, priceHigh: 100, priceHighVAT: 21, sourceChargesVat: "Ano" });
-    await expect(submit()).rejects.toThrow(/Document charges VAT but registry status/);
-    expect(runs).toHaveLength(0);
-    await edit({ sourceChargesVat: "Ne" });
+    await edit({ targetPriceNone: null, targetPriceHigh: 100, targetPriceHighVAT: 21 });
     await expect(submit()).rejects.toThrow(/Document charges VAT but registry status/);
     expect(runs).toHaveLength(0);
   });
@@ -103,7 +105,7 @@ describe("Real XLSX reviewed-import integration", () => {
   it("rechecks a payer decision when the reviewer removes VAT", async () => {
     const lookup = async () => ({ status: "matched", fetchedAt: "2026-11-14", supplier: { name: "Test supplier", ico: "25596641", country: "CZ" }, vat: { status: "payer" } });
     const { edit, submit, runs } = await setup({ taxMode: "auto", sourceChargesVat: true }, lookup);
-    await edit({ priceHigh: null, priceHighVAT: null, priceNone: 121, sourceChargesVat: "Ne" });
+    await edit({ targetPriceHigh: null, targetPriceHighVAT: null, targetPriceNone: 121 });
     await expect(submit()).rejects.toThrow(/Document shows no VAT but registry status/);
     expect(runs).toHaveLength(0);
   });
@@ -160,11 +162,10 @@ describe("Real XLSX reviewed-import integration", () => {
     ];
 
     it.each(cases)("cash receipt %s", async (_label, total, rounding, above) => {
-      const { prepared, submit, runs } = await setup({ ...pn(total, rounding), cashAccount: "HP", sourcePaymentDate: "2026-10-10" }, undefined, "create_cash_voucher");
+      const { prepared, submit, runs } = await setup({ ...pn(total, rounding ?? 0), cashAccount: "HP", sourcePaymentDate: "2026-10-10" }, undefined, "create_cash_voucher");
       const doc = await cell(prepared.workbookPath, "targetDocument");
       expect(doc.hidden).toBe(false);
       expect(doc.value).toBe(above ? "UCT-4711" : null);
-      expect((await cell(prepared.workbookPath, "sourceDocumentNumber")).value).toBe("UCT-4711");
       await submit();
       const header = runs[0].ops[0].header;
       expect(header.sourceDocumentNumber).toBe("UCT-4711");
@@ -179,9 +180,8 @@ describe("Real XLSX reviewed-import integration", () => {
     it.each(cases)("card commitment %s", async (_label, total, rounding, above) => {
       const { prepared, submit, runs } = await setup({ ...pn(total, rounding), cardPayment: true }, undefined, "create_other_liability");
       const doc = await cell(prepared.workbookPath, "targetDocument"), vs = await cell(prepared.workbookPath, "targetSymVar");
-      expect(doc.value).toBe(above ? "UCT-4711" : "K + další č. PK");
-      expect(vs.value).toBe(above ? null : "další č. PK");
-      expect((await cell(prepared.workbookPath, "sourceSymVar")).hidden).toBe(true);
+      expect(doc.value).toBe(above ? "UCT-4711" : "Přidělí se z PK");
+      expect(vs.value).toBe(above ? null : "Přidělí se z PK");
       await submit();
       const result = imported(runs[0].ops[0].header, "create_other_liability");
       expect(result.originalDocument).toBe(above ? "UCT-4711" : "K7");
@@ -190,8 +190,6 @@ describe("Real XLSX reviewed-import integration", () => {
 
     it("shows the received-invoice VS derived from the supplier number without inventing a source VS", async () => {
       const { prepared, submit, runs } = await setup({ symVar: undefined, originalDocument: "FV-2026/0007" });
-      expect((await cell(prepared.workbookPath, "sourceSymVar")).value).toBeNull();
-      expect((await cell(prepared.workbookPath, "sourceSymVar")).hidden).toBe(false);
       expect((await cell(prepared.workbookPath, "targetSymVar")).value).toBe("20260007");
       expect((await cell(prepared.workbookPath, "targetDocument")).value).toBe("FV-2026/0007");
       await submit();

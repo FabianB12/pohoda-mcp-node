@@ -179,10 +179,9 @@ export function resolveExpensePolicy(header: Record<string, any>, items: Record<
     // receipt, due or tax date. A missing date is a review issue (expenseSourceIssues).
     setOrDelete(result, "datePayment", sourcePaymentDate);
   }
-  const cash = kind === "voucher" || text(header.paymentType) === "cash";
-  if (cash && !foreign && amounts.payableCzkMinor !== undefined && amounts.payableCzkMinor % 100 !== 0) {
-    warnings.push(`Cash payable ${formatMinorUnits(amounts.payableCzkMinor)} CZK has haléře; CZK cash is normally settled in whole crowns. Verify the payment method and rounding on the source; amounts are kept as the source states.`);
-  }
+  // A CZK cash payable with haléře and no stated rounding is a source-evidence issue
+  // (see expenseSourceIssues: CASH_ROUNDING_UNCONFIRMED); an explicit rounding, even 0,
+  // records that the printed final payable was read.
 
   // originalDocument / symVar / payment type rules.
   const payableMinor = amounts.payableCzkMinor;
@@ -310,6 +309,7 @@ export function resolveExpensePolicy(header: Record<string, any>, items: Record<
     payableCZK: payableMinor === undefined ? undefined : fromMinorUnits(payableMinor),
     originalDocumentRule,
     symVarRule,
+    roundingRule: amounts.roundingRule,
     sourceVatBreakdown: collapsedVat ? sourceVatBreakdown : undefined,
     original: {
       issueDate: sourceIssueDate,
@@ -355,6 +355,7 @@ type SummaryResult = {
   normalized: Record<string, number | undefined>;
   payableCzkMinor: number | undefined;
   sourceVatBreakdown: SourceVatBucket[];
+  roundingRule: RoundingRule;
 };
 
 function validateSummary(header: Record<string, any>, taxMode: TaxMode, foreign: boolean, warnings: string[]): SummaryResult {
@@ -415,7 +416,28 @@ function validateSummary(header: Record<string, any>, taxMode: TaxMode, foreign:
   if (!anyBucket) {
     fail("SUMMARY_REQUIRED", "At least one summary amount (priceNone or a VAT bucket) is required.", "priceNone");
   }
-  const rounding = minor("roundingAmount");
+  let rounding = minor("roundingAmount");
+  let roundingRule: RoundingRule = rounding === undefined ? "none" : "source";
+  // A second policy pass receives the normalized rounding as an explicit field.
+  // Keep its provenance only while the current source amounts still prove it.
+  const derived = foreign ? undefined : derivedCrownRounding(sum, total);
+  if (rounding !== undefined && derived === rounding && header._expensePolicy?.roundingRule === "derived-from-payable") {
+    roundingRule = "derived-from-payable";
+  }
+  if (rounding === undefined && !foreign) {
+    // `total` is the printed final payable (CELKEM K ÚHRADĚ). When it differs from the
+    // explicit source buckets only by whole-crown mathematical rounding, the rounding is
+    // fully determined by these two source facts. Anything else stays a mismatch: never
+    // absorb a larger difference, a non-crown payable or a possible misread as rounding.
+    if (derived !== undefined) {
+      rounding = derived;
+      roundingRule = "derived-from-payable";
+      normalized.roundingAmount = fromMinorUnits(derived);
+    }
+  }
+  if (roundingRule === "derived-from-payable") {
+    warnings.push(`Rounding ${formatMinorUnits(rounding!)} derived from the stated final payable ${formatMinorUnits(total)} and source amounts ${formatMinorUnits(sum)}; verify it against the printed final payable.`);
+  }
   if (rounding !== undefined) {
     sum += rounding;
   }
@@ -469,7 +491,16 @@ function validateSummary(header: Record<string, any>, taxMode: TaxMode, foreign:
       fail("SUMMARY_MISMATCH", `homePayableCZK ${formatMinorUnits(explicit!)} != total ${formatMinorUnits(total)} for a CZK document.`, "homePayableCZK");
     }
   }
-  return { normalized, payableCzkMinor, sourceVatBreakdown: breakdown };
+  return { normalized, payableCzkMinor, sourceVatBreakdown: breakdown, roundingRule };
+}
+
+export type RoundingRule = "source" | "derived-from-payable" | "none";
+
+/** Rounding implied by a whole-crown final payable that is the mathematical crown rounding of the buckets. */
+function derivedCrownRounding(bucketSumMinor: number, payableMinor: number): number | undefined {
+  if (payableMinor === bucketSumMinor || payableMinor % 100 !== 0) return undefined;
+  const rounded = Math.sign(bucketSumMinor) * Math.round(Math.abs(bucketSumMinor) / 100) * 100;
+  return rounded === payableMinor ? payableMinor - bucketSumMinor : undefined;
 }
 
 const PLAUSIBLE_RATES: Record<string, number[]> = { low: [12, 10, 15], high: [21], third: [10] };
@@ -529,6 +560,8 @@ export function expenseSourceIssues(header: Record<string, any>, kind: ExpenseKi
       message: `Source VS "${symVar}" is not numeric; a variable symbol has digits only (it may be another identifier such as a DIČ). Enter the digits-only VS printed on the source, or clear it if the source has none; it is never rewritten automatically.`
     });
   }
+  const cashRounding = unconfirmedCashRounding(header, kind);
+  if (cashRounding) issues.push(cashRounding);
   if (kind === "voucher" && firstText(header.sourcePaymentDate, applied ? "" : header.datePayment) === "") {
     issues.push({
       code: "SOURCE_PAYMENT_DATE_REQUIRED",
@@ -537,6 +570,24 @@ export function expenseSourceIssues(header: Record<string, any>, kind: ExpenseKi
     });
   }
   return issues;
+}
+
+/**
+ * A CZK cash payable with haléře is unusual (cash is settled in whole crowns), and the
+ * typical extraction error is copying the "Celkem vč. DPH" sum instead of the printed
+ * "CELKEM K ÚHRADĚ". Without an explicit roundingAmount (0 allowed) it needs review.
+ */
+function unconfirmedCashRounding(header: Record<string, any>, kind: ExpenseKind): ExpenseSourceIssue | undefined {
+  const cash = kind === "voucher" || text(header.paymentType) === "cash";
+  if (!cash || isForeignCurrency(header) || isMoneyInput(header.roundingAmount) || !isMoneyInput(header.total)) return undefined;
+  let total: number;
+  try { total = toMinorUnits(header.total, "total"); } catch { return undefined; }
+  if (total % 100 === 0) return undefined;
+  return {
+    code: "CASH_ROUNDING_UNCONFIRMED",
+    field: "roundingAmount",
+    message: `CZK cash payable ${formatMinorUnits(total)} has haléře and no rounding is stated. Re-read the printed final payable (CELKEM K ÚHRADĚ) and rounding line: if it differs from the VAT-inclusive sum, enter that printed payable as total (whole-crown rounding is then derived) or the printed roundingAmount; if the source really asks for ${formatMinorUnits(total)}, enter roundingAmount 0. Never substitute the bucket sum for the printed payable.`
+  };
 }
 
 function foreignVatId(header: Record<string, any>) {

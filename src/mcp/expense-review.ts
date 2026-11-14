@@ -18,6 +18,7 @@ import { moneyValue, sumHomeCurrency, toMinorUnits } from "../pohoda/money.js";
 import * as workbookCodec from "./review-workbook.js";
 import { companyKey, decideNonPayerTreatment, normalizeDic, normalizeIco } from "../registry/czech-registry.js";
 import { checkPreviewDuplicates, duplicateReviewNote } from "./expense-duplicates.js";
+import { isStandardPaymentMethod, PAYMENT_METHOD_LABELS, reconcilePaymentMethod } from "./payment-method.js";
 
 type Fields = Record<string, any>;
 
@@ -61,7 +62,7 @@ const TOOLS: ReviewTool[] = ["create_invoice", "create_other_liability", "create
 const ACTIONS: ReviewAction[] = ["import", "review", "skip"];
 const MONEY_FIELDS = new Set(["total", "roundingAmount", "priceNone", "priceLow", "priceLowVAT", "priceLowSum", "priceHigh", "priceHighVAT", "priceHighSum", "price3", "price3VAT", "price3Sum", "currencyPriceSum", "homePayableCZK"]);
 const DATE_FIELDS = new Set(["sourceIssueDate", "sourceTaxDate", "sourcePaymentDate", "date", "dateTax", "dateAccounting", "dateKHDPH", "datePayment", "dateDue"]);
-const SOURCE_FACT_FIELDS = ["sourceIssueDate", "sourceTaxDate", "sourcePaymentDate", "sourceDocumentNumber", "sourceSymVar", "taxMode", "total", "priceNone", "priceLow", "priceLowVAT", "priceHigh", "priceHighVAT", "price3", "price3VAT", "roundingAmount", "currency", "homePayableCZK", "text", "accounting", "cardPayment"];
+const SOURCE_FACT_FIELDS = ["sourceIssueDate", "sourceTaxDate", "sourcePaymentDate", "sourceDocumentNumber", "sourceSymVar", "taxMode", "total", "priceNone", "priceLow", "priceLowVAT", "priceHigh", "priceHighVAT", "price3", "price3VAT", "roundingAmount", "currency", "homePayableCZK", "text", "accounting", "paymentType", "cardPayment"];
 const PREFERRED_TEXT_LENGTH = 60;
 const HISTORY_COUNT = 50;
 const EXAMPLES_PER_QUERY = 5;
@@ -130,7 +131,7 @@ export class ExpenseReviewService {
       const current = workbook.rows.map((row) => {
         const original = originals.get(row.rowId);
         if (!original || original.tool !== row.tool) throw new ReviewImportError("Existing workbook contains an unknown or changed document row.");
-        return { rowId: row.rowId, tool: row.tool, data: mergeRow(original.data, row.data).data };
+        return { rowId: row.rowId, tool: row.tool, data: mergeReviewedRow(original.tool, original.data, row.data, row.targets).data };
       });
       const { snapshot: _snapshot, ...checks } = await checkPreviewDuplicates(this.client, current, target);
       if (!codec.updateReviewDuplicateChecks) throw new ReviewImportError("This workbook codec cannot safely refresh duplicate checks.");
@@ -372,7 +373,7 @@ export class ExpenseReviewService {
       if (text(row.tool) && row.tool !== original.tool) { errors.push(`row ${rowId} changed document kind ${original.tool} -> ${row.tool}; prepare a new review instead`); continue; }
       const action = text(row.action).toLowerCase() as ReviewAction;
       if (!ACTIONS.includes(action)) { errors.push(`row ${rowId} has action "${text(row.action)}" (use import, review or skip)`); continue; }
-      const merged = mergeRow(original.data, row.data ?? {});
+      const merged = mergeReviewedRow(original.tool, original.data, row.data ?? {}, row.targets);
       ignored.push(...merged.ignored.map((field) => ({ rowId, field })));
       const pdf = text(merged.data.sourcePdfPath);
       if (pdf && pdf !== text(original.data.sourcePdfPath) && !allowedPdfs.has(pdf)) { errors.push(`row ${rowId} sourcePdfPath ${pdf} is not one of the prepared source PDFs`); continue; }
@@ -491,7 +492,164 @@ function draftData(tool: ReviewTool, input: Fields, vatPeriod: string): { data: 
     if (data.type) { blocking = true; notes.push(`Invoice type ${data.type} is not an expense; set receivedInvoice or commitment in a new review.`); }
     data.type = "receivedInvoice";
   }
-  return { data, notes, blocking };
+  // Forma úhrady is the single reviewed payment fact; a card flag is only an input alias.
+  const payment = reconcilePaymentMethod(tool, data, "cardPayment" in data ? coerce("cardPayment", data.cardPayment) : undefined);
+  if (payment.conflict) { blocking = true; notes.push(payment.conflict); }
+  if (payment.notes.length) { blocking = true; notes.push(...payment.notes); }
+  return { data: payment.data, notes, blocking };
+}
+
+/** Visible POHODA target cell -> the source field an edit of it changes (see mapTargetEdits). */
+const TARGET_SOURCE: Record<string, string> = {
+  targetDocument: "sourceDocumentNumber", targetSymVar: "sourceSymVar",
+  targetDate: "sourceIssueDate", targetDateTax: "sourceTaxDate", targetDateAccounting: "dateAccounting", targetDateKHDPH: "sourceTaxDate",
+  targetPriceNone: "priceNone", targetPriceLow: "priceLow", targetPriceLowVAT: "priceLowVAT", targetPriceHigh: "priceHigh", targetPriceHighVAT: "priceHighVAT",
+  targetPrice3: "price3", targetPrice3VAT: "price3VAT", targetRounding: "roundingAmount", targetTotal: "total"
+};
+const BUCKET_SUM: Record<string, string> = { priceLow: "priceLowSum", priceLowVAT: "priceLowSum", priceHigh: "priceHighSum", priceHighVAT: "priceHighSum", price3: "price3Sum", price3VAT: "price3Sum" };
+const TARGET_LABELS = new Map(workbookCodec.REVIEW_COLUMNS.map((c) => [c.key, c.label]));
+
+function sameTarget(key: string, a: unknown, b: unknown): boolean {
+  if (empty(a) || empty(b)) return empty(a) && empty(b);
+  if (key.startsWith("targetPrice") || key === "targetRounding" || key === "targetTotal") {
+    try { return toMinorUnits(a as string | number) === toMinorUnits(b as string | number); } catch { return false; }
+  }
+  return text(a) === text(b);
+}
+
+/**
+ * mergeRow plus the two reviewed-preview contracts:
+ * - Forma úhrady decides the card flag (PK numbering); an old "Platba kartou" column is
+ *   still read and a contradiction blocks import.
+ * - Visible cells show what POHODA receives. An edited target cell is mapped to its
+ *   source field, the policy is re-run and the result must equal the edit; otherwise the
+ *   row is invalid with an explanation. Unchanged target cells are never read as data, but
+ *   every visible target cell must equal what is imported: a cell left stale by another
+ *   edit blocks the row until the reviewer updates it (inspect lists the value to type).
+ */
+function mergeReviewedRow(tool: ReviewTool, original: Fields, decoded: Fields, targets?: Fields): { data: Fields; changed: string[]; ignored: string[] } {
+  const vatPeriod = text(original.vatPeriod);
+  const before = workbookCodec.computeReviewTargets({ tool, data: original }, vatPeriod);
+  const edits: Fields = { ...(decoded ?? {}) };
+  const legacyCard = "cardPayment" in edits ? coerce("cardPayment", edits.cardPayment) : undefined;
+  delete edits.cardPayment;
+  // Členění DPH shows the written value (PN for non-tax rows); PN on/off is the VAT mode.
+  let taxSwitch: string | undefined;
+  if ("classificationVAT" in edits) {
+    const shown = text(before.classificationVAT ?? original.classificationVAT);
+    const now = text(edits.classificationVAT);
+    if (now === shown) edits.classificationVAT = original.classificationVAT ?? "";
+    else if (now === "PN") taxSwitch = "nonTax";
+    else if (shown === "PN") taxSwitch = "taxable";
+  }
+  const merged = mergeRow(original, edits);
+  if (taxSwitch && !merged.changed.includes("taxMode")) { merged.data.taxMode = taxSwitch; merged.changed.push("taxMode"); }
+  const baseline = reconcilePaymentMethod(tool, original, original.cardPayment).data;
+  const result = reconcilePaymentMethod(tool, merged.data, legacyCard);
+  merged.data = result.data;
+  delete merged.data._paymentReviewError;
+  delete merged.data._targetReviewError;
+  for (const key of ["paymentType", "cardPayment"]) {
+    const differs = !sameValue(merged.data[key], baseline[key]);
+    const at = merged.changed.indexOf(key);
+    if (differs && at < 0) merged.changed.push(key);
+    if (!differs && at >= 0) merged.changed.splice(at, 1);
+  }
+  const method = text(merged.data.paymentType);
+  const editedUnknown = merged.changed.includes("paymentType") && method && !isStandardPaymentMethod(method);
+  const error = result.conflict ?? (editedUnknown ? `Forma úhrady "${method}" není známá; použijte ${Object.values(PAYMENT_METHOD_LABELS).join(", ")}. Neznámou zkratku z POHODY nelze zadat v kontrole, připravte ji ve zdrojových datech.` : undefined);
+  if (error) merged.data._paymentReviewError = error;
+  delete merged.data._registryReviewError;
+  const targetError = mapTargetEdits(tool, merged, original, before, targets ?? {}, vatPeriod);
+  if (targetError) merged.data._targetReviewError = targetError;
+  return merged;
+}
+
+type TargetCell = [string, unknown];
+
+function mapTargetEdits(tool: ReviewTool, merged: { data: Fields; changed: string[] }, original: Fields, before: Fields, targets: Fields, vatPeriod: string): string | undefined {
+  const cells: TargetCell[] = Object.entries(targets).filter(([key]) => key in TARGET_SOURCE);
+  const edited = cells.filter(([key, value]) => !sameTarget(key, value, before[key]));
+  const label = (key: string) => TARGET_LABELS.get(key) ?? key;
+  const shown = (v: unknown) => empty(v) ? "(prázdné)" : String(v);
+  // Applies target edits to a copy; the targets are what the import would write.
+  const trial = (mapped: TargetCell[]) => {
+    const row = { data: structuredClone(merged.data), changed: [...merged.changed] };
+    const errors = assignTargetEdits(row, mapped, edited, label);
+    recheckRegistry(row, original);
+    // A registry/VAT decision error is reported by preflight; targets cannot be judged before it.
+    const after: Fields = row.data._registryReviewError ? {} : workbookCodec.computeReviewTargets({ tool, data: row.data }, vatPeriod);
+    return { row, errors, after };
+  };
+  const matches = (after: Fields, [key, value]: TargetCell) => Object.keys(after).length > 0 && sameTarget(key, after[key], value);
+  // A cell typed to the value other edits already produce (new rounding after a Celkem
+  // edit, gross in Bez DPH / PN after switching to PN) is the reviewer bringing a dependent
+  // cell up to date, not a new source fact. Only the remaining edits change source fields.
+  const base = trial([]).after;
+  let mapped = edited.filter((cell) => !matches(base, cell));
+  for (const cell of [...mapped]) {
+    const without = mapped.filter((c) => c !== cell);
+    const attempt = trial(without);
+    if (!attempt.errors.length && matches(attempt.after, cell) && without.every((c) => matches(attempt.after, c))) mapped = without;
+  }
+  const { row, errors, after } = trial(mapped);
+  merged.data = row.data;
+  merged.changed.splice(0, merged.changed.length, ...row.changed);
+  if (Object.keys(after).length) {
+    const policy = policyOf(tool, merged.data);
+    for (const [key, value] of edited) {
+      if (!sameTarget(key, after[key], value)) errors.push(`${label(key)}: ${shown(value)} nelze zapsat, podle pravidel importu bude ${shown(after[key])}${targetLockReason(key, policy, tool)}.`);
+    }
+    // The table must show what is imported: an unchanged cell made stale by another edit
+    // (Členění DPH, Forma úhrady, Celkem, ...) blocks the row until the reviewer updates it.
+    const stale = cells.filter(([key, value]) => !edited.some(([k]) => k === key) && !sameTarget(key, after[key], value))
+      .map(([key, value]) => `${label(key)} ${shown(value)} → ${empty(after[key]) ? "vymazat" : String(after[key])}`);
+    if (stale.length) errors.push(`Po úpravách tabulka neukazuje importované hodnoty: ${stale.join("; ")}. Přepište tyto buňky (sbalené sloupce rozbalte).`);
+  }
+  return errors.length ? [...new Set(errors)].join(" ") : undefined;
+}
+
+/** Maps target edits onto source fields of `row` (mutated). Conflicting edits of one field are errors. */
+function assignTargetEdits(row: { data: Fields; changed: string[] }, mapped: TargetCell[], edited: TargetCell[], label: (key: string) => string): string[] {
+  const { data, changed } = row, errors: string[] = [];
+  const assigned = new Map<string, unknown>();
+  for (const [key, value] of mapped) {
+    // Distinct Datum DPH and Datum KH edits: KH is the DUZP, Datum DPH a requested override.
+    const field = key === "targetDateTax" && edited.some(([k, v]) => k === "targetDateKHDPH" && !sameTarget(key, v, value)) ? "dateTax" : TARGET_SOURCE[key]!;
+    const previous = assigned.has(field) ? assigned.get(field) : changed.includes(field) ? data[field] : undefined;
+    if ((assigned.has(field) || changed.includes(field)) && !sameValue(previous, value, field)) {
+      errors.push(`${label(key)}: upraveno současně s jinou hodnotou téhož údaje; ponechte jednu úpravu.`);
+      continue;
+    }
+    assigned.set(field, value);
+  }
+  for (const [field, value] of assigned) {
+    if (empty(value)) delete data[field]; else data[field] = typeof value === "string" ? value.trim() : value;
+    if (BUCKET_SUM[field]) delete data[BUCKET_SUM[field]!];
+    if (!changed.includes(field)) changed.push(field);
+  }
+  if (assigned.has("sourceTaxDate") && !assigned.has("dateTax")) delete data.dateTax;
+  // Edited VAT amounts are the reviewer's statement of whether the document charges VAT.
+  if (["priceLowVAT", "priceHighVAT", "price3VAT"].some((field) => assigned.has(field))) {
+    const chargesVat = ["priceLowVAT", "priceHighVAT", "price3VAT"].some((field) => !empty(data[field]) && Number(data[field]) !== 0);
+    if (data.sourceChargesVat !== chargesVat) { data.sourceChargesVat = chargesVat; if (!changed.includes("sourceChargesVat")) changed.push("sourceChargesVat"); }
+  }
+  return errors;
+}
+
+function policyOf(tool: ReviewTool, data: Fields): Fields {
+  try { const header = toolHeader(tool, data); return resolveExpensePolicy({ ...header, ...(header.cardPayment === true ? { cardSequence: 1 } : {}) }, [], tool === "create_cash_voucher" ? "voucher" : "invoice")._expensePolicy ?? {}; }
+  catch { return {}; }
+}
+
+function targetLockReason(key: string, policy: Fields, tool: ReviewTool): string {
+  if (key.startsWith("targetDate") && policy.lateSource) return " (pozdní doklad: data jsou 1. den období DPH; původní data zůstávají v interní poznámce)";
+  if (key === "targetDateKHDPH" && policy.taxMode === "nonTax") return " (PN nemá datum KH)";
+  if (key === "targetDateAccounting" && tool === "create_cash_voucher") return " (pokladní doklad nemá účetní datum)";
+  if ((key === "targetDocument" || key === "targetSymVar") && policy.originalDocumentRule === "card-sequence") return " (číslo přidělí import z řady PK)";
+  if (key === "targetDocument" && policy.originalDocumentRule === "omitted-at-or-below-threshold") return " (hotovost do 10 000 Kč je bez čísla dokladu)";
+  if (key.startsWith("targetPrice") && policy.taxMode === "nonTax") return " (PN: celá částka je v Bez DPH / PN)";
+  return "";
 }
 
 /** Starts from the stored row; only whitelisted workbook columns can change it. */
@@ -517,6 +675,12 @@ function mergeRow(original: Fields, decoded: Fields): { data: Fields; changed: s
     sourcePaymentDate: ["datePayment"], sourceDocumentNumber: ["originalDocument"], sourceSymVar: ["symVar"]
   };
   for (const field of changed) for (const alias of aliases[field] ?? []) delete data[alias];
+  return { data, changed, ignored };
+}
+
+/** Registry/VAT evidence belongs to the reviewed identity and amounts; re-decided after all edits. */
+function recheckRegistry(merged: { data: Fields; changed: string[] }, original: Fields): void {
+  const { data, changed } = merged;
   const identityChanged = changed.some((field) => ["partnerIco", "partnerDic", "partnerId", "partnerCountry"].includes(field));
   if (identityChanged) {
     // Registry evidence belongs to the reviewed identity. It cannot automatically
@@ -537,7 +701,6 @@ function mergeRow(original: Fields, decoded: Fields): { data: Fields; changed: s
       data._registryReviewError = `VAT treatment requires review: ${decision.reasons.join("; ")}`;
     }
   }
-  return { data, changed, ignored };
 }
 
 function coerce(key: string, value: unknown): unknown {
@@ -588,6 +751,8 @@ function toolHeader(tool: ReviewTool, data: Fields): Fields {
 function preflight(tool: ReviewTool, data: Fields): { ok: boolean; error?: string; preview?: Fields } {
   try {
     if (data._registryReviewError) throw new Error(data._registryReviewError);
+    if (data._paymentReviewError) throw new Error(data._paymentReviewError);
+    if (data._targetReviewError) throw new Error(data._targetReviewError);
     if (data._supplierChanged && !data.partnerName) throw new Error("Supplier identity changed; confirm the new supplier name/address or prepare a refreshed preview.");
     if (data.partnerIco && (!data.partnerCountry || data.partnerCountry === "CZ") && !normalizeIco(data.partnerIco).ok) throw new Error("Invalid Czech supplier IČO; review the source identifier.");
     const header = toolHeader(tool, data);
@@ -605,7 +770,9 @@ function preflight(tool: ReviewTool, data: Fields): { ok: boolean; error?: strin
     const planned: Fields = {
       date: resolved.date, dateTax: resolved.dateTax, dateAccounting: resolved.dateAccounting, dateKHDPH: resolved.dateKHDPH, datePayment: resolved.datePayment,
       classificationVAT: resolved.classificationVAT, taxMode: policy.taxMode, lateSource: policy.lateSource, payableCZK: policy.payableCZK,
-      priceNone: resolved.priceNone, sourceVatBreakdown: policy.sourceVatBreakdown,
+      priceNone: resolved.priceNone, priceLow: resolved.priceLow, priceLowVAT: resolved.priceLowVAT, priceHigh: resolved.priceHigh, priceHighVAT: resolved.priceHighVAT,
+      price3: resolved.price3, price3VAT: resolved.price3VAT, roundingAmount: resolved.roundingAmount, roundingRule: policy.roundingRule, total: resolved.total,
+      paymentType: resolved.paymentType, sourceVatBreakdown: policy.sourceVatBreakdown,
       originalDocument: cardNumbered ? "assigned from the next PK number at import" : resolved.originalDocument,
       symVar: cardNumbered ? "assigned from the next PK number at import" : resolved.symVar,
       originalDocumentRule: policy.originalDocumentRule,

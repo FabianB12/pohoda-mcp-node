@@ -91,11 +91,15 @@ describe("actual payment dates", () => {
     expect(resolveExpensePolicy(legacy, [], "voucher").datePayment).toBe("2026-11-06");
   });
 
-  it("notes haléře on a CZK cash payable without changing amounts", () => {
-    const result = resolveExpensePolicy({ ...cash, sourcePaymentDate: "2026-11-03", priceHigh: 100.5, priceHighVAT: 21.11, total: 121.61 }, [], "voucher");
+  it("requires a stated rounding for a CZK cash payable with haléře, never changing amounts", () => {
+    const halere = { ...cash, sourcePaymentDate: "2026-11-03", priceHigh: 100.5, priceHighVAT: 21.11, total: 121.61 };
+    expect(code(() => resolveExpensePolicy(halere, [], "voucher"))).toBe("CASH_ROUNDING_UNCONFIRMED");
+    expect(codes({ ...halere, type: "receivedInvoice", paymentType: "cash" })).toEqual(["CASH_ROUNDING_UNCONFIRMED"]);
+    expect(codes({ ...halere, type: "receivedInvoice", paymentType: "draft" })).toEqual([]);
+    const result = resolveExpensePolicy({ ...halere, roundingAmount: 0 }, [], "voucher");
     expect(result.total).toBe(121.61);
     expect(result.roundingDocument).toBe("none");
-    expect(result._expensePolicy.warnings.join(" ")).toContain("has haléře");
+    expect(result._expensePolicy.roundingRule).toBe("source");
     const whole = resolveExpensePolicy({ ...cash, sourcePaymentDate: "2026-11-03" }, [], "voucher");
     expect(whole._expensePolicy.warnings.join(" ")).not.toContain("haléře");
   });

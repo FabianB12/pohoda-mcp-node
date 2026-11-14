@@ -96,6 +96,59 @@ OCR of scanned statements is not tested. Offline: 1000 movements use one write
 and 31 bounded reads. Evidence: `tests/output/bankrules-opus55r2.json` and
 `tests/output/bankrules-opus55r2/`.
 
+### Liquidation-state variants (`bankvar`, 14 November 2026)
+
+A reported client preview failed with “POHODA did not export the invoice liquidation
+state”. The client XML was not available, so its specific cause is **not proven**.
+The demo reproduced the same message, read-only, with the previous code
+(`tests/output/bankvar-oldrepro.json`): the bank scan reads all six liquidable
+agendas, and one valid zero-total invoice aborted the whole preview.
+
+The demo exported these `inv:invoiceHeader/inv:liquidation` shapes (`typ:liquidationType`;
+the XSD makes every child optional and gives no semantics for omitted ones). Evidence is in
+`tests/output/bankvariants-bv1*`, `bankvariants-bv2*` and `bankvar-bvlive1*`:
+
+| Document | Exported state |
+| --- | --- |
+| Unpaid CZK (all six agendas incl. advances) | `amountHome` = remaining amount |
+| Partially paid CZK | `date` + `amountHome` (remaining) |
+| Fully paid (received/issued invoice, commitment, receivable, both advance types; EUR) | `date` only |
+| Unpaid / partially paid EUR | `amountHome` + `amountForeign` (+ `date` once partially paid) |
+| Zero total | empty `<inv:liquidation/>`, no `liquidations`, also with `lst:liquidations` |
+| Negative document | negative `amountHome` |
+| Storno pair | `storno` = `cancelledDocument` / `cancelDocument` (an enum, not a boolean), `date` only |
+
+Corrective tax documents are listed only under their own invoice type; CZ
+`receivedCreditNotice` imports are rejected (“Nesprávný typ dokladu”). An EUR bank
+liquidation with an explicit bank rate on the EUR account was accepted. Automatic
+execution still does not support it.
+
+Changes: each document is classified separately. Live shapes are known. A zero total
+counts as settled only after a `lst:liquidations` read shows no allocations. A
+missing or empty state, a missing foreign remaining amount, an invalid amount, ID or
+date, or a missing type is unknown. It is never treated as zero, paid or the original
+total, and the remaining amount is never computed from totals minus allocations.
+Unknown documents are re-read by ID with liquidations, at most 1000 per preview. Those
+still unresolved are listed in `diagnostics` (agenda, id, number, field, problem,
+blocking movements, link count), with no partner data or raw XML. They never match.
+They block only payments they could compete with: the same direction/currency and VS,
+or for amount-only rows the same or an unknown amount. These rows are `needs_review`
+with `blockedBy`. The rest of the plan stays valid, and `execute=true` writes only
+those other matches. Cancelled and cancelling documents are now excluded as storno.
+A failed global scan is still fatal, with a precise read-only message.
+
+Live (`bvlive1`, 5/5): shapes as in the table above. The MCP preview gives the full plan
+with zero-total and storno documents present (both zero-total demo invoices resolved
+by the targeted read; storno and paid-advance payments unmatched; received advance
+matched). A proxy hid one invoice's state from every read. The preview stayed
+usable, with that ID in `diagnostics` and its VS row plus two amount-only rows
+`needs_review`. Execute wrote and verified only the two unaffected settlements
+(zero remaining, bank link with ID/amount/date, two PDF checks). The blocked
+invoices, storno and paid documents stayed unchanged, and a renamed retry wrote
+nothing. Entry point: `tests/pohoda-bank-variants.integration.test.ts`.
+After the change, the original live bank suites passed again: `pohoda-bank` 4/4
+(`bvreg1`) and `pohoda-bank-rules` 7/7 (`bvreg2`, evidence `tests/output/bankrules-bvreg2*`).
+
 Official schema references: [bank liquidation items](https://www.stormware.cz/schema/version_2/bank.xsd),
 [invoice liquidation state](https://www.stormware.cz/schema/version_2/invoice.xsd),
 and [bank account rate modes](https://www.stormware.cz/schema/version_2/bankAccount.xsd).

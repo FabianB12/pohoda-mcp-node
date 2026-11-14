@@ -1863,7 +1863,8 @@ function buildPaymentType(paymentType: string): XmlObject | undefined {
   if (paymentType === "") {
     return undefined;
   }
-  return ["draft", "cash", "creditcard", "compensation"].includes(paymentType)
+  // type.xsd paymentType/paymentType enumeration; anything else is a Forma úhrady abbreviation.
+  return ["draft", "cash", "postal", "delivery", "creditcard", "advance", "encashment", "cheque", "compensation"].includes(paymentType)
     ? { "typ:paymentType": paymentType }
     : { "typ:ids": paymentType };
 }

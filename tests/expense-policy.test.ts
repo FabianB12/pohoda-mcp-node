@@ -246,7 +246,7 @@ describe("resolveExpensePolicy", () => {
     const roundedDown = resolveExpensePolicy({ ...expense, priceHigh: 8264.88, priceHighVAT: 1735.62, roundingAmount: -0.5, total: 10000 }, [], "voucher");
     expect(roundedDown.originalDocument).toBeUndefined();
 
-    const above = resolveExpensePolicy({ ...expense, priceHigh: 8264.47, priceHighVAT: 1735.54, total: 10000.01 }, [], "voucher");
+    const above = resolveExpensePolicy({ ...expense, priceHigh: 8264.47, priceHighVAT: 1735.54, roundingAmount: 0, total: 10000.01 }, [], "voucher");
     expect(above.originalDocument).toBe("UCT-9");
     expect(above.intNote).toBeUndefined();
 

@@ -175,9 +175,12 @@ describe("Read-only preview duplicate checks", () => {
     const sheet = wb.getWorksheet("Doklady")!;
     expect(sheet.rowCount).toBe(90);
     const actionColumn = REVIEW_COLUMNS.findIndex((c) => c.key === "action") + 1;
-    const totalColumn = REVIEW_COLUMNS.findIndex((c) => c.key === "total") + 1;
+    const totalColumn = REVIEW_COLUMNS.findIndex((c) => c.key === "targetTotal") + 1;
+    const notesColumn = REVIEW_COLUMNS.findIndex((c) => c.key === "reviewNotes") + 1;
     for (let row = 3; row <= 90; row++) expect(sheet.getCell(row, actionColumn).text).toBe("Prověřit");
-    expect(sheet.getCell(3, totalColumn).value).toBe(121.48); // preserve the source discrepancy
+    // The source discrepancy is preserved and named, never replaced by a computed POHODA total.
+    expect(sheet.getCell(3, totalColumn).value).toBeNull();
+    expect(sheet.getCell(3, notesColumn).text).toContain("121.48");
     expect(client.calls).toHaveLength(1);
     const again = await service.prepare({ databaseId: target.databaseOverride, target, vatPeriod: "2026-11", documents });
     expect(again).toMatchObject({ ok: true, status: "requiresReview", reused: true, nextAction: "deliver_workbook", workbookPath: result.workbookPath });

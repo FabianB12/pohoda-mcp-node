@@ -711,7 +711,7 @@ export function registerPohodaTools(server: McpServer, context: PohodaServerCont
 
   server.registerTool("process_bank_statement", {
     title: "Match and settle a bank statement",
-    description: "For bank-statement PDFs: read the statement account/IBAN, currency, period and all transactions first. Automatic execution currently supports CZK; foreign currency requires review and is blocked before writing until a verified bank rate is available. Matches only exact outstanding amounts, variable symbol first (oldest document first), otherwise a unique amount. execute=true creates real liquidation links and verifies fully paid invoices, then returns a checked copy of the PDF. Unmatched/ambiguous payments are never written. execute=false previews matches without accounting writes. Use instead of plain create_bank_document when the user asks to process and settle a statement.",
+    description: "For bank-statement PDFs (not the expense XLSX workflow): read the statement account/IBAN, currency, period and all transactions first. Always call execute=false first: it returns the read-only plan (matched, unmatched, needs_review with blockedBy, diagnostics for POHODA documents whose liquidation state cannot be proven) without accounting writes. execute=true then creates real liquidation links for matched rows only, verifies fully paid invoices and returns a checked copy of the PDF. Automatic execution currently supports CZK; foreign currency is blocked before writing until a verified bank rate is available. Matches only exact outstanding amounts, variable symbol first (oldest document first), otherwise a unique amount. Unmatched, ambiguous and needs_review payments are never written. If execute=true is rejected, return the plan; never bypass it with raw XML or other write tools.",
     inputSchema: {
       databaseId: databaseIdSchema,
       sourcePdfPath: z.string().min(1),
@@ -719,7 +719,7 @@ export function registerPohodaTools(server: McpServer, context: PohodaServerCont
       dateStatement: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
       accountNumber: z.string().optional(), bankCode: z.string().optional(), iban: z.string().optional(),
       currency: z.string().regex(/^[A-Z]{3}$/),
-      execute: z.boolean().default(false).describe("True only when the user requested actual processing/settlement, not just a preview."),
+      execute: z.boolean().default(false).describe("False: read-only plan (call this first). True only after presenting that plan, within the user's request to process/settle and any host approval."),
       payments: z.array(z.object({
         movement: z.number().int().min(1).max(999999).describe("Stable movement number from the statement, including unmatched rows; never renumber only matched rows."),
         date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/), amount: z.union([z.number().positive(),z.string().min(1)]),
@@ -1441,6 +1441,7 @@ export function registerPohodaTools(server: McpServer, context: PohodaServerCont
 
   server.registerTool("raw_xml_batch", {
     title: "Send raw Pohoda XML batch",
+    description: "Advanced XML for workflows without a typed tool. Not for expense documents or bank-statement settlement (use process_bank_statement), and never a way around a rejected or unapproved write.",
     inputSchema: { items: z.array(z.string().min(1)).min(1), note: z.string().default(""), dataPackId: z.string().default(""), databaseId: databaseIdSchema },
     annotations: { destructiveHint: true, idempotentHint: false, openWorldHint: true }
   }, async ({ items, note, dataPackId, databaseId }) => {

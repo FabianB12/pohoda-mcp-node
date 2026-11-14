@@ -23,6 +23,7 @@ import JSZip from "jszip"; // ExcelJS's own ZIP dependency
 import { resolveExpensePolicy } from "../pohoda/expense-policy.js";
 import type { ReviewAction, ReviewRow, ReviewTool, ReviewWorkbook, ReviewWorkbookRead } from "./review-contract.js";
 import { withDuplicateReviewNote, type PreviewDuplicateCheck } from "./expense-duplicates.js";
+import { displayedPaymentMethod, effectiveCardPayment, normalizePaymentMethod, paymentMethodLabel, PAYMENT_METHOD_LABELS, PRIMARY_PAYMENT_METHODS, reconcilePaymentMethod } from "./payment-method.js";
 
 export const REVIEW_WORKBOOK_FORMAT = "pohoda-mcp-review-workbook";
 export const REVIEW_WORKBOOK_SCHEMA_VERSION = 1;
@@ -58,11 +59,12 @@ export const REVIEW_TAX_MODE_LABELS: Readonly<Record<"auto" | "taxable" | "nonTa
 const BOOLEAN_LABELS = { true: "Ano", false: "Ne" } as const;
 
 export type ReviewColumnKind = "rowId" | "action" | "reviewNotes" | "tool" | "plan" | "display"
-  | "text" | "id" | "date" | "money" | "number" | "integer" | "boolean" | "taxMode" | "pages";
-type ColumnGroup = "control" | "plan" | "source" | "target" | "posting" | "advanced" | "trace";
+  | "text" | "id" | "date" | "money" | "number" | "integer" | "boolean" | "taxMode" | "pages" | "paymentMethod"
+  | "targetText" | "targetDate" | "targetMoney";
+type ColumnGroup = "control" | "plan" | "target" | "source" | "advanced" | "trace";
 
 export type ReviewColumn = {
-  /** Internal key. For data columns this is the `ReviewRow.data` field name. */
+  /** Internal key. Data columns: the `ReviewRow.data` field; target columns: the `ReviewRow.targets` field. */
   key: string;
   /** Czech header label shown in the workbook. */
   label: string;
@@ -76,63 +78,61 @@ export type ReviewColumn = {
 const col = (key: string, label: string, kind: ReviewColumnKind, group: ColumnGroup, width: number, note?: string): ReviewColumn =>
   note === undefined ? { key, label, kind, group, width } : { key, label, kind, group, width, note };
 
-/** Column layout of the "Doklady" sheet, in written order. */
+const TARGET_NOTE = "Hodnota, kterou import zapíše do POHODY (podle sdílených pravidel importu). Úprava se při kontrole převede na zdrojový údaj a znovu přepočítá; pokud ji pravidla nedovolí (např. pozdní doklad, číslování PK), import ji odmítne s vysvětlením.";
+
+/**
+ * Column layout of the "Doklady" sheet, in written order. The visible "DO POHODY" group
+ * holds exactly the values the import writes: pass-through data fields (text, supplier,
+ * Předkontace, ...) and policy-derived target cells (Doklad, VS, dates, VAT buckets, total).
+ * Source facts (supplier number, original dates and amounts) stay in the collapsed ZDROJ
+ * group and in the manifest; they are revealed only when the policy flags them.
+ */
 export const REVIEW_COLUMNS: readonly ReviewColumn[] = [
   col("rowId", "ID řádku", "rowId", "control", 11, "Stabilní identifikátor řádku z přípravy. Neměňte jej. Řádky lze řadit, filtrovat i mazat; řádky s neznámým ID budou při importu odmítnuty."),
   col("action", "Akce", "action", "control", 13, "Importovat = řádek se importuje po vašem výslovném pokynu. Prověřit = zatím neimportovat. Vynechat = neimportovat."),
   col("reviewNotes", "Poznámka (neimportuje se)", "reviewNotes", "control", 28, "Vaše poznámka pro kontrolu. Do POHODY se NEPŘENÁŠÍ (ani do interní poznámky)."),
   col("tool", "Typ dokladu", "tool", "control", 17),
-  col("plannedImport", "Plán importu (jen pro čtení, přepočítá se)", "plan", "plan", 44, "Informativní náhled úprav podle pravidel importu (pozdní DUZP, PN, číslování). Při importu se znovu spočítá z upravených zdrojových hodnot; tento sloupec se nikdy neimportuje."),
-  col("text", "Text dokladu v POHODĚ", "text", "source", 34, "Krátký text, který se zapíše do POHODY jako text dokladu. Nezaměňujte s Poznámkou ke kontrole."),
-  col("partnerName", "Dodavatel", "text", "source", 26),
-  col("partnerIco", "IČO", "id", "source", 11, "Uloženo jako text, aby se zachovaly úvodní nuly."),
-  col("partnerDic", "DIČ", "id", "source", 13),
-  col("partnerCountry", "Země", "text", "source", 7),
-  col("sourceDocumentNumber", "Číslo dokladu dodavatele", "id", "source", 18, "Číslo přesně podle zdroje (účtenky/faktury). Nemusí být totéž co pole Doklad v POHODĚ – to ukazuje sloupec Doklad v POHODĚ (vypočteno)."),
-  col("sourceSymVar", "Variabilní symbol (zdroj)", "id", "source", 14, "VS jen pokud je uveden na dokladu; prázdné = zdroj VS nemá. Výsledný VS ukazuje sloupec VS v POHODĚ (vypočteno)."),
-  col("targetDocument", "Doklad v POHODĚ (vypočteno)", "display", "target", 15, "Hodnota pole Doklad, kterou zapíše import podle pravidel (např. hotovost do 10 000 Kč bez čísla, karta do 10 000 Kč K + další číslo řady PK). Jen pro čtení: nečte se, import ji přepočítá z upravených zdrojových údajů. Zdrojové číslo zůstává v interní poznámce."),
-  col("targetSymVar", "VS v POHODĚ (vypočteno)", "display", "target", 13, "Variabilní symbol, který zapíše import (ze zdroje, odvozený z čísla faktury, nebo číslo řady PK u karty). Jen pro čtení; import jej přepočítá."),
-  col("sourceIssueDate", "Datum vystavení (zdroj)", "date", "source", 12, "Datum přesně podle dokladu. Pozdní doklad se při importu přesune na 1. den zvoleného období DPH; původní datum se zachová."),
-  col("sourceTaxDate", "DUZP (zdroj)", "date", "source", 12, "DUZP přesně podle dokladu. Nikdy jej neodvozujte z data vystavení."),
-  col("dateDue", "Datum splatnosti (zdroj)", "date", "source", 12),
-  col("taxMode", "Režim DPH", "taxMode", "source", 17, "Daňový = nárok na odpočet. PN = celá částka do 0 % sazby bez data KH. Automaticky = rozhodne import podle ověřených údajů o dodavateli."),
-  col("sourceChargesVat", "Doklad účtuje DPH", "boolean", "source", 10, "Ano/Ne podle dokladu; prázdné = neznámo. Chybějící DIČ samo o sobě neprokazuje neplátce."),
-  col("cardPayment", "Platba kartou", "boolean", "source", 10),
-  col("currency", "Měna", "text", "source", 7),
-  col("priceNone", "Bez DPH / 0 % (zdroj)", "money", "source", 13, "Částky přesně podle dokladu. Prázdná buňka ≠ 0."),
-  col("priceLow", "Základ 12 % (zdroj)", "money", "source", 13),
-  col("priceLowVAT", "DPH 12 % (zdroj)", "money", "source", 12),
-  col("priceLowSum", "Celkem 12 % (zdroj)", "money", "source", 13),
-  col("priceHigh", "Základ 21 % (zdroj)", "money", "source", 13),
-  col("priceHighVAT", "DPH 21 % (zdroj)", "money", "source", 12),
-  col("priceHighSum", "Celkem 21 % (zdroj)", "money", "source", 13),
-  col("roundingAmount", "Zaokrouhlení (zdroj)", "money", "source", 12),
-  col("total", "Celkem k úhradě (zdroj)", "money", "source", 14, "Přesná částka k úhradě PO zaokrouhlení."),
-  col("homePayableCZK", "K úhradě v CZK (zdroj)", "money", "source", 14, "Ověřená částka v CZK u cizí měny. Nikdy ji neodhadujte kurzem 1."),
-  col("accounting", "Předkontace", "text", "posting", 12),
-  col("classificationVAT", "Členění DPH", "text", "posting", 11),
-  col("cashAccount", "Pokladna", "text", "posting", 10),
-  col("price3", "Základ 3. sazba (zdroj)", "money", "advanced", 13),
-  col("price3VAT", "DPH 3. sazba (zdroj)", "money", "advanced", 12),
-  col("price3Sum", "Celkem 3. sazba (zdroj)", "money", "advanced", 13),
-  col("currencyRate", "Kurz", "number", "advanced", 10, "Prázdné = kurz nastavený v POHODĚ. Nikdy nedoplňujte 1."),
-  col("currencyAmount", "Kurz za množství", "integer", "advanced", 10),
-  col("partnerId", "ID adresy v POHODĚ", "integer", "advanced", 11),
-  col("partnerStreet", "Ulice dodavatele", "text", "advanced", 24),
-  col("partnerCity", "Obec dodavatele", "text", "advanced", 20),
-  col("partnerZip", "PSČ dodavatele", "id", "advanced", 10),
-  col("partnerVatStatus", "Status DPH dodavatele", "text", "advanced", 18),
-  col("vatStatusEvidence", "Podklad statusu DPH", "text", "advanced", 32),
-  col("dateAccounting", "Datum účetního případu", "date", "advanced", 14),
-  col("accountIds", "Účet dokladu", "text", "advanced", 14),
-  col("paymentAccountNumber", "Číslo bankovního účtu", "id", "advanced", 24),
-  col("paymentBankCode", "Kód banky", "id", "advanced", 10),
-  col("note", "Poznámka v POHODĚ (importuje se)", "text", "advanced", 32),
-  col("classificationKVDPH", "Členění KH DPH", "text", "advanced", 14),
-  col("paymentType", "Forma úhrady", "text", "advanced", 14),
-  col("centre", "Středisko", "text", "advanced", 11),
-  col("activity", "Činnost", "text", "advanced", 11),
-  col("contract", "Zakázka", "text", "advanced", 11),
+  col("text", "Text dokladu v POHODĚ", "text", "target", 34, "Krátký text, který se zapíše do POHODY jako text dokladu. Nezaměňujte s Poznámkou ke kontrole."),
+  col("partnerName", "Dodavatel", "text", "target", 26),
+  col("partnerIco", "IČO", "id", "target", 11, "Uloženo jako text, aby se zachovaly úvodní nuly."),
+  col("partnerDic", "DIČ", "id", "target", 13),
+  col("partnerCountry", "Země", "text", "target", 7),
+  col("partnerStreet", "Ulice dodavatele", "text", "target", 24),
+  col("partnerCity", "Obec dodavatele", "text", "target", 20),
+  col("partnerZip", "PSČ dodavatele", "id", "target", 10),
+  col("partnerId", "ID adresy v POHODĚ", "integer", "target", 11),
+  col("targetDocument", "Doklad v POHODĚ", "targetText", "target", 15, `${TARGET_NOTE} Hotovost do 10 000 Kč: prázdné. Karta do 10 000 Kč: číslo přidělí import z řady PK.`),
+  col("targetSymVar", "VS v POHODĚ", "targetText", "target", 13, TARGET_NOTE),
+  col("targetDate", "Datum dokladu", "targetDate", "target", 12, `${TARGET_NOTE} Pozdní doklad: 1. den období DPH; původní data zůstávají v interní poznámce.`),
+  col("targetDateTax", "Datum DPH", "targetDate", "target", 12, TARGET_NOTE),
+  col("targetDateAccounting", "Účetní datum", "targetDate", "target", 12, `${TARGET_NOTE} Prázdné = neodesílá se (POHODA použije své výchozí).`),
+  col("targetDateKHDPH", "Datum KH DPH", "targetDate", "target", 12, `${TARGET_NOTE} PN nemá datum KH.`),
+  col("dateDue", "Datum splatnosti", "date", "target", 12),
+  col("paymentType", "Forma úhrady", "paymentMethod", "target", 12, "Hotově / Kartou / Převodem / Dobírkou podle dokladu; prázdné = neznámo. Ostatní závazek s Formou Kartou se čísluje řadou PK (do 10 000 Kč Doklad K + číslo a VS = číslo, nad 10 000 Kč číslo dokladu dodavatele). Pokladní výdej je vždy Hotově. Jiné formy POHODY (Složenkou, Inkasem, Šekem, Zápočtem, Zálohou) zůstávají zachovány."),
+  col("accountIds", "Účet dokladu", "text", "target", 14),
+  col("paymentAccountNumber", "Číslo bankovního účtu", "id", "target", 24),
+  col("paymentBankCode", "Kód banky", "id", "target", 10),
+  col("accounting", "Předkontace", "text", "target", 12),
+  col("classificationVAT", "Členění DPH", "text", "target", 11, "PN = nedaňový doklad (celá částka v Bez DPH, bez data KH); změna na PN nebo z PN změní režim DPH."),
+  col("classificationKVDPH", "Členění KH DPH", "text", "target", 14),
+  col("cashAccount", "Pokladna", "text", "target", 10),
+  col("currency", "Měna", "text", "target", 7),
+  col("currencyRate", "Kurz", "number", "target", 10, "Prázdné = kurz nastavený v POHODĚ. Nikdy nedoplňujte 1."),
+  col("currencyAmount", "Kurz za množství", "integer", "target", 10),
+  col("targetPriceNone", "Bez DPH / PN", "targetMoney", "target", 13, `${TARGET_NOTE} PN: celá částka dokladu včetně DPH dodavatele.`),
+  col("targetPriceLow", "Základ 12 %", "targetMoney", "target", 13, TARGET_NOTE),
+  col("targetPriceLowVAT", "DPH 12 %", "targetMoney", "target", 12, TARGET_NOTE),
+  col("targetPriceHigh", "Základ 21 %", "targetMoney", "target", 13, TARGET_NOTE),
+  col("targetPriceHighVAT", "DPH 21 %", "targetMoney", "target", 12, TARGET_NOTE),
+  col("targetPrice3", "Základ 3. sazba", "targetMoney", "target", 13, TARGET_NOTE),
+  col("targetPrice3VAT", "DPH 3. sazba", "targetMoney", "target", 12, TARGET_NOTE),
+  col("targetRounding", "Zaokrouhlení", "targetMoney", "target", 12, `${TARGET_NOTE} Zaokrouhlení podle dokladu; nikdy se nenahrazuje součtem základu a DPH.`),
+  col("targetTotal", "Celkem", "targetMoney", "target", 14, `${TARGET_NOTE} Částka k úhradě po zaokrouhlení přesně podle dokladu.`),
+  col("note", "Poznámka v POHODĚ (importuje se)", "text", "target", 32),
+  col("centre", "Středisko", "text", "target", 11),
+  col("activity", "Činnost", "text", "target", 11),
+  col("contract", "Zakázka", "text", "target", 11),
+  col("plannedImport", "Plán importu (jen pro čtení, přepočítá se)", "plan", "plan", 44, "Informativní souhrn pravidel importu (pozdní doklad, PN, číslování). Nikdy se neimportuje."),
   col("sourcePages", "Strany PDF", "pages", "advanced", 10, "Čísla stran zdrojového PDF, např. 1, 2 nebo 3-4."),
   col("sourcePdfPath", "Zdrojové PDF (jen pro dohledání)", "display", "trace", 42, "Jen pro dohledání. Povolené zdrojové soubory určuje manifest přípravy, ne tato buňka."),
   col("sourceType", "Způsob zadání (jen pro dohledání)", "display", "trace", 16),
@@ -146,11 +146,41 @@ export const REVIEW_COLUMNS: readonly ReviewColumn[] = [
  * derived here from issue, due or tax dates.
  */
 export const REVIEW_LEGACY_COLUMNS: readonly ReviewColumn[] = [
-  col("sourcePaymentDate", "Datum úhrady (zdroj)", "date", "source", 12)
+  col("sourcePaymentDate", "Datum úhrady (zdroj)", "date", "source", 12),
+  // Source facts are kept in the manifest and no longer written as columns (the sheet shows
+  // only values POHODA receives). Older workbooks that still have them are read as before.
+  col("sourceDocumentNumber", "Číslo dokladu dodavatele", "id", "source", 18, "Zdrojový údaj přesně podle dokladu (účtenky/faktury); zůstává v interní poznámce."),
+  col("sourceSymVar", "Variabilní symbol (zdroj)", "id", "source", 14, "VS jen pokud je uveden na dokladu; prázdné = zdroj VS nemá."),
+  col("sourceIssueDate", "Datum vystavení (zdroj)", "date", "source", 12, "Datum přesně podle dokladu. Pozdní doklad se zapíše k 1. dni období DPH; toto původní datum zůstává v interní poznámce."),
+  col("sourceTaxDate", "DUZP (zdroj)", "date", "source", 12, "DUZP přesně podle dokladu. Nikdy jej neodvozujte z data vystavení."),
+  col("taxMode", "Režim DPH", "taxMode", "source", 17, "Daňový = nárok na odpočet. PN = celá částka do 0 % sazby bez data KH. Automaticky = rozhodne import podle ověřených údajů o dodavateli."),
+  col("sourceChargesVat", "Doklad účtuje DPH", "boolean", "source", 10, "Ano/Ne podle dokladu; prázdné = neznámo. Chybějící DIČ samo o sobě neprokazuje neplátce."),
+  col("priceNone", "Bez DPH / 0 % (zdroj)", "money", "source", 13, "Částky přesně podle dokladu. Prázdná buňka ≠ 0."),
+  col("priceLow", "Základ 12 % (zdroj)", "money", "source", 13),
+  col("priceLowVAT", "DPH 12 % (zdroj)", "money", "source", 12),
+  col("priceLowSum", "Celkem 12 % (zdroj)", "money", "source", 13),
+  col("priceHigh", "Základ 21 % (zdroj)", "money", "source", 13),
+  col("priceHighVAT", "DPH 21 % (zdroj)", "money", "source", 12),
+  col("priceHighSum", "Celkem 21 % (zdroj)", "money", "source", 13),
+  col("price3", "Základ 3. sazba (zdroj)", "money", "source", 13),
+  col("price3VAT", "DPH 3. sazba (zdroj)", "money", "source", 12),
+  col("price3Sum", "Celkem 3. sazba (zdroj)", "money", "source", 13),
+  col("roundingAmount", "Zaokrouhlení (zdroj)", "money", "source", 12, "Zaokrouhlení vytištěné na dokladu; nevypouštějte je."),
+  col("total", "Celkem k úhradě (zdroj)", "money", "source", 14, "Přesná částka k úhradě PO zaokrouhlení podle dokladu; nikdy ji nenahrazujte součtem základu a DPH."),
+  col("homePayableCZK", "K úhradě v CZK (zdroj)", "money", "source", 14, "Ověřená částka v CZK u cizí měny. Nikdy ji neodhadujte kurzem 1."),
+  col("partnerVatStatus", "Status DPH dodavatele", "text", "advanced", 18),
+  col("vatStatusEvidence", "Podklad statusu DPH", "text", "advanced", 32),
+  col("dateAccounting", "Datum účetního případu", "date", "advanced", 14, "Požadované účetní datum (jen v období dokladu); zobrazená hodnota je ve sloupci Účetní datum."),
+
+  // Replaced by the visible Forma úhrady; read only to detect a contradiction in old files.
+  col("cardPayment", "Platba kartou", "boolean", "source", 10)
 ];
 
-const DATA_KINDS = new Set<ReviewColumnKind>(["text", "id", "date", "money", "number", "integer", "boolean", "taxMode", "pages"]);
+const DATA_KINDS = new Set<ReviewColumnKind>(["text", "id", "date", "money", "number", "integer", "boolean", "taxMode", "pages", "paymentMethod"]);
 const DISPLAY_KINDS = new Set<ReviewColumnKind>(["plan", "display"]);
+const TARGET_KINDS = new Set<ReviewColumnKind>(["targetText", "targetDate", "targetMoney"]);
+/** Keys of policy-derived target cells, read back into `ReviewRow.targets`. */
+export const REVIEW_TARGET_FIELDS: readonly string[] = REVIEW_COLUMNS.filter((c) => TARGET_KINDS.has(c.kind)).map((c) => c.key);
 
 /** Data keys the parser may return in `ReviewRow.data`. */
 export const REVIEW_DATA_FIELDS: readonly string[] = REVIEW_COLUMNS.filter((c) => DATA_KINDS.has(c.kind)).map((c) => c.key);
@@ -174,18 +204,16 @@ const FILL = (argb: string): ExcelJS.Fill => ({ type: "pattern", pattern: "solid
 const HEADER_COLORS: Record<ColumnGroup, string> = {
   control: "FF1F2937",
   plan: "FF6B7280",
-  source: "FF1E3A8A",
   target: "FF0F766E",
-  posting: "FF1E40AF",
+  source: "FF1E3A8A",
   advanced: "FF475569",
   trace: "FF6B7280"
 };
 const BAND_LABELS: Record<ColumnGroup, string> = {
   control: "KONTROLA",
   plan: "PLÁN",
-  source: "ZDROJOVÉ ÚDAJE",
-  target: "POHODA (vypočteno)",
-  posting: "ZAÚČTOVÁNÍ",
+  target: "DO POHODY (zapíše se)",
+  source: "ZDROJ – fakta z dokladu (rozbalte +)",
   advanced: "DALŠÍ POLE (rozbalte +)",
   trace: "DOHLEDÁNÍ"
 };
@@ -197,7 +225,10 @@ const THIN_BORDER: Partial<ExcelJS.Borders> = {
 };
 const NUM_FMT: Partial<Record<ReviewColumnKind, string>> = {
   money: "#,##0.00",
+  targetMoney: "#,##0.00",
   date: "dd.mm.yyyy",
+  targetDate: "dd.mm.yyyy",
+  targetText: "@",
   integer: "0",
   number: "General",
   text: "@",
@@ -307,81 +338,130 @@ function validateWriteInput(input: ReviewWorkbook): void {
 // ---------------------------------------------------------------------------------------
 // Column visibility contract (written once at preparation; never changed on refresh).
 //
-// 1. Always visible: control, identity, source dates/amount facts used by every row,
-//    Předkontace/Členění DPH and the computed POHODA Doklad/VS. Blank values stay visible.
-//    Datum úhrady is not a workbook column (see REVIEW_LEGACY_COLUMNS).
-// 2. Applicable: shown when any row has a value (0 counts) or the field applies to any row
-//    (CONDITIONAL_COLUMNS). Otherwise collapsed into an outline group, still editable.
-// 3. Collapsed groups (advanced, plan, trace) stay collapsed by default.
-// 4. A field the import policy flags as needing correction on a non-skipped row is always
-//    shown, whatever its group, so a yellow cell is never hidden.
+// The main sheet shows only values the import writes to POHODA. Source facts are not
+// columns; they live in the manifest/intNote (legacy source columns are still read).
+// 1. Always visible: control, identity, Doklad/VS, all four target dates, Forma úhrady,
+//    Předkontace, Členění DPH and Celkem. Blank target = not sent (e.g. PN has no KH date).
+// 2. Other target fields: shown when any row writes a value or the field applies
+//    (CONDITIONAL_COLUMNS); otherwise collapsed, still editable.
+// 3. plan/advanced/trace stay collapsed and are never revealed automatically.
+// 4. A policy flag marks the matching visible target column (revealing it), or the review
+//    note when the field has no target column.
 
 type RowPredicate = (row: ReviewRow) => boolean;
 const blank = (value: unknown) => value === undefined || value === null || (typeof value === "string" && value.trim() === "");
 const isCashVoucher: RowPredicate = (row) => row.tool === "create_cash_voucher";
-const isCardPayment: RowPredicate = (row) => row.data?.cardPayment === true;
+const isCardPayment: RowPredicate = (row) => effectiveCardPayment(row.tool, row.data ?? {});
 const isPaidReceipt: RowPredicate = (row) => isCashVoucher(row) || isCardPayment(row)
-  || ["cash", "creditcard", "card"].includes(String(row.data?.paymentType ?? "").trim().toLowerCase());
+  || ["cash", "creditcard"].includes(displayedPaymentMethod(row.tool, row.data ?? {}));
 const isForeign: RowPredicate = (row) => !blank(row.data?.currency) && String(row.data.currency).trim().toUpperCase() !== "CZK";
-const SUMMARY_KEYS = ["priceNone", "priceLow", "priceLowVAT", "priceHigh", "priceHighVAT", "price3", "price3VAT"];
-const lacksSummary: RowPredicate = (row) => SUMMARY_KEYS.every((key) => blank(row.data?.[key]));
 
-/** Optional source fields shown only when relevant to some row. Rate groups move together. */
+const ALWAYS_VISIBLE = new Set(["text", "partnerName", "partnerIco", "partnerDic", "partnerCountry", "targetDocument", "targetSymVar",
+  "targetDate", "targetDateTax", "targetDateAccounting", "targetDateKHDPH", "paymentType", "accounting", "classificationVAT", "targetTotal"]);
+/** Optional target fields shown when they apply to some row even while blank. */
 const CONDITIONAL_COLUMNS: ReadonlyArray<{ keys: readonly string[]; appliesTo: RowPredicate }> = [
-  { keys: ["sourceSymVar"], appliesTo: (row) => !isCashVoucher(row) && !isCardPayment(row) },
   { keys: ["dateDue"], appliesTo: (row) => !isPaidReceipt(row) },
-  { keys: ["priceNone"], appliesTo: lacksSummary },
-  { keys: ["priceLow", "priceLowVAT", "priceLowSum"], appliesTo: lacksSummary },
-  { keys: ["priceHigh", "priceHighVAT", "priceHighSum"], appliesTo: lacksSummary },
-  { keys: ["roundingAmount"], appliesTo: () => false },
-  { keys: ["homePayableCZK"], appliesTo: isForeign },
+  { keys: ["currency", "currencyRate"], appliesTo: isForeign },
   { keys: ["cashAccount"], appliesTo: isCashVoucher }
 ];
 const COLLAPSED_GROUPS = new Set<ColumnGroup>(["plan", "advanced", "trace"]);
 
-function policyHeader(row: ReviewRow, vatPeriod: string): Record<string, any> {
-  const header: Record<string, any> = { ...row.data, type: row.data?.type ?? DOCUMENT_TYPE_FOR_TOOL[row.tool], vatPeriod, ...(row.data?.cardPayment === true ? { cardSequence: 1 } : {}) };
+/** Policy field -> visible column a reviewer edits to fix it. */
+const FLAG_COLUMN: Record<string, string> = {
+  sourceIssueDate: "targetDate", sourceTaxDate: "targetDateTax", dateTax: "targetDateTax", dateAccounting: "targetDateAccounting", dateKHDPH: "targetDateKHDPH",
+  sourceDocumentNumber: "targetDocument", sourceSymVar: "targetSymVar", symVar: "targetSymVar", originalDocument: "targetDocument",
+  priceNone: "targetPriceNone", priceLow: "targetPriceLow", priceLowVAT: "targetPriceLowVAT", priceLowSum: "targetPriceLow",
+  priceHigh: "targetPriceHigh", priceHighVAT: "targetPriceHighVAT", priceHighSum: "targetPriceHigh",
+  price3: "targetPrice3", price3VAT: "targetPrice3VAT", price3Sum: "targetPrice3",
+  roundingAmount: "targetRounding", total: "targetTotal", currencyPriceSum: "targetTotal",
+  taxMode: "classificationVAT", cardPayment: "paymentType", cardSequence: "paymentType"
+};
+
+function policyHeader(row: Pick<ReviewRow, "tool" | "data">, vatPeriod: string): Record<string, any> {
+  // Same derivation as the import: the card flag follows the visible Forma úhrady.
+  const card = effectiveCardPayment(row.tool, row.data ?? {});
+  const method = displayedPaymentMethod(row.tool, row.data ?? {});
+  const header: Record<string, any> = { ...row.data, type: row.data?.type ?? DOCUMENT_TYPE_FOR_TOOL[row.tool], vatPeriod, ...(card ? { cardSequence: 1 } : {}) };
+  if (card) header.cardPayment = true; else delete header.cardPayment;
+  if (method && row.tool !== "create_cash_voucher") header.paymentType = method; else delete header.paymentType;
   delete header._expensePolicy;
   return header;
 }
-const policyKind = (row: ReviewRow) => row.tool === "create_cash_voucher" ? "voucher" : "invoice";
+const paymentConflict = (row: Pick<ReviewRow, "tool" | "data">) => reconcilePaymentMethod(row.tool, row.data ?? {}, row.data?.cardPayment).conflict;
+const policyKind = (row: Pick<ReviewRow, "tool">) => row.tool === "create_cash_voucher" ? "voucher" : "invoice";
 
-/** The data column the import policy rejects for this row, if any. */
+/** The policy field rejected for this row, if any (a data key, not necessarily a column). */
 function flaggedField(row: ReviewRow, vatPeriod: string): string | undefined {
   if (row.action === "skip") return undefined;
+  if (paymentConflict(row)) return "paymentType";
   try { resolveExpensePolicy(policyHeader(row, vatPeriod), [], policyKind(row)); }
   catch (error) { const field = (error as { field?: string }).field; if (field) return field; }
   if (isCashVoucher(row) && blank(row.data?.cashAccount)) return "cashAccount";
   return undefined;
 }
+const flaggedColumn = (row: ReviewRow, vatPeriod: string): string | undefined => {
+  const field = flaggedField(row, vatPeriod);
+  return field === undefined ? undefined : FLAG_COLUMN[field] ?? field;
+};
 
 /** Keys of columns hidden in a newly written workbook (see the contract above). */
 export function collapsedReviewColumns(rows: readonly ReviewRow[], vatPeriod: string): Set<string> {
-  const flagged = new Set(rows.map((row) => flaggedField(row, vatPeriod)).filter((key): key is string => Boolean(key)));
-  const hidden = new Set(REVIEW_COLUMNS.filter((c) => COLLAPSED_GROUPS.has(c.group)).map((c) => c.key));
-  if (rows.length) {
-    for (const { keys, appliesTo } of CONDITIONAL_COLUMNS) {
-      if (!rows.some(appliesTo) && rows.every((row) => keys.every((key) => blank(row.data?.[key])))) keys.forEach((key) => hidden.add(key));
-    }
+  const visible = new Set(REVIEW_COLUMNS.map((c) => c.key));
+  const targets = rows.map((row) => computeReviewTargets(row, vatPeriod));
+  const hidden = new Set<string>();
+  for (const column of REVIEW_COLUMNS) {
+    if (COLLAPSED_GROUPS.has(column.group)) { hidden.add(column.key); continue; }
+    if (column.group !== "target" || ALWAYS_VISIBLE.has(column.key)) continue;
+    const written = TARGET_KINDS.has(column.kind)
+      ? targets.some((t) => !blank(t[column.key]))
+      : rows.some((row) => !blank(row.data?.[column.key]));
+    const applies = CONDITIONAL_COLUMNS.some(({ keys, appliesTo }) => keys.includes(column.key) && rows.some(appliesTo));
+    if (!written && !applies) hidden.add(column.key);
   }
-  for (const key of flagged) hidden.delete(key);
+  for (const row of rows) {
+    const key = flaggedColumn(row, vatPeriod);
+    if (key && visible.has(key) && !COLLAPSED_GROUPS.has(REVIEW_COLUMNS.find((c) => c.key === key)!.group)) hidden.delete(key);
+  }
   return hidden;
 }
 
-const CARD_SEQUENCE_PLACEHOLDER = "K + další č. PK";
-const CARD_SYMVAR_PLACEHOLDER = "další č. PK";
+/** Shown instead of a number the importer reserves from the PK series at import time. */
+export const CARD_SEQUENCE_PLACEHOLDER = "Přidělí se z PK";
+const LEGACY_CARD_PLACEHOLDERS = ["K + další č. PK", "další č. PK"];
 
-/** Doklad/VS the import will write, from the same policy; card numbers are assigned at import. */
-function targetReferences(row: ReviewRow, vatPeriod: string): { targetDocument: string | null; targetSymVar: string | null } {
-  const none = { targetDocument: null, targetSymVar: null };
-  if (row.action === "skip") return none;
-  try {
-    const result = resolveExpensePolicy(policyHeader(row, vatPeriod), [], policyKind(row));
-    if (result._expensePolicy?.originalDocumentRule === "card-sequence") return { targetDocument: CARD_SEQUENCE_PLACEHOLDER, targetSymVar: CARD_SYMVAR_PLACEHOLDER };
-    return { targetDocument: blank(result.originalDocument) ? null : String(result.originalDocument), targetSymVar: blank(result.symVar) ? null : String(result.symVar) };
-  } catch {
-    return none;
-  }
+export type ReviewTargets = Record<string, string | number | null>;
+
+/**
+ * Exactly what the import writes, from the shared policy and the same header derivation
+ * as ExpenseImporter (card numbering, Forma úhrady). Dates are ISO strings. Empty when the
+ * row cannot be computed (the reason is in the review note / inspect result).
+ * `classificationVAT` is the written Členění DPH (PN for non-tax rows).
+ */
+export function computeReviewTargets(row: Pick<ReviewRow, "tool" | "data">, vatPeriod: string): ReviewTargets {
+  if (paymentConflict(row)) return {};
+  let result: Record<string, any>;
+  try { result = resolveExpensePolicy(policyHeader(row, vatPeriod), [], policyKind(row)); } catch { return {}; }
+  const policy = result._expensePolicy ?? {};
+  const card = policy.originalDocumentRule === "card-sequence";
+  const value = (v: unknown) => blank(v) ? null : typeof v === "number" ? v : String(v);
+  return {
+    targetDocument: card ? CARD_SEQUENCE_PLACEHOLDER : value(result.originalDocument),
+    targetSymVar: card ? CARD_SEQUENCE_PLACEHOLDER : value(result.symVar),
+    targetDate: value(result.date),
+    targetDateTax: value(result.dateTax),
+    targetDateAccounting: policyKind(row) === "voucher" ? null : value(result.dateAccounting),
+    targetDateKHDPH: policy.taxMode === "nonTax" ? null : value(result.dateKHDPH),
+    targetPriceNone: value(result.priceNone),
+    targetPriceLow: value(result.priceLow),
+    targetPriceLowVAT: value(result.priceLowVAT),
+    targetPriceHigh: value(result.priceHigh),
+    targetPriceHighVAT: value(result.priceHighVAT),
+    targetPrice3: value(result.price3),
+    targetPrice3VAT: value(result.price3VAT),
+    targetRounding: value(result.roundingAmount),
+    targetTotal: value(result.total),
+    classificationVAT: value(result.classificationVAT)
+  };
 }
 
 function writeMainSheet(workbook: ExcelJS.Workbook, input: ReviewWorkbook): void {
@@ -428,20 +508,22 @@ function writeMainSheet(workbook: ExcelJS.Workbook, input: ReviewWorkbook): void
   input.rows.forEach((row, index) => {
     const excelRow = ws.getRow(index + 3);
     const plan = describePlan(row, input.vatPeriod);
-    const targets = targetReferences(row, input.vatPeriod);
+    const targets = computeReviewTargets(row, input.vatPeriod);
     const note = withDuplicateReviewNote(row.reviewNotes || "", row.duplicateCheck);
     const lineCount = (value: string, width: number) => value.split("\n").reduce((sum, line) => sum + Math.max(1, Math.ceil(line.length / width)), 0);
     excelRow.height = Math.min(96, Math.max(28, 14 * Math.max(lineCount(note, 34), lineCount(String(row.data.text || ""), 40), lineCount(String(row.data.partnerName || ""), 30))));
     REVIEW_COLUMNS.forEach((c, colIndex) => {
       const cell = excelRow.getCell(colIndex + 1);
-      const value = c.group === "target" ? targets[c.key as keyof typeof targets] : cellValueFor(c, row, plan);
-      cell.value = value;
+      cell.value = TARGET_KINDS.has(c.kind) ? targetCellValue(c, targets[c.key])
+        : c.key === "classificationVAT" && !blank(targets.classificationVAT) ? String(targets.classificationVAT)
+          : c.kind === "reviewNotes" ? reviewNoteWithIssue(row, note, targets, input.vatPeriod)
+            : cellValueFor(c, row, plan);
       if (NUM_FMT[c.kind]) cell.numFmt = NUM_FMT[c.kind]!;
       cell.border = THIN_BORDER;
       cell.alignment = { vertical: "top", wrapText: c.kind === "plan" || c.kind === "reviewNotes" || c.key === "text" || c.key === "partnerName" };
       if (c.kind === "rowId") { cell.fill = FILL("FFF1F5F9"); cell.font = { color: { argb: "FF475569" } }; }
       if (c.kind === "reviewNotes" && note) cell.fill = FILL("FFFFF7ED");
-      if (c.key === "total") cell.font = { bold: true };
+      if (c.key === "targetTotal") cell.font = { bold: true };
       if (DISPLAY_KINDS.has(c.kind)) { cell.fill = FILL("FFF3F4F6"); cell.font = { italic: true, color: { argb: "FF4B5563" }, size: 9 }; }
     });
     applyReviewHighlights(excelRow, new Map(REVIEW_COLUMNS.map((c, i) => [c.key, i + 1])), row.duplicateCheck, row.action, row, input.vatPeriod);
@@ -466,7 +548,12 @@ function writeMainSheet(workbook: ExcelJS.Workbook, input: ReviewWorkbook): void
     const validation = c.kind === "action" ? list(Object.values(REVIEW_ACTION_LABELS), "Akce")
       : c.kind === "tool" ? list(Object.values(REVIEW_TOOL_LABELS), "Typ dokladu")
         : c.kind === "taxMode" ? list(Object.values(REVIEW_TAX_MODE_LABELS), "Režim DPH")
-          : c.kind === "boolean" ? list([BOOLEAN_LABELS.true, BOOLEAN_LABELS.false], c.label) : undefined;
+          : c.kind === "boolean" ? list([BOOLEAN_LABELS.true, BOOLEAN_LABELS.false], c.label)
+            : c.kind === "paymentMethod" ? {
+              // A warning, not a stop: other POHODA methods already present stay valid.
+              ...list(PRIMARY_PAYMENT_METHODS.map((m) => PAYMENT_METHOD_LABELS[m]!), c.label), errorStyle: "warning",
+              error: `Obvyklé hodnoty: ${PRIMARY_PAYMENT_METHODS.map((m) => PAYMENT_METHOD_LABELS[m]).join(", ")}. Další formy POHODY: Složenkou, Inkasem, Šekem, Zápočtem, Zálohou. Prázdné = neznámo.`
+            } : undefined;
     // Per-cell validations are merged into one range by ExcelJS when the file is written.
     if (validation) for (let r = 3; r <= lastRow; r++) ws.getCell(r, index + 1).dataValidation = validation;
     if (c.kind === "action") {
@@ -496,7 +583,7 @@ function applyReviewHighlights(row: ExcelJS.Row, columns: Map<string, number>, c
     // Loaded XLSX cells can share a style object; detach it before colouring.
     cell.style = { ...cell.style };
     cell.fill = FILL(skipped ? "FFF1F5F9" : duplicate ? "FFFFF1F2" : "FFFFFFFF");
-    if (key === "rowId" || key === "plannedImport" || key === "targetDocument" || key === "targetSymVar") cell.fill = FILL(skipped ? "FFF1F5F9" : duplicate ? "FFFFF1F2" : "FFF8FAFC");
+    if (key === "rowId" || key === "plannedImport") cell.fill = FILL(skipped ? "FFF1F5F9" : duplicate ? "FFFFF1F2" : "FFF8FAFC");
   }
   if (skipped) return;
   const mark = (key: string, color: string) => { const cell = value(key); if (cell) cell.fill = FILL(color); };
@@ -504,20 +591,38 @@ function applyReviewHighlights(row: ExcelJS.Row, columns: Map<string, number>, c
     mark("reviewNotes", "FFFFCDD2");
     const keys = new Set<string>();
     for (const match of check!.matches) {
-      if (match.reason === "identity") keys.add("sourcePages");
-      else { keys.add("partnerName"); keys.add("partnerIco"); }
-      if (match.reason === "reference") keys.add("sourceDocumentNumber");
-      if (match.reason === "amount_date") { keys.add("total"); keys.add("sourceIssueDate"); keys.add("sourceTaxDate"); }
+      if (match.reason !== "identity") { keys.add("partnerName"); keys.add("partnerIco"); }
+      if (match.reason === "reference") keys.add("targetDocument");
+      if (match.reason === "amount_date") { keys.add("targetTotal"); keys.add("targetDate"); keys.add("targetDateTax"); }
     }
     for (const key of keys) mark(key, "FFFFCDD2");
   } else if (check?.status === "incomplete" || action === "review") mark("reviewNotes", "FFFEF3C7");
   if (source && vatPeriod) {
-    const field = flaggedField(source, vatPeriod);
+    const field = flaggedColumn(source, vatPeriod);
     // A field without a workbook column (e.g. Datum úhrady) is flagged on the review note.
     if (field) mark(columns.has(field) ? field : "reviewNotes", "FFFEF3C7");
   }
   const actionCell = value("action");
   if (actionCell) actionCell.fill = FILL(actionCell.text === REVIEW_ACTION_LABELS.import ? "FFDCFCE7" : "FFFEF3C7");
+}
+
+function targetCellValue(column: ReviewColumn, value: unknown): ExcelJS.CellValue {
+  if (blank(value)) return null;
+  if (column.kind === "targetDate") return parseIsoDate(String(value)) ?? String(value);
+  if (column.kind === "targetMoney") return typeof value === "number" ? value : Number.isFinite(Number(value)) ? Number(value) : String(value);
+  return String(value);
+}
+
+/** The review note, plus a short reason when the POHODA values cannot be computed. */
+function reviewNoteWithIssue(row: ReviewRow, note: string, targets: ReviewTargets, vatPeriod: string): ExcelJS.CellValue {
+  if (row.action === "skip" || Object.keys(targets).length) return note || null;
+  let issue = paymentConflict(row) ?? "";
+  if (!issue) {
+    try { resolveExpensePolicy(policyHeader(row, vatPeriod), [], policyKind(row)); }
+    catch (error) { issue = error instanceof Error ? error.message : String(error); }
+  }
+  if (!issue || note.includes(issue)) return note || null;
+  return [note, `Nelze spočítat hodnoty pro POHODU: ${issue}`].filter(Boolean).join("\n");
 }
 
 function cellValueFor(column: ReviewColumn, row: ReviewRow, plan: string): ExcelJS.CellValue {
@@ -527,13 +632,14 @@ function cellValueFor(column: ReviewColumn, row: ReviewRow, plan: string): Excel
     case "reviewNotes": return withDuplicateReviewNote(row.reviewNotes || "", row.duplicateCheck) || null;
     case "tool": return REVIEW_TOOL_LABELS[row.tool];
     case "plan": return plan;
+    case "paymentMethod": return paymentMethodLabel(displayedPaymentMethod(row.tool, row.data ?? {})) || null;
     default: return dataCellValue(column, row.data?.[column.key]);
   }
 }
 
 function dataCellValue(column: ReviewColumn, value: unknown): ExcelJS.CellValue {
   if (value === undefined || value === null || value === "") {
-    return column.key === "cardPayment" ? BOOLEAN_LABELS.false : column.kind === "taxMode" ? REVIEW_TAX_MODE_LABELS.auto : null;
+    return column.kind === "taxMode" ? REVIEW_TAX_MODE_LABELS.auto : null;
   }
   switch (column.kind) {
     case "money":
@@ -554,6 +660,8 @@ function dataCellValue(column: ReviewColumn, value: unknown): ExcelJS.CellValue 
       return String(value);
     case "taxMode":
       return (REVIEW_TAX_MODE_LABELS as Record<string, string>)[String(value)] ?? String(value);
+    case "paymentMethod":
+      return paymentMethodLabel(value) || null;
     case "pages":
       return Array.isArray(value) ? value.join(", ") : String(value);
     case "display":
@@ -568,6 +676,8 @@ function dataCellValue(column: ReviewColumn, value: unknown): ExcelJS.CellValue 
 /** Human-readable preview of what the import policy would do with the prepared source values. */
 function describePlan(row: ReviewRow, vatPeriod: string): string {
   if (row.action === "skip") return "Vynecháno – nic se neimportuje.";
+  const conflict = paymentConflict(row);
+  if (conflict) return `Nelze naplánovat – ${conflict}`;
   const kind = policyKind(row);
   try {
     const result = resolveExpensePolicy(policyHeader(row, vatPeriod), [], kind);
@@ -667,15 +777,15 @@ async function writeGuideSheet(workbook: ExcelJS.Workbook, input: ReviewWorkbook
     ["ID kontroly", input.reviewId],
     ["Počet řádků", String(input.rows.length)],
     ["", ""],
-    ["1. Úpravy", "Hodnoty upravujte jen v listu Doklady. Modré sloupce jsou zdrojové hodnoty přesně podle dokladu (data, částky, čísla)."],
+    ["1. Úpravy", "List Doklady ukazuje jen hodnoty, které import zapíše do POHODY (DO POHODY). Upravujte je přímo; import úpravu převede na zdrojový údaj a přepočítá. Co pravidla nedovolí (pozdní doklad, číslování PK, PN), import odmítne s vysvětlením. Původní zdrojové údaje zůstávají v interní poznámce."],
     ["2. Akce", "Importovat / Prověřit / Vynechat. Import proběhne pouze po vašem výslovném pokynu a jen pro řádky Importovat."],
     ["3. Text vs. poznámka", "„Text dokladu v POHODĚ“ je krátký text dokladu. „Poznámka ke kontrole“ slouží jen vám a do POHODY se nepřenáší."],
-    ["4. Plán importu", "Šedý sloupec ukazuje úpravy podle pravidel importu. Při importu se vždy znovu spočítá z upravených zdrojových hodnot; sám se nikdy neimportuje."],
-    ["5. Pozdní doklady", "Je-li DUZP (u PN datum dokladu) ve starším měsíci než zvolené období DPH, datum dokladu, DPH, účetní datum a datum KH se nastaví na 1. den období. Původní data se uloží do interní poznámky."],
-    ["6. PN (nedaňový)", "Celá zdrojová částka včetně případné DPH dodavatele jde do sazby 0 % (Bez DPH), bez data KH. Chybějící DIČ samo neprokazuje neplátce."],
-    ["7. Platba kartou", "Ostatní závazek s platbou kartou pokračuje řadou PK. Do 10 000 Kč: Doklad K + číslo, VS = číslo. Nad 10 000 Kč: číslo dokladu dodavatele."],
+    ["4. Plán importu", "Skrytý souhrn pravidel importu (rozbalte +); nikdy se neimportuje."],
+    ["5. Pozdní doklady", "Je-li DUZP (u PN datum dokladu) ve starším měsíci než zvolené období DPH, Datum dokladu, Datum DPH, Účetní datum a Datum KH DPH jsou 1. den období – tak je list ukazuje i import zapíše. Původní data jsou v interní poznámce."],
+    ["6. PN (nedaňový)", "Členění DPH PN: celá částka včetně případné DPH dodavatele je v Bez DPH / PN, bez data KH. Chybějící DIČ samo neprokazuje neplátce."],
+    ["7. Forma úhrady", "Hotově / Kartou / Převodem / Dobírkou podle dokladu; prázdné = neznámo. Ostatní závazek s Formou Kartou pokračuje řadou PK: do 10 000 Kč Doklad K + číslo, VS = číslo; nad 10 000 Kč číslo dokladu dodavatele. Změna z Kartou na jinou formu číslování PK zruší. Pokladní výdej je vždy Hotově."],
     ["8. Hotovost", "Pokladní výdej má Doklad jen nad 10 000 Kč po zaokrouhlení; datum úhrady je skutečné datum platby."],
-    ["9. Částky", "Zadávejte přesné částky se 2 desetinnými místy. Prázdná buňka není totéž co 0."],
+    ["9. Částky", "Celkem je částka k úhradě po zaokrouhlení přesně podle dokladu; zaokrouhlení z dokladu se nevypouští a Celkem se nenahrazuje součtem základu a DPH. Prázdná buňka není totéž co 0."],
     ["10. Data", "Datum zadejte jako datum Excelu nebo text RRRR-MM-DD či DD.MM.RRRR."],
     ["11. Vzorce", "Vzorce nejsou povoleny. Pokud je použijete, vložte místo nich hodnoty (Vložit jinak → Hodnoty)."],
     ["12. Řádky", "Řádky lze řadit, filtrovat i mazat. Neměňte ID řádku. Nové řádky s neznámým ID budou odmítnuty."],
@@ -895,6 +1005,9 @@ function rowIdProblem(id: string): string | undefined {
 }
 
 const normalizeHeader = (value: string): string => value.normalize("NFC").replace(/\s+/g, " ").trim().toLocaleLowerCase("cs-CZ")
+  // Labels of earlier layouts.
+  .replace(/^(doklad v pohodě|vs v pohodě) \(vypočteno\)$/, "$1")
+  .replace(/^datum splatnosti \(zdroj\)$/, "datum splatnosti")
   .replace("poznámka ke kontrole (neimportuje se)", "poznámka (neimportuje se)")
   .replace("text dokladu v pohodě (krátký, max. 240 znaků)", "text dokladu v pohodě");
 
@@ -929,7 +1042,7 @@ function readMainSheet(ws: ExcelJS.Worksheet, issues: ReviewWorkbookIssue[]): Re
     positions.set(column.key, colNumber);
   });
   for (const column of REVIEW_COLUMNS) {
-    if (!DISPLAY_KINDS.has(column.kind) && !positions.has(column.key)) {
+    if (!DISPLAY_KINDS.has(column.kind) && !TARGET_KINDS.has(column.kind) && !positions.has(column.key)) {
       issues.push({ code: "MISSING_COLUMN", message: `Required column "${column.label}" (${column.key}) is missing.`, sheet: REVIEW_SHEET_NAME });
     }
   }
@@ -960,6 +1073,7 @@ function readMainSheet(ws: ExcelJS.Worksheet, issues: ReviewWorkbookIssue[]): Re
     }
 
     const data: Record<string, any> = {};
+    const targets: Record<string, unknown> = {};
     let rowId = "";
     let action: ReviewAction | undefined;
     let tool: ReviewTool | undefined;
@@ -993,8 +1107,11 @@ function readMainSheet(ws: ExcelJS.Worksheet, issues: ReviewWorkbookIssue[]): Re
           break;
         }
         default: {
-          const parsed = parseDataCell(column, raw, bad);
-          if (parsed.ok) data[column.key] = parsed.value;
+          // Target cells are returned separately; the import maps edits to source fields deliberately.
+          const parsed = parseDataCell(TARGET_KINDS.has(column.kind) ? { ...column, kind: TARGET_PARSE_KIND[column.kind]! } : column, raw, bad);
+          if (!parsed.ok) break;
+          if (TARGET_KINDS.has(column.kind)) targets[column.key] = normalizeTargetCell(parsed.value);
+          else data[column.key] = parsed.value;
         }
       }
     }
@@ -1006,10 +1123,16 @@ function readMainSheet(ws: ExcelJS.Worksheet, issues: ReviewWorkbookIssue[]): Re
       rowIssues.push({ code: "ROW_ID_INVALID", message: `Row ${rowNumber} has data but a blank row ID.`, sheet: REVIEW_SHEET_NAME });
     }
     for (const issue of rowIssues) issues.push(rowId && !issue.rowId ? { ...issue, rowId } : issue);
-    if (!rowIssues.length && tool && action) rows.push({ rowId, tool, action, data, reviewNotes });
+    if (!rowIssues.length && tool && action) rows.push({ rowId, tool, action, data, reviewNotes, ...(Object.keys(targets).length ? { targets } : {}) });
   });
   return rows;
 }
+
+const TARGET_PARSE_KIND: Partial<Record<ReviewColumnKind, ReviewColumnKind>> = { targetText: "id", targetDate: "date", targetMoney: "money" };
+const normalizeTargetCell = (value: unknown): unknown => {
+  if (value === null || value === "") return null;
+  return typeof value === "string" && LEGACY_CARD_PLACEHOLDERS.includes(value) ? CARD_SEQUENCE_PLACEHOLDER : value;
+};
 
 type RawCell =
   | { kind: "blank" }
@@ -1155,6 +1278,11 @@ function parseDataCell(column: ReviewColumn, raw: RawCell, bad: Bad): { ok: true
       if (["ne", "false", "0", "no"].includes(textValue)) return ok(false);
       bad("BOOLEAN_INVALID", `"${rawText(raw)}" must be Ano or Ne.`);
       return { ok: false };
+    }
+    case "paymentMethod": {
+      if (raw.kind === "blank") return ok("");
+      const value = toText(raw, false, bad);
+      return value === undefined ? { ok: false } : ok(normalizePaymentMethod(value));
     }
     case "taxMode": {
       if (raw.kind === "blank") return ok("auto");

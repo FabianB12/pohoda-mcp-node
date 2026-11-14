@@ -47,7 +47,7 @@ describe("received invoice VS in reviewed imports", () => {
     expect(preview.sourceFacts.sourceSymVar).toBeUndefined();
     expect(preview.warnings.join(" ")).toContain("derived from supplier document number");
     const { ws } = await sheet();
-    expect(ws.getCell(3, colOf("sourceSymVar")).value).toBeNull();
+    expect(ws.getCell(3, colOf("targetSymVar")).value).toBe("20260007");
     expect(String(ws.getCell(3, colOf("plannedImport")).value)).toContain("20260007");
     expect((await service.inspect({ reviewId: prepared.reviewId })).rows[0].preview.planned.symVar).toBe("20260007");
     await submit();
@@ -56,27 +56,30 @@ describe("received invoice VS in reviewed imports", () => {
     expect(finalSymVar()).toBe("20260007");
   });
 
-  it("keeps a reviewer-entered VS and re-derives with a visible rule when the reviewer clears it", async () => {
+  it("keeps a reviewer-entered VS and rejects clearing a VS the policy would derive", async () => {
     const { service, prepared, edit, submit, runs, finalSymVar } = await setup({ sourceSymVar: "0042026" });
     expect(prepared.rows[0].preview.planned).toMatchObject({ symVar: "0042026", symVarRule: "source" });
-    await edit({ sourceSymVar: "00777" });
+    await edit({ targetSymVar: "00777" });
     expect((await service.inspect({ reviewId: prepared.reviewId })).rows[0].preview.planned).toMatchObject({ symVar: "00777", symVarRule: "source" });
     await submit();
     expect(finalSymVar()).toBe("00777");
 
-    await edit({ sourceSymVar: null });
+    // A blank VS cannot be imported: the policy derives one from the supplier number.
+    await edit({ targetSymVar: null });
     const view = await service.inspect({ reviewId: prepared.reviewId });
-    expect(view.rows[0].changedFields).toContain("sourceSymVar");
-    expect(view.rows[0].preview.planned).toMatchObject({ symVar: "20260007", symVarRule: "derived-from-source-document" });
-    expect(view.rows[0].preview.sourceFacts.sourceSymVar).toBeUndefined();
-    await submit();
-    expect(runs).toHaveLength(2);
-    expect(finalSymVar()).toBe("20260007");
+    expect(view.rows[0]).toMatchObject({ valid: false, error: expect.stringContaining("VS v POHODĚ: (prázdné) nelze zapsat, podle pravidel importu bude 20260007") });
+    await expect(submit()).rejects.toThrow(/nelze zapsat/);
+    expect(runs).toHaveLength(1);
   });
 
   it("follows an edited supplier document number and shows no VS when it has no digits", async () => {
     const { service, prepared, edit, submit, finalSymVar } = await setup({});
-    await edit({ sourceDocumentNumber: "FA-ABC" });
+    await edit({ targetDocument: "FA-ABC" });
+    // The derived VS shown for the old number is no longer imported: blocked until updated.
+    const stale = (await service.inspect({ reviewId: prepared.reviewId })).rows[0];
+    expect(stale).toMatchObject({ valid: false, error: expect.stringMatching(/neukazuje importované hodnoty: VS v POHODĚ \S+ → vymazat/) });
+    await expect(submit()).rejects.toThrow(/neukazuje importované hodnoty/);
+    await edit({ targetSymVar: null });
     const planned = (await service.inspect({ reviewId: prepared.reviewId })).rows[0].preview;
     expect(planned.planned.symVar).toBeUndefined();
     expect(planned.planned.symVarRule).toBe("missing-no-digits");

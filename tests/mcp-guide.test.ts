@@ -56,7 +56,28 @@ describe("Canonical MCP operator guide", () => {
       expect(guide.defaultExpenseWorkflow.completion).toContain("Include every extracted source document");
       expect(guide.defaultExpenseWorkflow.stopping).toContain("flag the affected row and continue creating the workbook");
       expect(guide.defaultExpenseWorkflow.stopping).toContain("explicit user stop");
+      // Target-only review sheet and the payment method contract.
+      expect(guide.defaultExpenseWorkflow.presentation).toContain("only values the import writes to POHODA");
+      expect(guide.defaultExpenseWorkflow.presentation).toContain("never silently replaced");
+      expect(guide.expensePolicy.numbering).toContain("paymentType");
       expect(tools.tools.find((tool) => tool.name === "prepare_expense_review")?.description).toContain("even if all documents already exist");
+
+      // Bank statements: preview-first, no expense workbook, no approval bypass, data errors are not "wait for POHODA".
+      expect(client.getInstructions()).toContain("never the expense XLSX workflow");
+      expect(client.getInstructions()).toContain("execute=false first");
+      expect(client.getInstructions()).toMatch(/rejected, do not retry it or bypass it with raw XML/);
+      expect(guide.bankStatements.workflow).toContain("Always call process_bank_statement with execute=false first");
+      expect(guide.bankStatements.workflow).toContain("never use or promise the expense XLSX");
+      expect(guide.bankStatements.approval).toContain("never route around it with raw_xml_batch");
+      expect(guide.bankStatements.dataDiagnostics).toContain("still returns its plan");
+      expect(guide.bankStatements.errors).toContain("never tell the user to wait until POHODA starts exporting");
+      expect(guide.xmlTransport.batching).toContain("never bypasses expense review, bank-statement preview or a rejected/unapproved write");
+      const bank = tools.tools.find((tool) => tool.name === "process_bank_statement")!;
+      expect(bank.description).toContain("Always call execute=false first");
+      expect(bank.description).toContain("not the expense XLSX workflow");
+      expect(bank.description).toContain("never bypass it with raw XML");
+      expect((bank.inputSchema.properties as Record<string, { description?: string; default?: unknown }>).execute).toMatchObject({ default: false, description: expect.stringContaining("call this first") });
+      expect(tools.tools.find((tool) => tool.name === "raw_xml_batch")?.description).toContain("never a way around a rejected or unapproved write");
     } finally {
       await client.close();
       await rm(dir, { recursive: true, force: true });
