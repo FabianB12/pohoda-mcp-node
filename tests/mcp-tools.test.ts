@@ -110,7 +110,7 @@ describe("MCP tool helpers", () => {
     registerPohodaTools(fakeServer as any, { client, databaseRegistry: registry, exportStore });
 
     expect([...fakeServer.tools.keys()]).toEqual([
-      "prepare_scanned_pdf", "status", "list_xml_databases", "current_database", "list_accounting_units",
+      "get_usage_guide", "lookup_supplier_registry", "prepare_expense_review", "inspect_expense_review", "import_expense_review", "prepare_scanned_pdf", "status", "list_xml_databases", "current_database", "list_accounting_units",
       "list_documents", "list_stock", "list_contacts", "list_export_agenda", "batch_list_records", "list_balance", "create_invoice",
       "create_other_liability", "create_other_receivable", "create_address", "create_cash_voucher", "manage_activity",
       "batch_create_invoices", "batch_write", "create_stock", "create_order", "manage_address", "manage_stock",
@@ -124,8 +124,8 @@ describe("MCP tool helpers", () => {
     expect(fakeServer.tools.get("list_export_agenda")?.config.inputSchema.agenda.options).not.toContain("userAgenda");
     expect(fakeServer.tools.get("list_export_agenda")?.config.inputSchema.agenda.options).not.toContain("measureUnit");
     expect(fakeServer.tools.get("create_invoice")?.config.inputSchema.dateTax.description).toContain("deduction/delivery date");
-    expect(fakeServer.tools.get("create_invoice")?.config.inputSchema.dateKHDPH.description).toContain("DUZP/DPPD");
-    expect(fakeServer.tools.get("create_cash_voucher")?.config.inputSchema.dateKHDPH.description).toContain("cash expenses");
+    expect(fakeServer.tools.get("create_invoice")?.config.inputSchema.dateKHDPH.description).toContain("vatPeriod");
+    expect(fakeServer.tools.get("create_cash_voucher")?.config.inputSchema.dateKHDPH.description).toContain("PN/nonTax");
     expect(fakeServer.tools.has("select_database")).toBe(false);
 
     const guideResource = fakeServer.resources.get("guide") as any;
@@ -585,6 +585,18 @@ describe("MCP tool helpers", () => {
     })).rejects.toThrow(/address.company or invoice.partnerName is required/);
   });
 
+  it("sums every exported VAT bucket and rounding instead of using one bucket", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "pohoda-export-totals-"));
+    tempDirs.push(dir);
+    const transport = new HandlerTransport(() => '<rsp:responsePack state="ok" xmlns:rsp="urn:rsp"><rsp:responsePackItem state="ok"><lst:listInvoice xmlns:lst="urn:lst"><lst:invoice><inv:invoiceHeader xmlns:inv="urn:inv"><inv:id>8</inv:id><inv:number><typ:numberRequested xmlns:typ="urn:typ">PF8</typ:numberRequested></inv:number></inv:invoiceHeader><inv:invoiceSummary xmlns:inv="urn:inv"><inv:homeCurrency xmlns:typ="urn:typ"><typ:priceNone>50</typ:priceNone><typ:priceLow>100</typ:priceLow><typ:priceLowVAT>12</typ:priceLowVAT><typ:priceLowSum>112</typ:priceLowSum><typ:priceHigh>200</typ:priceHigh><typ:priceHighVAT>42</typ:priceHighVAT><typ:priceHighSum>242</typ:priceHighSum><typ:round><typ:priceRound>-0.40</typ:priceRound></typ:round></inv:homeCurrency></inv:invoiceSummary></lst:invoice></lst:listInvoice></rsp:responsePackItem></rsp:responsePack>');
+    const client = new PohodaClient({ transport, ico: "12345678", database: "12345678_2026.mdb" });
+    const server = new CapturingServer();
+    registerPohodaTools(server as any, { client, registryClient: null, exportStore: new ExportStore(dir) });
+    const output = await server.call("create_data_export", { kind: "documents", agenda: "invoice", invoiceType: "receivedInvoice", databaseId: "12345678_2026.mdb", pageSize: 1, maxRecords: 1, previewLimit: 1 });
+    expect(output.structuredContent.summary.total).toBe(403.6);
+    expect(output.structuredContent.preview[0].homeCurrency.total).toBe(403.6);
+  });
+
   it("maps universal batch_write responses for mixed typed operations", async () => {
     const dir = await mkdtemp(join(tmpdir(), "pohoda-mcp-batch-write-"));
     tempDirs.push(dir);
@@ -628,6 +640,47 @@ describe("MCP tool helpers", () => {
     expect(transport.calls[0]?.xml).toContain("<ord:order");
   });
 
+  it("rejects old item-based expense calls before any POHODA request", async () => {
+    const transport = new FakeTransport();
+    const client = new PohodaClient({ transport, ico: "12345678", database: "12345678_2026.mdb" });
+    const server = new CapturingServer();
+    registerPohodaTools(server as any, { client, registryClient: null });
+    await expect(server.call("create_other_liability", {
+      databaseId: "12345678_2026.mdb", vatPeriod: "2026-11", partnerName: "Supplier", text: "Expense",
+      items: [{ text: "Old line", unitPrice: 100 }]
+    })).rejects.toThrow(/reviewed spreadsheet workflow/);
+    await expect(server.call("raw_xml", {
+      databaseId: "12345678_2026.mdb",
+      xml: '<inv:invoice><inv:invoiceHeader><inv:invoiceType>receivedInvoice</inv:invoiceType></inv:invoiceHeader></inv:invoice>'
+    })).rejects.toThrow(/reviewed spreadsheet workflow/);
+    expect(transport.calls).toHaveLength(0);
+  });
+
+  it("blocks all direct expense paths and requires explicit reviewed import approval", async () => {
+    const transport = new FakeTransport();
+    const client = new PohodaClient({ transport, ico: "12345678", database: "12345678_2026.mdb" });
+    const server = new CapturingServer();
+    registerPohodaTools(server as any, { client, registryClient: null });
+    const databaseId = "12345678_2026.mdb";
+    const invoice = invoiceInputDefaults({ type: "receivedInvoice" });
+    const cases: Array<[string, Record<string, unknown>]> = [
+      ["create_invoice", { ...invoice, databaseId }],
+      ["create_cash_voucher", { type: "expense", items: [], databaseId }],
+      ["batch_create_invoices", { databaseId, invoices: [{ requestId: "a", invoice, createAddress: false, address: {} }] }],
+      ["batch_write", { databaseId, operations: [{ requestId: "a", tool: "create_other_liability", data: { items: [] } }] }],
+      ["raw_xml_batch", { databaseId, items: ['<vch:voucher><vch:voucherHeader><vch:voucherType>expense</vch:voucherType></vch:voucherHeader></vch:voucher>'] }]
+    ];
+    for (const [tool, input] of cases) await expect(server.call(tool, input)).rejects.toThrow(/reviewed spreadsheet workflow/);
+    for (const value of ['&#114;eceivedInvoice', '<![CDATA[receivedInvoice]]>', 'receivedInvoice']) {
+      await expect(server.call("raw_xml", { databaseId, xml: `<inv:invoice><inv:invoiceHeader><inv:invoiceType test="1">${value}</inv:invoiceType></inv:invoiceHeader></inv:invoice>` })).rejects.toThrow(/reviewed spreadsheet workflow/);
+    }
+    const approvalSchema = server.tools.get("import_expense_review")!.config.inputSchema.approved;
+    expect(approvalSchema.safeParse(undefined).success).toBe(false);
+    expect(approvalSchema.safeParse(false).success).toBe(false);
+    expect(approvalSchema.safeParse(true).success).toBe(true);
+    expect(transport.calls).toHaveLength(0);
+  });
+
   it("maps batch_write responses for cash vouchers, other documents, and activities", async () => {
     const dir = await mkdtemp(join(tmpdir(), "pohoda-mcp-new-batch-write-"));
     tempDirs.push(dir);
@@ -654,9 +707,9 @@ describe("MCP tool helpers", () => {
           data: { type: "receipt", cashAccount: "HLAVNI", date: "2026-07-02", text: "Cash receipt", items: [{ text: "Paid", quantity: 1, unit: "ks", unitPrice: 121, vatRate: "high", stockCode: "" }] }
         },
         {
-          requestId: "liability",
-          tool: "create_other_liability",
-          data: { partnerName: "Supplier", date: "2026-07-02", text: "Other liability", sphereType: "business", paymentAccountNumber: "123456", paymentBankCode: "0100", items: [{ text: "Fee", quantity: 1, unit: "ks", unitPrice: 200, vatRate: "none", stockCode: "" }] }
+          requestId: "invoice",
+          tool: "create_invoice",
+          data: { type: "issuedInvoice", partnerName: "Supplier", date: "2026-07-02", text: "Other liability", sphereType: "business", paymentAccountNumber: "123456", paymentBankCode: "0100", items: [{ text: "Fee", quantity: 1, unit: "ks", unitPrice: 200, vatRate: "none", stockCode: "" }] }
         },
         {
           requestId: "receivable",
@@ -673,15 +726,15 @@ describe("MCP tool helpers", () => {
 
     expect(result.structuredContent.ok).toBe(true);
     expect(result.structuredContent.operationCount).toBe(4);
-    expect(result.structuredContent.results.map((row: any) => row.tool)).toEqual(["create_cash_voucher", "create_other_liability", "create_other_receivable", "manage_activity"]);
+    expect(result.structuredContent.results.map((row: any) => row.tool)).toEqual(["create_cash_voucher", "create_invoice", "create_other_receivable", "manage_activity"]);
     expect(transport.calls).toHaveLength(1);
     expect(transport.calls[0]?.database).toBe("12345678_2026.mdb");
     expect(transport.calls[0]?.xml).toContain('ico="12345678"');
     expect(transport.calls[0]?.xml).toContain('note="voucher:create_cash_voucher"');
     expect(transport.calls[0]?.xml).toContain("<vch:voucher");
     expect(transport.calls[0]?.xml).toContain("<vch:voucherType>receipt</vch:voucherType>");
-    expect(transport.calls[0]?.xml).toContain('note="liability:create_other_liability"');
-    expect(transport.calls[0]?.xml).toContain("<inv:invoiceType>commitment</inv:invoiceType>");
+    expect(transport.calls[0]?.xml).toContain('note="invoice:create_invoice"');
+    expect(transport.calls[0]?.xml).toContain("<inv:invoiceType>issuedInvoice</inv:invoiceType>");
     expect(transport.calls[0]?.xml).toContain("<typ:accountNo>123456</typ:accountNo>");
     expect(transport.calls[0]?.xml).toContain('note="receivable:create_other_receivable"');
     expect(transport.calls[0]?.xml).toContain("<inv:invoiceType>receivable</inv:invoiceType>");

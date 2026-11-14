@@ -1,4 +1,7 @@
+import { buildPdfAttachment } from "./pdf-archive.js";
 import { agendaConfig } from "./constants.js";
+import { isExpenseDocument, isForeignCurrency, resolveExpensePolicy } from "./expense-policy.js";
+import { isMoneyInput, roundMoney } from "./money.js";
 import { PohodaResponse } from "./response.js";
 import type { TransportOptions, XmlTransport } from "./transport.js";
 import { XmlBuilder, type DataPackItem, type XmlObject } from "./xml-builder.js";
@@ -299,6 +302,11 @@ export class PohodaClient {
     return this.send("prn:print", "1.0", buildPrintData(options), `Print ${options.agenda}`, {}, "", { checkDuplicity: false, ...databaseOption(options) });
   }
 
+  /** Build every operation without contacting POHODA, so validation precedes dependent writes. */
+  public validateWriteBatch(operations: WriteBatchOperation[]): void {
+    if (operations.length) this.xml.buildMany(operations.map((operation, index) => writeBatchItem(operation, index)), "Validate batch", "validate-only");
+  }
+
   public async writeBatch(operations: WriteBatchOperation[], dataPackId = "", target: DatabaseTarget = ""): Promise<PohodaResponse> {
     if (operations.length === 0) {
       throw new Error("At least one write batch operation is required.");
@@ -573,7 +581,7 @@ function buildGenericHeader(config: DocumentConfig, header: Record<string, any>)
     [`${prefix}:dateKVDPH`]: header.dateKVDPH,
     [`${prefix}:numberOrder`]: header.numberOrder,
     [`${prefix}:accounting`]: ref(header.accounting ?? ""),
-    [`${prefix}:classificationVAT`]: header.classificationVAT ? { "typ:classificationVATType": header.classificationVAT } : undefined,
+    [`${prefix}:classificationVAT`]: classificationVat(header.classificationVAT),
     [`${prefix}:classificationKVDPH`]: ref(header.classificationKVDPH ?? ""),
     [`${prefix}:transactionTaxType`]: header.transactionTaxType,
     [`${prefix}:text`]: header.text,
@@ -710,7 +718,7 @@ function buildGenericItem(config: DocumentConfig, item: Record<string, any>, hea
     [`${prefix}:destinationStore`]: ref(item.destinationStore ?? item.storeDestination ?? ""),
     [`${prefix}:acc`]: item.acc,
     [`${prefix}:accounting`]: ref(item.accounting ?? ""),
-    [`${prefix}:classificationVAT`]: item.classificationVAT ? { "typ:classificationVATType": item.classificationVAT } : undefined,
+    [`${prefix}:classificationVAT`]: classificationVat(item.classificationVAT),
     [`${prefix}:classificationKVDPH`]: ref(item.classificationKVDPH ?? ""),
     [`${prefix}:PDP`]: item.PDP,
     [`${prefix}:CodePDP`]: item.CodePDP,
@@ -803,8 +811,18 @@ function buildBankStatementNumber(header: Record<string, any>): XmlObject | unde
 
 function buildManageAddressData(action: "add" | "update" | "delete", data: Record<string, any>, match: Record<string, any>): XmlObject {
   const result: XmlObject = {};
-  if (action !== "add") {
-    result["adb:actionType"] = { [`adb:${action}`]: buildActionFilter(match, data, "addressbook") };
+  if (action === "add") {
+    // Guarded add: with an explicit IČO/DIČ match POHODA refuses the add when the contact
+    // exists (update="false") instead of creating a duplicate or overwriting it.
+    const guard = filterEmpty({ ico: match.ico, dic: match.dic });
+    if (Object.keys(guard).length > 0) {
+      result["adb:actionType"] = { "adb:add": { "@update": "false", "@add": "true", ...buildActionFilter(guard, {}, "addressbook") } };
+    }
+  } else {
+    // Update/delete match only by explicit match or record identifiers (id/extId), never by
+    // the new identity values being written (company/IČO in data).
+    const identifiers = filterEmpty({ id: data.id, extId: data.extId, extSystemName: data.extSystemName });
+    result["adb:actionType"] = { [`adb:${action}`]: buildActionFilter(match, identifiers, "addressbook") };
   }
   if (action !== "delete") {
     Object.assign(result, buildAddressData(data));
@@ -1050,6 +1068,7 @@ function buildActionFilter(match: Record<string, any>, data: Record<string, any>
     code: source.code,
     name: agenda === "stock" ? source.name : undefined,
     ico: agenda === "addressbook" ? source.ico : undefined,
+    dic: agenda === "addressbook" ? source.dic : undefined,
     company: agenda === "addressbook" ? source.company : undefined
   }), agenda);
   if (Object.keys(filter).length === 0) {
@@ -1162,18 +1181,26 @@ function withDefaultControlStatementDate(header: Record<string, any>, applicable
   return { ...header, dateKHDPH: header.dateTax };
 }
 
+const controlStatementInvoiceTypes = [
+  "receivedInvoice", "receivedCreditNotice", "receivedDebitNote", "receivedCorrectiveTax",
+  "commitment", "issuedCreditNotice", "issuedDebitNote", "issuedCorrectiveTax"
+];
+
 function buildInvoiceData(header: Record<string, any>, items: Record<string, any>[]): XmlObject {
   const type = header.type || "issuedInvoice";
-  header = withDefaultControlStatementDate(header, [
-    "receivedInvoice", "receivedCreditNotice", "receivedDebitNote", "receivedCorrectiveTax",
-    "commitment", "issuedCreditNotice", "issuedDebitNote", "issuedCorrectiveTax"
-  ].includes(type));
-  const currency = header.currency ?? "";
+  const expense = isExpenseDocument({ ...header, type }, "invoice");
+  if (expense) {
+    header = resolveExpensePolicy({ ...header, type }, items, "invoice");
+    items = [];
+  } else {
+    header = withDefaultControlStatementDate(header, controlStatementInvoiceTypes.includes(type));
+  }
+  const currency = String(header.currency ?? "").trim();
   const invoiceHeader = filterEmpty({
     "inv:invoiceType": type,
     "inv:extId": buildExtId(header),
     "inv:sphereType": header.sphereType,
-    "inv:number": header.number ? { "typ:numberRequested": header.number } : undefined,
+    "inv:number": buildRequestedNumber(header),
     "inv:symVar": header.symVar,
     "inv:originalDocument": header.originalDocument,
     "inv:originalDocumentNumber": header.originalDocumentNumber,
@@ -1186,7 +1213,7 @@ function buildInvoiceData(header: Record<string, any>, items: Record<string, any
     "inv:dateKHDPH": header.dateKHDPH,
     "inv:dateDelivery": header.dateDelivery,
     "inv:accounting": ids(header.accounting ?? ""),
-    "inv:classificationVAT": header.classificationVAT ? { "typ:classificationVATType": header.classificationVAT } : undefined,
+    "inv:classificationVAT": classificationVat(header.classificationVAT),
     "inv:classificationKVDPH": ids(header.classificationKVDPH ?? ""),
     "inv:numberKHDPH": header.numberKHDPH,
     "inv:numberKVDPH": header.numberKVDPH,
@@ -1214,49 +1241,52 @@ function buildInvoiceData(header: Record<string, any>, items: Record<string, any
         "inv:unit": item.unit,
         "inv:coefficient": item.coefficient,
         "inv:payVAT": item.payVAT,
-        "inv:rateVAT": item.vatRate ?? "high",
+        "inv:rateVAT": item.vatRate ?? item.rateVAT ?? "high",
+        "inv:percentVAT": item.percentVAT,
         "inv:discountPercentage": item.discountPercentage,
         ...(currency ? { "inv:foreignCurrency": buildCurrencyItem(item) } : { "inv:homeCurrency": buildCurrencyItem(item) }),
         "inv:note": item.note,
         "inv:code": item.code,
         "inv:stockItem": item.stockCode ? { "typ:stockItem": { "typ:ids": item.stockCode } } : undefined,
         "inv:accounting": ids(item.accounting ?? ""),
-        "inv:classificationVAT": item.classificationVAT ? { "typ:classificationVATType": item.classificationVAT } : undefined,
+        "inv:classificationVAT": classificationVat(item.classificationVAT),
         "inv:classificationKVDPH": ids(item.classificationKVDPH ?? ""),
+        "inv:PDP": item.PDP,
+        "inv:CodePDP": item.CodePDP,
         "inv:centre": ids(item.centre ?? ""),
         "inv:activity": ids(item.activity ?? ""),
         "inv:contract": ids(item.contract ?? "")
       })
     }));
   }
-  if (currency) {
-    data["inv:invoiceSummary"] = {
-      "inv:foreignCurrency": {
-        "typ:currency": { "typ:ids": currency },
-        "typ:rate": Number(header.currencyRate ?? 0) || 1,
-        "typ:amount": 1
-      }
-    };
+  const summary = expense ? buildExpenseSummary("inv", header) : buildDocumentSummary("inv", header);
+  if (Object.keys(summary).length > 0) {
+    data["inv:invoiceSummary"] = summary;
   }
+  if (header.sourcePdfArchivePath) data["inv:attachments"] = buildPdfAttachment(header.sourcePdfArchivePath);
   return data;
 }
 
 function buildVoucherData(header: Record<string, any>, items: Record<string, any>[]): XmlObject {
-  header = withDefaultControlStatementDate(header, (header.type ?? header.voucherType) === "expense");
+  const expense = isExpenseDocument(header, "voucher");
+  if (expense) {
+    header = resolveExpensePolicy(header, items, "voucher");
+    items = [];
+  }
   const currency = header.currency ?? "";
   const data: XmlObject = {
     "vch:voucherHeader": filterEmpty({
       "vch:extId": buildExtId(header),
       "vch:voucherType": header.type ?? header.voucherType,
       "vch:cashAccount": ids(header.cashAccount ?? header.cashAccountIds ?? ""),
-      "vch:number": header.number ? { "typ:numberRequested": header.number } : undefined,
+      "vch:number": buildRequestedNumber(header),
       "vch:originalDocument": header.originalDocument,
       "vch:date": header.date,
       "vch:datePayment": header.datePayment,
       "vch:dateTax": header.dateTax,
       "vch:dateKHDPH": header.dateKHDPH,
       "vch:accounting": ids(header.accounting ?? ""),
-      "vch:classificationVAT": header.classificationVAT ? { "typ:classificationVATType": header.classificationVAT } : undefined,
+      "vch:classificationVAT": classificationVat(header.classificationVAT),
       "vch:classificationKVDPH": ids(header.classificationKVDPH ?? ""),
       "vch:text": header.text,
       "vch:partnerIdentity": buildPartnerIdentity(header),
@@ -1289,7 +1319,7 @@ function buildVoucherData(header: Record<string, any>, items: Record<string, any
         "vch:stockItem": item.stockCode ? { "typ:stockItem": { "typ:ids": item.stockCode } } : undefined,
         "vch:linkToStock": item.linkToStock ? { "typ:ids": item.linkToStock } : undefined,
         "vch:accounting": ids(item.accounting ?? ""),
-        "vch:classificationVAT": item.classificationVAT ? { "typ:classificationVATType": item.classificationVAT } : undefined,
+        "vch:classificationVAT": classificationVat(item.classificationVAT),
         "vch:classificationKVDPH": ids(item.classificationKVDPH ?? ""),
         "vch:PDP": item.PDP,
         "vch:CodePDP": item.CodePDP,
@@ -1299,10 +1329,11 @@ function buildVoucherData(header: Record<string, any>, items: Record<string, any
       })
     }));
   }
-  const summary = buildDocumentSummary("vch", header);
+  const summary = expense ? buildExpenseSummary("vch", header) : buildDocumentSummary("vch", header);
   if (Object.keys(summary).length > 0) {
     data["vch:voucherSummary"] = summary;
   }
+  if (header.sourcePdfArchivePath) data["vch:attachments"] = buildPdfAttachment(header.sourcePdfArchivePath);
   return data;
 }
 
@@ -1329,21 +1360,37 @@ function buildActivityData(action: "add" | "update" | "delete", data: Record<str
   return result;
 }
 
+const addressIdentityFields = ["company", "name", "division", "city", "street", "zip", "ico", "dic", "country"];
+
 function buildAddressData(data: Record<string, any>): XmlObject {
+  const address = filterEmpty({
+    "typ:company": data.company,
+    "typ:division": data.division,
+    "typ:name": data.name,
+    "typ:city": data.city,
+    "typ:street": data.street,
+    "typ:zip": data.zip,
+    "typ:ico": data.ico,
+    "typ:dic": data.dic,
+    "typ:country": ref(data.country ?? "")
+  });
+  const extId = buildExtId(data);
+  const hasIdentity = extId !== undefined || addressIdentityFields.some((field) => String(data[field] ?? "").trim() !== "");
   return {
     "adb:addressbookHeader": filterEmpty({
-      "adb:identity": {
-        "typ:address": filterEmpty({
-          "typ:company": data.company ?? "",
-          "typ:ico": data.ico,
-          "typ:dic": data.dic,
-          "typ:street": data.street,
-          "typ:city": data.city,
-          "typ:zip": data.zip
-        })
-      },
+      // Omitted entirely for flag-only updates (e.g. { p1: true }) so identity is never overwritten.
+      "adb:identity": hasIdentity ? filterEmpty({ "typ:extId": extId, "typ:address": Object.keys(address).length > 0 ? address : undefined }) : undefined,
       "adb:phone": data.phone,
-      "adb:email": data.email
+      "adb:email": data.email,
+      "adb:p1": data.p1,
+      "adb:p2": data.p2,
+      "adb:p3": data.p3,
+      "adb:p4": data.p4,
+      "adb:p5": data.p5,
+      "adb:p6": data.p6,
+      "adb:note": data.note,
+      "adb:intNote": data.intNote,
+      ...namespaceObject("adb", data.extraHeader)
     })
   };
 }
@@ -1680,15 +1727,42 @@ function buildPartnerIdentity(header: Record<string, any>): XmlObject | undefine
   if (!header.partnerName) {
     return undefined;
   }
-  return {
+  return filterEmpty({
+    "typ:extId": buildExtId({ extId: header.partnerExtId, extSystemName: header.partnerExtSystemName }),
     "typ:address": filterEmpty({
       "typ:company": header.partnerName,
-      "typ:ico": header.partnerIco,
-      "typ:street": header.partnerStreet,
+      "typ:name": header.partnerPerson,
       "typ:city": header.partnerCity,
-      "typ:zip": header.partnerZip
+      "typ:street": header.partnerStreet,
+      "typ:zip": header.partnerZip,
+      "typ:ico": header.partnerIco,
+      "typ:dic": header.partnerDic,
+      "typ:country": ref(header.partnerCountry ?? "")
     })
-  };
+  });
+}
+
+function buildRequestedNumber(header: Record<string, any>): XmlObject | undefined {
+  const requested = String(header.number ?? "").trim();
+  // Live POHODA: any series id/ids takes precedence and silently discards
+  // numberRequested. Sending only numberRequested honors it and checks duplicates.
+  if (requested) return { "typ:numberRequested": { "@checkDuplicity": true, "#text": requested } };
+  const seriesId = Number(header.numberSeriesId ?? 0);
+  const number = filterEmpty({
+    "typ:id": Number.isSafeInteger(seriesId) && seriesId > 0 ? seriesId : undefined,
+    "typ:ids": String(header.numberSeries ?? "").trim()
+  });
+  return Object.keys(number).length > 0 ? number : undefined;
+}
+
+function classificationVat(value: unknown): XmlObject | undefined {
+  const code = String(value ?? "").trim();
+  if (code === "") {
+    return undefined;
+  }
+  return code === "inland" || code === "nonSubsume"
+    ? { "typ:classificationVATType": code }
+    : { "typ:ids": code };
 }
 
 function buildExtId(data: Record<string, any>): XmlObject | undefined {
@@ -1727,19 +1801,38 @@ function buildDocumentSummary(prefix: string, header: Record<string, any>): XmlO
   });
 }
 
-function buildHomeCurrencySummary(data: Record<string, any>): XmlObject | undefined {
-  const summary = filterEmpty({
-    "typ:priceNone": data.priceNone,
-    "typ:priceLow": data.priceLow,
-    "typ:priceLowVAT": data.priceLowVAT,
-    "typ:priceLowSum": data.priceLowSum,
-    "typ:priceHigh": data.priceHigh,
-    "typ:priceHighVAT": data.priceHighVAT,
-    "typ:priceHighSum": data.priceHighSum,
-    "typ:price3": data.price3,
-    "typ:price3VAT": data.price3VAT,
-    "typ:price3Sum": data.price3Sum
+/**
+ * Summary-only expense documents: exact source buckets for home currency, or the
+ * foreign total only (POHODA ignores homeCurrency when foreignCurrency is supplied and has
+ * no foreign VAT buckets). Rate/amount are emitted only when explicitly supplied so POHODA
+ * uses its configured exchange-rate list otherwise.
+ */
+function buildExpenseSummary(prefix: string, header: Record<string, any>): XmlObject {
+  const foreign = isForeignCurrency(header);
+  return filterEmpty({
+    [`${prefix}:roundingDocument`]: header.roundingDocument,
+    [`${prefix}:roundingVAT`]: header.roundingVAT,
+    [`${prefix}:calculateVAT`]: header.calculateVAT,
+    [`${prefix}:typeCalculateVATInclusivePrice`]: header.typeCalculateVATInclusivePrice,
+    [`${prefix}:homeCurrency`]: foreign ? undefined : buildHomeCurrencySummary(header),
+    [`${prefix}:foreignCurrency`]: foreign ? buildForeignCurrencySummary({ ...header, currencyPriceSum: header.currencyPriceSum ?? header.total }) : undefined
   });
+}
+
+const homeSummaryKeys = [
+  "priceNone", "priceLow", "priceLowVAT", "priceLowSum", "priceHigh", "priceHighVAT", "priceHighSum", "price3", "price3VAT", "price3Sum"
+];
+
+function buildHomeCurrencySummary(data: Record<string, any>): XmlObject | undefined {
+  const summary: XmlObject = {};
+  for (const key of homeSummaryKeys) {
+    if (isMoneyInput(data[key])) {
+      summary[`typ:${key}`] = roundMoney(data[key], key);
+    }
+  }
+  if (isMoneyInput(data.roundingAmount) && roundMoney(data.roundingAmount, "roundingAmount") !== 0) {
+    summary["typ:round"] = { "typ:priceRound": roundMoney(data.roundingAmount, "roundingAmount") };
+  }
   return Object.keys(summary).length > 0 ? summary : undefined;
 }
 
@@ -1748,19 +1841,22 @@ function buildForeignCurrencySummary(data: Record<string, any>): XmlObject | und
   if (currency === "") {
     return undefined;
   }
+  const rate = Number(data.currencyRate ?? 0);
+  const amount = Number(data.currencyAmount ?? 0);
   return filterEmpty({
     "typ:currency": { "typ:ids": currency },
-    "typ:rate": Number(data.currencyRate ?? 0) || 1,
-    "typ:amount": Number(data.currencyAmount ?? 0) || 1,
-    "typ:priceSum": data.currencyPriceSum !== undefined ? Number(data.currencyPriceSum) : undefined
+    "typ:rate": Number.isFinite(rate) && rate > 0 ? rate : undefined,
+    "typ:amount": Number.isFinite(amount) && amount > 0 ? amount : undefined,
+    "typ:priceSum": isMoneyInput(data.currencyPriceSum) ? roundMoney(data.currencyPriceSum, "currencyPriceSum") : undefined
   });
 }
 
 function buildPaymentType(paymentType: string): XmlObject | undefined {
+  if (paymentType === "card") paymentType = "creditcard";
   if (paymentType === "") {
     return undefined;
   }
-  return ["draft", "cash", "card", "compensation"].includes(paymentType)
+  return ["draft", "cash", "creditcard", "compensation"].includes(paymentType)
     ? { "typ:paymentType": paymentType }
     : { "typ:ids": paymentType };
 }

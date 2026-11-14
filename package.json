@@ -1,6 +1,6 @@
 {
   "name": "pohoda-mcp-node",
-  "version": "1.1.0",
+  "version": "2.0.0",
   "description": "MCP server for Stormware POHODA through Pohoda.exe /XML.",
   "type": "module",
   "private": true,
@@ -19,11 +19,14 @@
     "benchmark:utm:invoices": "POHODA_UTM_VM=Windows tsx scripts/benchmark-invoices-utm.ts",
     "test:watch": "vitest",
     "start": "node dist/index.js",
-    "dev": "tsx src/index.ts"
+    "dev": "tsx src/index.ts",
+    "test:integration:parallels": "vitest run tests/pohoda-parallels.integration.test.ts",
+    "test:integration:production": "vitest run tests/pohoda-production.integration.test.ts"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",
     "@napi-rs/canvas": "^1.0.6",
+    "exceljs": "4.4.0",
     "fast-xml-parser": "^5.3.2",
     "iconv-lite": "^0.7.2",
     "pdfjs-dist": "^6.2.108",

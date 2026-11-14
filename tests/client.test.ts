@@ -219,10 +219,13 @@ describe("PohodaClient", () => {
       symSpec: "555",
       paymentAccountNumber: "123456789",
       paymentBankCode: "0100",
-      activity: "ADMIN"
-    }, [
-      { text: "Fee", unitPrice: 250, quantity: 1, vatRate: "none", activity: "ADMIN" }
-    ], "liability-1", "LiabilityDb");
+      activity: "ADMIN",
+      vatPeriod: "2026-07",
+      taxMode: "nonTax",
+      originalDocument: "OL-1",
+      priceNone: 250,
+      total: 250
+    }, [], "liability-1", "LiabilityDb");
     await client.manageActivity("update", { name: "Consulting", code: "CONSULT", note: "Updated" }, { id: 42 }, "activity-1", "CodebookDb");
 
     expect(transport.calls[0]?.database).toBe("CashDb");
@@ -250,20 +253,31 @@ describe("PohodaClient", () => {
     const transport = new FakeTransport();
     const client = new PohodaClient({ transport, ico: "12345678", database: "Default" });
     const item = [{ text: "Taxable supply", unitPrice: 100, quantity: 1, vatRate: "high" }];
+    const summary = { priceHigh: 100, priceHighVAT: 21, total: 121 };
 
     await client.createInvoice({
       type: "receivedInvoice",
       date: "2026-08-05",
       dateTax: "2026-08-05",
-      partnerName: "Supplier"
-    }, item, "received-same", "Db");
+      partnerName: "Supplier",
+      text: "Received same",
+      vatPeriod: "2026-08",
+      taxMode: "taxable", classificationVAT: "PD",
+      originalDocument: "FA-1",
+      ...summary
+    }, [], "received-same", "Db");
     await client.createInvoice({
       type: "receivedInvoice",
       date: "2026-08-05",
       dateTax: "2026-08-05",
       dateKHDPH: "2026-07-31",
-      partnerName: "Supplier"
-    }, item, "received-different", "Db");
+      partnerName: "Supplier",
+      text: "Received late source",
+      vatPeriod: "2026-08",
+      taxMode: "taxable", classificationVAT: "PD",
+      originalDocument: "FA-2",
+      ...summary
+    }, [], "received-different", "Db");
     await client.createInvoice({
       type: "issuedInvoice",
       date: "2026-08-05",
@@ -279,15 +293,23 @@ describe("PohodaClient", () => {
     await client.createOtherLiability({
       date: "2026-08-05",
       dateTax: "2026-08-05",
-      partnerName: "Supplier"
-    }, item, "liability", "Db");
+      partnerName: "Supplier",
+      text: "Liability",
+      vatPeriod: "2026-08",
+      taxMode: "taxable", classificationVAT: "PD",
+      originalDocument: "Z-1",
+      ...summary
+    }, [], "liability", "Db");
     await client.createCashVoucher({
       type: "expense",
       cashAccount: "HLAVNI",
       date: "2026-08-05",
       dateTax: "2026-08-05",
-      text: "Cash expense"
-    }, item, "expense", "Db");
+      text: "Cash expense",
+      vatPeriod: "2026-08",
+      taxMode: "taxable", classificationVAT: "PD",
+      ...summary
+    }, [], "expense", "Db");
     await client.createCashVoucher({
       type: "receipt",
       cashAccount: "HLAVNI",
@@ -303,8 +325,12 @@ describe("PohodaClient", () => {
 
     expect(transport.calls[0]?.xml).toContain("<inv:dateTax>2026-08-05</inv:dateTax>");
     expect(transport.calls[0]?.xml).toContain("<inv:dateKHDPH>2026-08-05</inv:dateKHDPH>");
-    expect(transport.calls[1]?.xml).toContain("<inv:dateTax>2026-08-05</inv:dateTax>");
-    expect(transport.calls[1]?.xml).toContain("<inv:dateKHDPH>2026-07-31</inv:dateKHDPH>");
+    // Late source DUZP (July) imported into August: all four dates move to the period start.
+    expect(transport.calls[1]?.xml).toContain("<inv:date>2026-08-01</inv:date>");
+    expect(transport.calls[1]?.xml).toContain("<inv:dateTax>2026-08-01</inv:dateTax>");
+    expect(transport.calls[1]?.xml).toContain("<inv:dateAccounting>2026-08-01</inv:dateAccounting>");
+    expect(transport.calls[1]?.xml).toContain("<inv:dateKHDPH>2026-08-01</inv:dateKHDPH>");
+    expect(transport.calls[1]?.xml).toContain("Zdroj: doklad FA-2; vystaveno 2026-08-05; DUZP 2026-07-31");
     expect(transport.calls[2]?.xml).toContain("<inv:dateTax>2026-08-05</inv:dateTax>");
     expect(transport.calls[2]?.xml).not.toContain("<inv:dateKHDPH>");
     expect(transport.calls[3]?.xml).toContain("<inv:dateKHDPH>2026-08-05</inv:dateKHDPH>");
@@ -322,14 +348,14 @@ describe("PohodaClient", () => {
       {
         requestId: "voucher",
         tool: "create_cash_voucher",
-        header: { type: "expense", cashAccount: "HLAVNI", date: "2026-07-02", dateTax: "2026-07-02", text: "Cash expense" },
-        items: [{ text: "Expense", unitPrice: 50, quantity: 1, vatRate: "none" }]
+        header: { type: "expense", cashAccount: "HLAVNI", date: "2026-07-02", dateTax: "2026-07-02", text: "Cash expense", vatPeriod: "2026-07", taxMode: "taxable", classificationVAT: "PD", priceHigh: 50, priceHighVAT: 10.5, total: 60.5 },
+        items: []
       },
       {
         requestId: "liability",
         tool: "create_other_liability",
-        header: { partnerName: "Supplier", date: "2026-07-02", dateTax: "2026-07-02", text: "Liability" },
-        items: [{ text: "Fee", unitPrice: 100, quantity: 1, vatRate: "none" }]
+        header: { partnerName: "Supplier", date: "2026-07-02", dateTax: "2026-07-02", text: "Liability", vatPeriod: "2026-07", taxMode: "taxable", classificationVAT: "PD", originalDocument: "Z-7", priceHigh: 100, priceHighVAT: 21, total: 121 },
+        items: []
       },
       {
         requestId: "receivable",
@@ -599,4 +625,183 @@ describe("PohodaClient", () => {
       .rejects.toThrow(/manage_bank_account add requires numberAccount, codeBank/);
     expect(transport.calls).toHaveLength(0);
   });
+
+  it("builds summary-only expense XML with exact buckets, rounding, numbering, and typed classification", async () => {
+    const transport = new FakeTransport();
+    const client = new PohodaClient({ transport, ico: "12345678", database: "Db" });
+
+    await client.createInvoice({
+      type: "receivedInvoice",
+      text: "Material",
+      vatPeriod: "2026-08",
+      taxMode: "taxable",
+      date: "2026-08-03",
+      dateKHDPH: "2026-08-02",
+      originalDocument: "FA-2026-17",
+      symVar: "202617",
+      number: "26PF0005",
+      numberSeries: "26PF",
+      numberSeriesId: 73,
+      classificationVAT: "UD",
+      partnerName: "Dodavatel s.r.o.",
+      partnerIco: "12345679",
+      partnerDic: "CZ12345679",
+      partnerCountry: "CZ",
+      partnerExtId: "SUP-1",
+      partnerExtSystemName: "registry",
+      priceNone: "10",
+      priceLow: 100,
+      priceLowVAT: 12,
+      priceHigh: 0.1 + 0.2,
+      priceHighVAT: 0.06,
+      roundingAmount: -0.36,
+      total: 122
+    }, [], "expense-summary", "Db");
+
+    const xml = transport.calls[0]?.xml ?? "";
+    expect(xml).not.toContain("<inv:invoiceDetail>");
+    expect(xml).toContain('<inv:number><typ:numberRequested checkDuplicity="true">26PF0005</typ:numberRequested></inv:number>');
+    expect(xml).toContain("<inv:originalDocument>FA-2026-17</inv:originalDocument>");
+    expect(xml).toContain("<inv:symVar>202617</inv:symVar>");
+    expect(xml).toContain("<inv:classificationVAT><typ:ids>UD</typ:ids></inv:classificationVAT>");
+    expect(xml).toContain("<inv:dateTax>2026-08-02</inv:dateTax>");
+    expect(xml).toContain("<inv:dateKHDPH>2026-08-02</inv:dateKHDPH>");
+    expect(xml).toContain("<typ:extId><typ:ids>SUP-1</typ:ids><typ:exSystemName>registry</typ:exSystemName></typ:extId>");
+    expect(xml).toContain("<typ:dic>CZ12345679</typ:dic>");
+    expect(xml).toContain("<typ:country><typ:ids>CZ</typ:ids></typ:country>");
+    expect(xml).toContain("<inv:invoiceSummary><inv:roundingDocument>math2one</inv:roundingDocument><inv:roundingVAT>none</inv:roundingVAT><inv:calculateVAT>false</inv:calculateVAT><inv:homeCurrency><typ:priceNone>10</typ:priceNone><typ:priceLow>100</typ:priceLow><typ:priceLowVAT>12</typ:priceLowVAT><typ:priceLowSum>112</typ:priceLowSum><typ:priceHigh>0.3</typ:priceHigh><typ:priceHighVAT>0.06</typ:priceHighVAT><typ:priceHighSum>0.36</typ:priceHighSum><typ:round><typ:priceRound>-0.36</typ:priceRound></typ:round></inv:homeCurrency></inv:invoiceSummary>");
+    expect(xml).not.toContain("vatPeriod");
+    expect(xml).not.toContain("_expensePolicy");
+  });
+
+  it("keeps inland/nonSubsume as classification enum and other codes as ids", async () => {
+    const transport = new FakeTransport();
+    const client = new PohodaClient({ transport, ico: "12345678", database: "Db" });
+    await client.createInvoice({ type: "issuedInvoice", partnerName: "Customer", classificationVAT: "inland" }, [
+      { text: "A", unitPrice: 1, classificationVAT: "UD" }
+    ], "classification", "Db");
+    const xml = transport.calls[0]?.xml ?? "";
+    expect(xml).toContain("<inv:classificationVAT><typ:classificationVATType>inland</typ:classificationVATType></inv:classificationVAT>");
+    expect(xml).toContain("<inv:classificationVAT><typ:ids>UD</typ:ids></inv:classificationVAT>");
+  });
+
+  it("rejects items and invalid expense headers before transport", async () => {
+    const transport = new FakeTransport();
+    const client = new PohodaClient({ transport, ico: "12345678", database: "Db" });
+    const base = { type: "receivedInvoice", text: "X", vatPeriod: "2026-08", taxMode: "taxable", classificationVAT: "PD", date: "2026-08-03", dateKHDPH: "2026-08-03", originalDocument: "F1", priceHigh: 100, priceHighVAT: 21, total: 121 };
+
+    await expect(client.createInvoice(base, [{ text: "Item", unitPrice: 100 }], "bad-1", "Db")).rejects.toThrow(/ITEMS_NOT_ALLOWED/);
+    await expect(client.createInvoice({ ...base, total: 120 }, [], "bad-2", "Db")).rejects.toThrow(/SUMMARY_MISMATCH/);
+    await expect(client.createOtherLiability({ ...base, vatPeriod: "" }, [], "bad-3", "Db")).rejects.toThrow(/VAT_PERIOD_REQUIRED/);
+    await expect(client.createCashVoucher({ ...base, type: "expense", cashAccount: "HL", text: "" }, [], "bad-4", "Db")).rejects.toThrow(/TEXT_REQUIRED/);
+    await expect(client.writeBatch([{ tool: "create_other_liability", header: { ...base, priceHighVAT: 21.001 }, items: [] }], "bad-5", "Db")).rejects.toThrow(/AMOUNT_PRECISION/);
+    expect(transport.calls).toHaveLength(0);
+  });
+
+  it("builds small and large card commitments with K/VS from the PK sequence", async () => {
+    const transport = new FakeTransport();
+    const client = new PohodaClient({ transport, ico: "12345678", database: "Db" });
+    const card = { text: "Card purchase", vatPeriod: "2026-08", taxMode: "taxable", classificationVAT: "PD", date: "2026-08-10", dateKHDPH: "2026-08-10", cardPayment: true, numberSeries: "PK26" };
+
+    await client.createOtherLiability({ ...card, number: "PK26007", cardSequence: 7, originalDocument: "UCT-55", priceHigh: 1000, priceHighVAT: 210, total: 1210 }, [], "card-small", "Db");
+    await client.createOtherLiability({ ...card, number: "PK26008", cardSequence: 8, originalDocument: "FA-900", symVar: "900", priceHigh: 10000, priceHighVAT: 2100, total: 12100 }, [], "card-large", "Db");
+    await expect(client.createOtherLiability({ ...card, cardSequence: 9, paymentType: "cash", originalDocument: "X", priceHigh: 1, priceHighVAT: 0.21, total: 1.21 }, [], "card-cash", "Db"))
+      .rejects.toThrow(/CARD_PAYMENT_TYPE_CONFLICT/);
+
+    const small = transport.calls[0]?.xml ?? "";
+    expect(small).toContain("<inv:invoiceType>commitment</inv:invoiceType>");
+    expect(small).toContain('<inv:number><typ:numberRequested checkDuplicity="true">PK26007</typ:numberRequested></inv:number>');
+    expect(small).toContain("<inv:originalDocument>K7</inv:originalDocument>");
+    expect(small).toContain("<inv:symVar>7</inv:symVar>");
+    expect(small).toContain("<inv:paymentType><typ:paymentType>creditcard</typ:paymentType></inv:paymentType>");
+    expect(small).toContain("Zdroj: doklad UCT-55");
+    const large = transport.calls[1]?.xml ?? "";
+    expect(large).toContain("<inv:originalDocument>FA-900</inv:originalDocument>");
+    expect(large).toContain("<inv:symVar>900</inv:symVar>");
+    expect(large).not.toContain("Zdroj:");
+  });
+
+  it("applies the cash expense originalDocument threshold on the final payable and leaves receipts alone", async () => {
+    const transport = new FakeTransport();
+    const client = new PohodaClient({ transport, ico: "12345678", database: "Db" });
+    const expense = { type: "expense", cashAccount: "HL", text: "Cash", vatPeriod: "2026-08", taxMode: "taxable", classificationVAT: "PD", date: "2026-08-04", dateKHDPH: "2026-08-04", datePayment: "2026-08-05", originalDocument: "UCT-1" };
+
+    await client.createCashVoucher({ ...expense, priceHigh: 8264.46, priceHighVAT: 1735.54, roundingAmount: 0, total: 10000 }, [], "cash-small", "Db");
+    await client.createCashVoucher({ ...expense, priceHigh: 8264.88, priceHighVAT: 1735.62, roundingAmount: -0.5, total: 10000 }, [], "cash-rounded", "Db");
+    await client.createCashVoucher({ ...expense, priceHigh: 8265.29, priceHighVAT: 1735.71, total: 10001 }, [], "cash-large", "Db");
+    await client.createCashVoucher({ type: "receipt", cashAccount: "HL", date: "2026-08-04", text: "Receipt", originalDocument: "R-1" }, [
+      { text: "Sale", unitPrice: 1, vatRate: "none" }
+    ], "cash-receipt", "Db");
+
+    for (const call of transport.calls.slice(0, 2)) {
+      expect(call.xml).not.toContain("<vch:originalDocument>");
+      expect(call.xml).toContain("Zdroj: doklad UCT-1; vystaveno 2026-08-04; DUZP 2026-08-04; uhrazeno 2026-08-05");
+      expect(call.xml).toContain("<vch:datePayment>2026-08-05</vch:datePayment>");
+      expect(call.xml).not.toContain("<vch:voucherDetail>");
+    }
+    expect(transport.calls[1]?.xml).toContain("<typ:round><typ:priceRound>-0.5</typ:priceRound></typ:round>");
+    expect(transport.calls[2]?.xml).toContain("<vch:originalDocument>UCT-1</vch:originalDocument>");
+    expect(transport.calls[3]?.xml).toContain("<vch:originalDocument>R-1</vch:originalDocument>");
+    expect(transport.calls[3]?.xml).toContain("<vch:voucherDetail>");
+  });
+
+  it("emits foreign summaries without a forced exchange rate and blocks unexpressible foreign VAT", async () => {
+    const transport = new FakeTransport();
+    const client = new PohodaClient({ transport, ico: "12345678", database: "Db" });
+    const foreign = { type: "receivedInvoice", text: "EU service", vatPeriod: "2026-08", taxMode: "nonTax", date: "2026-08-04", originalDocument: "INV-77", currency: "EUR" };
+
+    await client.createInvoice({ ...foreign, priceNone: 120, total: 120 }, [], "fx-default-rate", "Db");
+    await client.createInvoice({ ...foreign, priceNone: 120, total: 120, currencyRate: 24.5, currencyAmount: 1 }, [], "fx-explicit", "Db");
+    await client.createInvoice({ type: "issuedInvoice", partnerName: "Customer", currency: "EUR" }, [{ text: "A", unitPrice: 1 }], "fx-issued", "Db");
+    await expect(client.createInvoice({ ...foreign, taxMode: "taxable", classificationVAT: "PD", dateKHDPH: "2026-08-04", priceHigh: 100, priceHighVAT: 21, total: 121 }, [], "fx-vat", "Db"))
+      .rejects.toThrow(/FOREIGN_TAXABLE_SPLIT_UNSUPPORTED/);
+
+    const defaultRate = transport.calls[0]?.xml ?? "";
+    expect(defaultRate).toContain("<inv:invoiceSummary><inv:roundingDocument>none</inv:roundingDocument><inv:roundingVAT>none</inv:roundingVAT><inv:calculateVAT>false</inv:calculateVAT><inv:foreignCurrency><typ:currency><typ:ids>EUR</typ:ids></typ:currency><typ:priceSum>120</typ:priceSum></inv:foreignCurrency></inv:invoiceSummary>");
+    expect(defaultRate).not.toContain("<typ:rate>");
+    expect(defaultRate).not.toContain("<inv:homeCurrency>");
+    expect(defaultRate).toContain("<inv:classificationVAT><typ:ids>PN</typ:ids></inv:classificationVAT>");
+    expect(defaultRate).not.toContain("<inv:dateKHDPH>");
+    expect(transport.calls[1]?.xml).toContain("<typ:rate>24.5</typ:rate><typ:amount>1</typ:amount>");
+    expect(transport.calls[2]?.xml).not.toContain("<typ:rate>");
+    expect(transport.calls[2]?.xml).not.toContain("<typ:amount>");
+  });
+
+  it("builds flag-only, guarded-add, and identity-safe address operations", async () => {
+    const transport = new FakeTransport();
+    const client = new PohodaClient({ transport, ico: "12345678", database: "Db" });
+
+    await client.manageAddress("update", { p1: true }, { id: 7 }, "p1-only", "Db");
+    await client.manageAddress("add", { company: "Dodavatel", ico: "12345679", dic: "CZ12345679", country: "CZ", p1: true, intNote: "ARES" }, { ico: "12345679" }, "guarded-add", "Db");
+    await client.manageAddress("update", { company: "New name", ico: "99999999" }, { id: 8 }, "update", "Db");
+    await expect(client.manageAddress("update", { company: "No match", ico: "11111111" }, {}, "no-match", "Db")).rejects.toThrow(/requires a match/);
+
+    const flagOnly = transport.calls[0]?.xml ?? "";
+    expect(flagOnly).toContain("<adb:update><ftr:filter><ftr:id>7</ftr:id></ftr:filter></adb:update>");
+    expect(flagOnly).toContain("<adb:addressbookHeader><adb:p1>true</adb:p1></adb:addressbookHeader>");
+    expect(flagOnly).not.toContain("adb:identity");
+    const add = transport.calls[1]?.xml ?? "";
+    expect(add).toContain('<adb:actionType><adb:add update="false" add="true"><ftr:filter><ftr:ico>12345679</ftr:ico></ftr:filter></adb:add></adb:actionType>');
+    expect(add).toContain("<typ:dic>CZ12345679</typ:dic>");
+    expect(add).toContain("<typ:country><typ:ids>CZ</typ:ids></typ:country>");
+    expect(add).toContain("<adb:p1>true</adb:p1>");
+    expect(add).toContain("<adb:intNote>ARES</adb:intNote>");
+    const update = transport.calls[2]?.xml ?? "";
+    expect(update).toContain("<adb:update><ftr:filter><ftr:id>8</ftr:id></ftr:filter></adb:update>");
+    expect(update).not.toContain("<ftr:ico>99999999</ftr:ico>");
+    expect(transport.calls).toHaveLength(3);
+  });
+  it("links the archived source PDF in invoice and cash document attachment blocks", async () => {
+    const transport = new FakeTransport();
+    const client = new PohodaClient({ transport, ico: "12345678", database: "Db" });
+    const path = String.raw`C:\Účetnictví\PDF DOKLADY KLIENTŮ Z POHODY\test.pdf`;
+    const header = { text: "PDF source", vatPeriod: "2026-11", taxMode: "nonTax", date: "2026-11-02", datePayment: "2026-11-02", priceNone: 100, total: 100, sourcePdfArchivePath: path };
+    await client.createInvoice({ ...header, type: "receivedInvoice" }, [], "pdf-invoice", "Db");
+    await client.createCashVoucher({ ...header, type: "expense", cashAccount: "HP" }, [], "pdf-cash", "Db");
+    expect(transport.calls[0]?.xml).toContain(`<inv:attachments><typ:shortcut><typ:target>${path}</typ:target></typ:shortcut></inv:attachments>`);
+    expect(transport.calls[1]?.xml).toContain(`<vch:attachments><typ:shortcut><typ:target>${path}</typ:target></typ:shortcut></vch:attachments>`);
+    expect(transport.calls[0]?.xml).not.toContain("typ:companyDocumentsFolder");
+    expect(transport.calls[1]?.xml).not.toContain("typ:file");
+  });
+
 });

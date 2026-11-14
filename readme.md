@@ -140,6 +140,7 @@ Database and transport:
 
 Read tools:
 
+- `lookup_supplier_registry`
 - `prepare_scanned_pdf`
 - `list_documents`
 - `list_stock`
@@ -227,26 +228,76 @@ For four or more independently readable pages/documents, render once and distrib
 disjoint returned page paths to sub-agents. Each reader should return structured fields,
 source pages, confidence, and continuation markers. The parent agent must merge multi-page
 documents, validate totals/VAT/identity, deduplicate, choose the accounting unit, and then
-perform one `batch_write` or `batch_create_invoices` call per `databaseId`. Reader agents
+prepare one review workbook per `databaseId` using `prepare_expense_review`. Only after
+user review and an explicit import instruction, call `import_expense_review`. Reader agents
 must not write to POHODA independently.
 
-### Czech VAT dates on imported documents
+### Default reviewed-workbook workflow
 
-For received taxable invoices, other liabilities, and taxable cash expenses, extract and
-send both VAT dates:
+A request to process PDFs prepares an editable `.xlsx`; it does not authorize accounting
+writes. The workflow is:
 
-- `dateTax` is the deduction/delivery date that determines the VAT-return and control-
-  statement reporting period.
-- `dateKHDPH` is the supplier's original DUZP/DPPD shown on the source document.
+1. Extract source PDFs and call `prepare_expense_review` with the client, VAT month and
+   document rows. The service reads similar POHODA documents before saving the preview.
+2. Review/edit the workbook. Use `inspect_expense_review` to inspect its current contents.
+   Resolve rows marked for review or mark them to skip.
+3. Explicitly request import, then call `import_expense_review` with `approved: true` and the `expectedWorkbookSha256` returned by the latest inspection.
+   The service rereads the reviewed cells and validates them before any accounting write.
 
-When the dates are equal, repeat the same `YYYY-MM-DD` in both fields. When they differ,
-preserve each date; do not replace the source DUZP/DPPD with the later deduction date.
-The same distinction applies to internal and corrective tax documents. Ordinary issued
-invoices do not normally use `dateKHDPH`.
+Review notes are not accounting data and are never imported. Short document descriptions
+are preferred (for example, `Materiál` rather than a list of all materials). Existing client
+records inform accounting conventions but never replace source VAT or amounts.
+Direct expense create/batch MCP calls are blocked; the lower-level TypeScript client
+remains available for implementation and controlled integration tests.
 
-For applicable document types, the XML builder defensively copies `dateTax` into a missing
-`dateKHDPH`. This only protects equal-date documents and cannot infer a different source
-DUZP/DPPD, so agents and sub-agents must still extract both values explicitly.
+### Strict expense imports (version 2)
+
+Received invoices (`receivedInvoice`), other liabilities (`commitment`) and cash
+expenses require **summary amounts and header text, without items**. Pass the selected
+`vatPeriod` (`YYYY-MM`), original source dates/number, exact VAT buckets, optional
+`roundingAmount`, and `total` (final payable after rounding).
+Taxable expenses also require an explicit `classificationVAT` from the client's
+codebook: leaving it to a POHODA default can incorrectly classify a card purchase as PN.
+
+The shared policy applies the selected month's first day to late invoice `date`,
+`dateTax`, `dateAccounting` and `dateKHDPH`. Original source facts remain in `intNote`.
+Cash expenses keep actual `datePayment`; they have no `dateAccounting` XML field.
+PN/non-tax documents have no KH date and put the source gross in the zero-rate bucket.
+Missing DIČ alone never establishes non-payer status. Foreign documents need an explicit
+VAT-treatment decision; current registry status does not prove historical status.
+
+`lookup_supplier_registry` looks up Czech suppliers through ARES and returns current
+VAT evidence. Expense writes resolve/create contacts, mark suppliers and verify links.
+Cash expense `Doklad` is populated only above CZK 10,000 payable after rounding.
+For `cardPayment=true` commitments, the live PK sequence drives `KN`/variable symbol N
+at or below CZK 10,000; above it the source references are used.
+
+Omit `currencyRate` to let POHODA use its configured rate. There is no fallback of 1.
+Foreign summaries cannot encode every VAT split: unsupported combinations fail clearly
+rather than silently losing VAT or converting the currency. Inspect the applied FX data
+and all verification differences returned after import.
+POHODA recalculates document rounding from its selected rounding mode. The importer
+selects a mode only when it reproduces the source payable exactly; an arbitrary
+adjustment that no supported mode can preserve is returned for review before writing.
+
+Expense results distinguish created, already-existing and created-but-unverified
+records. A verification failure returns IDs and differences; never blindly re-import.
+POHODA 14302 does not reliably export or filter invoice external IDs. Expense imports
+therefore also keep a stable `MCP-ID:` line in the internal note and compare it during
+fresh paged reads. Preserve that line if editing imported records manually. Duplicate
+scans are grouped by agenda and accounting year and processed on the server.
+This policy is a breaking input change from version 1; issued invoices, other receivables
+and cash receipts retain their ordinary workflows.
+
+The canonical operator guide is `pohoda://guide`, also available through the read-only
+`get_usage_guide` tool for clients without resource access. Both serve the same content
+from `src/mcp/guide.ts`; the server's short initialization instructions tell the agent
+to read it before processing documents.
+
+MCP clients decide whether to pass server instructions to the model or load resources
+automatically. If yours does not, use [the optional workspace reminder](docs/consumer-AGENTS.md)
+and keep only client/year-specific mappings alongside it. The repository root
+`AGENTS.md` is for developers, not a second operator manual.
 
 Use `raw_xml_batch` for schema-specific multi-step workflows where batching several
 `dataPackItem`s into one POHODA process run is more efficient than separate calls.
@@ -435,3 +486,52 @@ completed in roughly one process run instead of three.
 The real POHODA 14302.10 demo rejected `listUserAgendaRequest` and
 `listMeasureUnitRequest` for dataPack v2, so those two requests are intentionally not
 exposed in `list_export_agenda`.
+
+
+## Parallels integration tests
+
+`npm run test:integration:parallels` is opt-in. With no VM configured it skips.
+Set `POHODA_PRL_VM` to the existing Windows VM name and use
+`POHODA_PRL_CURRENT_USER=1` when POHODA must run as the logged-in Windows user.
+`POHODA_PRL_EXE_PATH` can identify an installation explicitly; otherwise the harness
+checks standard installation locations. Credentials come from `POHODA_PRL_USERNAME`
+and `POHODA_PRL_PASSWORD`; the harness sends them via stdin rather than host arguments.
+
+Writes additionally require `POHODA_PRL_ALLOW_WRITES=1` and an explicit
+`POHODA_PRL_DEMO_DATABASE`. Live accounting-unit metadata must identify it as a test/demo
+unit; the harness never picks the first company for writes. Optionally pin its ICO with
+`POHODA_PRL_DEMO_ICO`. Set `POHODA_PRL_REPORT` for the evidence JSON output.
+All experimental documents use the `MCPTEST` marker and stable import IDs.
+
+Tests cover exact VAT/rounding summaries, PN with an absent KH date, supplier linking,
+POHODA-selected foreign rates and numbering behavior. A schema-valid request alone
+is not proof that POHODA preserves the values: inspect the read-back evidence.
+
+`npm run test:integration:production` uses the same environment gates and tests the
+actual XLSX review service, expense importer and XML client together. It also checks
+repeat imports, Czech PDF links, the cash threshold and card numbering across a large
+purchase. Use a new `POHODA_PRL_RUN` tag for a new set of isolated test documents.
+
+
+## Source PDF archive and document links
+
+For PDF expense imports, pass `sourcePdfPath` (the original PDF readable by the MCP
+server) and `sourcePages`. Attaching the source is required. `sourceType: "manual"`
+is reserved for entries that did not come from a PDF.
+
+The default archive root is `C:\Účetnictví\PDF DOKLADY KLIENTŮ Z POHODY`.
+`POHODA_PDF_ARCHIVE_DIR` may explicitly override it. The server stores originals in
+client/year subfolders using content-addressed filenames, so unrelated files cannot
+silently overwrite each other. Several invoices from one PDF reuse the same saved file.
+Source files are never deleted. The Windows path belongs to the machine hosting POHODA;
+a non-Windows deployment needs an explicitly configured archive/bridge, not a relative
+folder whose name happens to start with `C:`.
+
+The XML links the archived file through `attachments/shortcut/target` in the Documents
+tab. `attachments/files/file` is export-only and is not used for copying PDFs.
+Post-import read-back must contain the saved target path. A successful invoice import
+with a missing PDF link is returned as incomplete and must not be blindly re-imported.
+Enable POHODA's **Používat složku dokumentů firmy** setting for the accounting unit.
+The Windows system locale must support Czech (ANSI code page 1250) for this Czech
+archive path: a live test on an English 1252 system changed accented path characters;
+the same path round-tripped exactly after selecting the Czech system locale.

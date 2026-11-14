@@ -19,6 +19,14 @@ describe("XmlBuilder", () => {
     expect(parser.parse(xml).dataPack.dataPackItem.invoice.invoiceHeader.invoiceType).toBe("issuedInvoice");
   });
 
+  it("writes text and attributes together for explicit number duplicate checks", () => {
+    const xml = builder.build("inv:invoice", "2.0", {
+      "inv:number": { "typ:numberRequested": { "@checkDuplicity": true, "#text": "A&B<1" } }
+    });
+    expect(xml).toContain('<typ:numberRequested checkDuplicity="true">A&amp;B&lt;1</typ:numberRequested>');
+    expect(xml).not.toContain("<#text>");
+  });
+
   it("writes nested data, attributes, booleans, numeric array wrappers, and escapes XML text", () => {
     const xml = builder.build("prn:print", "1.0", {
       "prn:record": {

@@ -2,6 +2,7 @@ import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { McpServer, ResourceTemplate } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
+import { XMLParser } from "fast-xml-parser";
 import {
   defaultListLimit,
   documentAgendas,
@@ -21,11 +22,20 @@ import type { XmlDatabase, XmlDatabaseRegistry } from "../pohoda/database-regist
 import type { PohodaResponse } from "../pohoda/response.js";
 import { ExportStore, type CurrencyTotal, type ExportRecord, type ExportSnapshot, summarizeRecords } from "./export-store.js";
 import { preparePdfPages } from "./pdf-pages.js";
+import type { PdfArchive } from "../pohoda/pdf-archive.js";
+import { ExpenseReviewService } from "./expense-review.js";
+import { ExpenseImporter, lookupSupplierRegistry } from "./expense-import.js";
+import { CzechRegistryClient } from "../registry/czech-registry.js";
+import { sumHomeCurrency } from "../pohoda/money.js";
+import { POHODA_GUIDE_URI, POHODA_USAGE_GUIDE } from "./guide.js";
 
 export type PohodaServerContext = {
   client: PohodaClient;
   databaseRegistry?: XmlDatabaseRegistry | undefined;
   exportStore?: ExportStore | undefined;
+  registryClient?: CzechRegistryClient | null;
+  pdfArchive?: Pick<PdfArchive, "archive">;
+  reviewDirectory?: string;
 };
 
 type DatabaseTarget = {
@@ -65,15 +75,52 @@ const dateTaxSchema = z.string().default("").describe(
   "YYYY-MM-DD. POHODA VAT date. On received taxable documents this is the deduction/delivery date and determines the VAT/control-statement reporting period. It is not a substitute for the supplier's original DUZP when that date differs."
 );
 const dateKHDPHSchema = z.string().default("").describe(
-  "YYYY-MM-DD. Datum KH DPH: the source document's DUZP/DPPD reported in Czech VAT control-statement detail. For received taxable invoices, other liabilities, cash expenses, and corrective tax documents, copy the source DUZP here explicitly. If it equals dateTax, repeat the same date in both fields; if it differs, preserve the source DUZP here. Do not normally set this on an ordinary issued invoice."
+  "YYYY-MM-DD. KH VAT date. For expense imports the shared VAT-period policy resolves this from sourceTaxDate and vatPeriod; late documents use period day one. PN/nonTax leaves it absent. Other document types retain their source-date rules."
 );
 const dateApplicationVATSchema = z.string().default("").describe(
   "YYYY-MM-DD. Date VAT is applied, primarily for corrective tax documents; this controls VAT-return treatment and is distinct from dateKHDPH/DPPD."
 );
 
+const moneySchema = z.union([z.number().finite(), z.string().regex(/^-?\d+(?:\.\d{1,2})?$/)]);
+const expenseHeaderShape = {
+  sourceType: z.enum(["pdf", "manual"]).default("pdf").describe("PDF imports must supply sourcePdfPath; manual is only for sources not imported from a PDF."),
+  sourcePdfPath: z.string().default("").describe("Original PDF accessible to this MCP process. It is archived under the configured Windows PDF root and linked to the document."),
+  sourcePages: z.array(z.number().int().positive()).default([]).describe("Original PDF page numbers belonging to this document."),
+  vatPeriod: z.string().default("").describe("Required for expense imports: selected VAT month YYYY-MM. Older source dates move to its first day; originals are preserved."),
+  taxMode: z.enum(["auto", "taxable", "nonTax"]).default("auto").describe("Explicit VAT treatment. Auto PN requires confirmed Czech non-payer evidence; foreign suppliers require a decision."),
+  partnerDic: z.string().default(""),
+  partnerCountry: z.string().default(""),
+  partnerVatStatus: z.enum(["", "payer", "non-payer", "identified-person", "unknown"]).default(""),
+  vatStatusEvidence: z.string().default(""),
+  sourceChargesVat: z.boolean().optional().describe("Whether the source explicitly charges VAT; absence is unknown, not proof of non-payer status."),
+  partnerExtId: z.string().default(""),
+  partnerExtSystemName: z.string().default(""),
+  sourceIssueDate: z.string().default(""),
+  sourceTaxDate: z.string().default(""),
+  sourceDocumentNumber: z.string().default(""),
+  sourceSymVar: z.string().default(""),
+  sourcePaymentDate: z.string().default(""),
+  cardPayment: z.boolean().default(false).describe("Card purchase in Ostatni zavazky. PK series determines K/variable symbol for amounts <=10000 CZK."),
+  numberSeries: z.string().default(""),
+  numberSeriesId: z.number().int().positive().optional(),
+  total: moneySchema.optional().describe("Exact final payable amount AFTER rounding; required for summary-only expenses."),
+  roundingAmount: moneySchema.optional(),
+  homePayableCZK: moneySchema.optional().describe("Verified CZK payable for foreign currency threshold decisions; never guess a conversion rate."),
+  currencyAmount: z.number().int().min(0).optional(),
+  currencyPriceSum: moneySchema.optional(),
+  roundingDocument: z.string().default(""),
+  roundingVAT: z.string().default(""),
+  calculateVAT: z.boolean().optional(),
+  priceNone: moneySchema.optional(),
+  priceLow: moneySchema.optional(), priceLowVAT: moneySchema.optional(), priceLowSum: moneySchema.optional(),
+  priceHigh: moneySchema.optional(), priceHighVAT: moneySchema.optional(), priceHighSum: moneySchema.optional(),
+  price3: moneySchema.optional(), price3VAT: moneySchema.optional(), price3Sum: moneySchema.optional()
+};
+
 const invoiceCreateSchema = z.object({
+  ...expenseHeaderShape,
   type: z.enum(invoiceTypes).describe("POHODA invoice type. dateKHDPH applies especially to received taxable types, commitment, and issued/received corrective tax documents; it is not normally used for issuedInvoice."),
-  items: z.array(itemSchema).min(1),
+  items: z.array(itemSchema).default([]).describe("Must be empty for received invoices and commitments. Supply exact header summary totals."),
   extId: z.string().default(""),
   extSystemName: z.string().default(""),
   sphereType: z.enum(["", ...sphereTypes]).default(""),
@@ -123,9 +170,10 @@ const otherLiabilityCreateSchema = invoiceCreateSchema.omit({ type: true }).exte
 });
 
 const cashVoucherCreateSchema = z.object({
+  ...expenseHeaderShape,
   type: z.enum(voucherTypes),
   cashAccount: z.string(),
-  items: z.array(itemSchema.extend({ vatRate: z.enum(vatRates).default("none") })).min(1),
+  items: z.array(itemSchema.extend({ vatRate: z.enum(vatRates).default("none") })).default([]).describe("Must be empty for cash expenses. Supply exact header summary totals."),
   extId: z.string().default(""),
   extSystemName: z.string().default(""),
   number: z.string().default(""),
@@ -151,22 +199,7 @@ const cashVoucherCreateSchema = z.object({
   contract: z.string().default(""),
   currency: z.string().default(""),
   currencyRate: z.number().default(0),
-  currencyAmount: z.number().default(0),
-  currencyPriceSum: z.number().optional(),
-  roundingDocument: z.string().default(""),
-  roundingVAT: z.string().default(""),
-  calculateVAT: z.boolean().optional(),
   typeCalculateVATInclusivePrice: z.string().default(""),
-  priceNone: z.number().optional(),
-  priceLow: z.number().optional(),
-  priceLowVAT: z.number().optional(),
-  priceLowSum: z.number().optional(),
-  priceHigh: z.number().optional(),
-  priceHighVAT: z.number().optional(),
-  priceHighSum: z.number().optional(),
-  price3: z.number().optional(),
-  price3VAT: z.number().optional(),
-  price3Sum: z.number().optional(),
   note: z.string().default(""),
   intNote: z.string().default(""),
   markRecord: z.boolean().optional()
@@ -186,6 +219,7 @@ const activityManageSchema = z.object({
 });
 
 const emptyAddressInput = {
+  name: "", division: "", country: "", extId: "", extSystemName: "", VATPayerType: "" as const, intNote: "",
   company: "",
   ico: "",
   dic: "",
@@ -197,6 +231,11 @@ const emptyAddressInput = {
 };
 
 const addressCreateSchema = z.object({
+  name: z.string().default(""), division: z.string().default(""), country: z.string().default(""),
+  p1: z.boolean().optional(), p2: z.boolean().optional(),
+  extId: z.string().default(""), extSystemName: z.string().default(""),
+  VATPayerType: z.enum(["", "payer", "non-payer", "identified-person"]).default(""),
+  intNote: z.string().default(""),
   company: z.string().default(""),
   ico: z.string().default(""),
   dic: z.string().default(""),
@@ -366,8 +405,9 @@ const simpleMatchSchema = z.object({
   extId: z.string().default(""),
   extSystemName: z.string().default(""),
   code: z.string().default(""),
-  name: z.string().default("")
-}).default({ id: 0, extId: "", extSystemName: "", code: "", name: "" });
+  name: z.string().default(""),
+  ico: z.string().default(""), dic: z.string().default("")
+}).default({ id: 0, extId: "", extSystemName: "", code: "", name: "", ico: "", dic: "" });
 
 const addressManageSchema = addressCreateSchema.extend({
   action: manageActionSchema,
@@ -651,6 +691,58 @@ const prepareScannedPdfSchema = z.object({
 
 export function registerPohodaTools(server: McpServer, context: PohodaServerContext): void {
   const { client, databaseRegistry } = context;
+  const registryClient = context.registryClient === undefined
+    ? (/^(0|false|off)$/i.test(process.env.POHODA_REGISTRY_LOOKUP ?? "") ? null : new CzechRegistryClient())
+    : context.registryClient;
+  const expenseImporter = new ExpenseImporter(client, registryClient, context.pdfArchive);
+  const reviewService = new ExpenseReviewService({ client, importer: expenseImporter, lookupSupplier: (input) => lookupSupplierRegistry(registryClient, input), ...(context.reviewDirectory ? { directory: context.reviewDirectory } : {}) });
+  const structuredResult = (data: Record<string, any>) => ({ ...jsonResult(data), structuredContent: data, isError: data.ok === false });
+
+  server.registerTool("get_usage_guide", {
+    title: "Read the POHODA operator guide",
+    description: "Read before processing POHODA documents. Returns the canonical pohoda://guide, including preview-first workflow, accounting rules and limitations. Use this when the client cannot read MCP resources.",
+    inputSchema: {},
+    annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false }
+  }, async () => structuredResult(POHODA_USAGE_GUIDE));
+
+  server.registerTool("lookup_supplier_registry", {
+    title: "Look up a supplier in Czech public registries",
+    description: "Read-only ARES identity/address lookup with current VAT-status evidence. Search by IČO or company name plus address; ambiguous results require a decision. Foreign suppliers bypass ARES. Current status does not prove historical VAT status.",
+    inputSchema: {
+      ico: z.string().default(""), dic: z.string().default(""), name: z.string().default(""),
+      street: z.string().default(""), city: z.string().default(""), zip: z.string().default(""), country: z.string().default(""),
+      maxAgeSeconds: z.number().min(0).optional()
+    },
+    annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true }
+  }, async (input) => structuredResult(await lookupSupplierRegistry(registryClient, input)));
+  server.registerTool("prepare_expense_review", {
+    title: "Prepare an Excel expense preview for user review",
+    description: "Default first step after extracting client PDFs. Reads similar existing POHODA documents, then creates an editable XLSX preview; NEVER creates or changes POHODA records. Use short Czech descriptions (e.g. Materiál), and put uncertainty in reviewNotes. Wait for the user to review/edit and explicitly request import.",
+    inputSchema: {
+      databaseId: databaseIdSchema,
+      vatPeriod: z.string().regex(/^\d{4}-(0[1-9]|1[0-2])$/),
+      documents: z.array(z.object({ requestId: z.string().default(""), tool: z.enum(["create_invoice", "create_other_liability", "create_cash_voucher"]), data: z.record(z.string(), z.any()), reviewNotes: z.string().default("") })).min(1).max(500)
+    },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true }
+  }, async ({ databaseId, ...input }) => {
+    const target = await databaseTarget(databaseId);
+    return structuredResult(await reviewService.prepare({ ...input, databaseId: target.database, target: targetOptions(target) }));
+  });
+  server.registerTool("inspect_expense_review", {
+    title: "Read an edited expense review workbook without importing",
+    description: "Rereads the actual edited XLSX and reports importable, skipped and unresolved rows. Review notes never become POHODA notes. Does not write accounting records.",
+    inputSchema: { reviewId: z.string().min(1), workbookPath: z.string().default("") },
+    annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false }
+  }, async ({ reviewId, workbookPath }) => structuredResult(await reviewService.inspect({ reviewId, ...(workbookPath ? { workbookPath } : {}) })));
+  server.registerTool("import_expense_review", {
+    title: "Import the user-reviewed Excel expense workbook",
+    description: "Only call after the user explicitly requests import of the reviewed spreadsheet. Requires expectedWorkbookSha256 from inspect_expense_review; rereads that exact version, validates all selected rows, then imports using exact amounts, supplier linking, PDF attachments and read-back verification. approved must explicitly be true; never infer approval from a request to process PDFs.",
+    inputSchema: { reviewId: z.string().min(1), workbookPath: z.string().default(""), expectedWorkbookSha256: z.string().regex(/^[a-f0-9]{64}$/).describe("Exact workbookSha256 returned by inspect_expense_review for the reviewed version."), approved: z.literal(true), databaseId: databaseIdSchema },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true }
+  }, async ({ reviewId, workbookPath, expectedWorkbookSha256, approved, databaseId }) => {
+    const target = await databaseTarget(databaseId);
+    return structuredResult(await reviewService.importReviewed({ reviewId, ...(workbookPath ? { workbookPath } : {}), expectedWorkbookSha256, approved, databaseId: target.database, target: targetOptions(target) }));
+  });
   const exportStore = context.exportStore ?? new ExportStore(process.env.POHODA_XML_EXPORT_DIR ?? join(process.cwd(), "var", "exports"));
 
   server.registerTool("prepare_scanned_pdf", {
@@ -979,25 +1071,28 @@ export function registerPohodaTools(server: McpServer, context: PohodaServerCont
 
   server.registerTool("create_invoice", {
     title: "Create Pohoda invoice",
-    description: "Creates one POHODA invoice document. Supports the official invoiceType enum including issued/received invoices, other receivables (receivable), and other liabilities (commitment). For a received taxable or corrective document, send both dateTax (deduction/reporting date) and dateKHDPH (source DUZP/DPPD), even when they are equal.",
+    description: "Creates a POHODA invoice. receivedInvoice/commitment must use prepare_expense_review and import_expense_review instead of direct creation. Supplier resolution, late-period dates, PN treatment and read-back verification are automatic. Preserve original document facts in source* fields.",
     inputSchema: {
       ...invoiceCreateSchema.shape,
       dataPackId: z.string().default(""), databaseId: databaseIdSchema
     },
     annotations: { destructiveHint: false, idempotentHint: false, openWorldHint: true }
-  }, async ({ items, dataPackId, databaseId, ...header }) =>
-    jsonResult(assertOk(await client.createInvoice(header, items, dataPackId, targetOptions(await databaseTarget(databaseId))))));
+  }, async ({ items, dataPackId, databaseId, ...header }) => {
+    const target = targetOptions(await databaseTarget(databaseId));
+    if (["receivedInvoice", "commitment"].includes(header.type)) requireReviewedExpenseImport();
+    requireItemMode(header.type, items);
+    return jsonResult(assertOk(await client.createInvoice(header, items, dataPackId, target)));
+  });
 
   server.registerTool("create_other_liability", {
     title: "Create Pohoda other liability",
-    description: "Creates one Ostatni zavazek using inv:invoice with invoiceType=commitment. Use this for other payables/liabilities instead of raw XML. For a taxable source document, send both dateTax (deduction/reporting date) and dateKHDPH (source DUZP/DPPD), even when they are equal.",
+    description: "Use prepare_expense_review then import_expense_review for Ostatni zavazky; direct expense creation is disabled. cardPayment=true applies the live PK-series K/variable-symbol policy. Supplier linking and stored-field verification are automatic.",
     inputSchema: {
       ...otherLiabilityCreateSchema.shape,
       dataPackId: z.string().default(""), databaseId: databaseIdSchema
     },
     annotations: { destructiveHint: false, idempotentHint: false, openWorldHint: true }
-  }, async ({ items, dataPackId, databaseId, ...header }) =>
-    jsonResult(assertOk(await client.createOtherLiability(header, items, dataPackId, targetOptions(await databaseTarget(databaseId))))));
+  }, async () => requireReviewedExpenseImport());
 
   server.registerTool("create_other_receivable", {
     title: "Create Pohoda other receivable",
@@ -1007,14 +1102,15 @@ export function registerPohodaTools(server: McpServer, context: PohodaServerCont
       dataPackId: z.string().default(""), databaseId: databaseIdSchema
     },
     annotations: { destructiveHint: false, idempotentHint: false, openWorldHint: true }
-  }, async ({ items, dataPackId, databaseId, ...header }) =>
-    jsonResult(assertOk(await client.createOtherReceivable(header, items, dataPackId, targetOptions(await databaseTarget(databaseId))))));
+  }, async ({ items, dataPackId, databaseId, ...header }) => {
+    requireItemMode("receivable", items);
+    return jsonResult(assertOk(await client.createOtherReceivable(header, items, dataPackId, targetOptions(await databaseTarget(databaseId)))));
+  });
 
   server.registerTool("create_address", {
     title: "Create Pohoda contact",
     inputSchema: {
-      company: z.string(), ico: z.string().default(""), dic: z.string().default(""), street: z.string().default(""), city: z.string().default(""),
-      zip: z.string().default(""), phone: z.string().default(""), email: z.string().default(""), dataPackId: z.string().default(""), databaseId: databaseIdSchema
+      ...addressCreateSchema.shape, company: z.string().min(1), dataPackId: z.string().default(""), databaseId: databaseIdSchema
     },
     annotations: { destructiveHint: false, idempotentHint: false, openWorldHint: true }
   }, async ({ dataPackId, databaseId, ...data }) =>
@@ -1022,14 +1118,18 @@ export function registerPohodaTools(server: McpServer, context: PohodaServerCont
 
   server.registerTool("create_cash_voucher", {
     title: "Create Pohoda cash voucher",
-    description: "Creates one cash register document (Pokladna) using vch:voucher. Use type=receipt for income cash receipts and type=expense for cash expenses. For a taxable cash expense, send both dateTax (deduction/reporting date) and dateKHDPH (source DUZP/DPPD), even when they are equal.",
+    description: "Creates Pokladna receipts or expenses. Cash expenses must use prepare_expense_review and import_expense_review; preserve actual datePayment. Doklad is only filled above CZK 10000 final payable. PN cash expenses have no KH date. Receipts retain their ordinary item workflow.",
     inputSchema: {
       ...cashVoucherCreateSchema.shape,
       dataPackId: z.string().default(""), databaseId: databaseIdSchema
     },
     annotations: { destructiveHint: false, idempotentHint: false, openWorldHint: true }
-  }, async ({ items, dataPackId, databaseId, ...header }) =>
-    jsonResult(assertOk(await client.createCashVoucher(header, items, dataPackId, targetOptions(await databaseTarget(databaseId))))));
+  }, async ({ items, dataPackId, databaseId, ...header }) => {
+    const target = targetOptions(await databaseTarget(databaseId));
+    if (header.type === "expense") requireReviewedExpenseImport();
+    requireItemMode(header.type, items);
+    return jsonResult(assertOk(await client.createCashVoucher(header, items, dataPackId, target)));
+  });
 
   server.registerTool("manage_activity", {
     title: "Manage Pohoda activity",
@@ -1044,7 +1144,7 @@ export function registerPohodaTools(server: McpServer, context: PohodaServerCont
 
   server.registerTool("batch_create_invoices", {
     title: "Batch create Pohoda invoices with optional contacts",
-    description: "Creates up to 50 invoices for one accounting unit in a single POHODA /XML run. Use this instead of repeated create_address/create_invoice calls when creating multiple invoices, especially when each invoice needs a new addressbook contact. Each received taxable/corrective invoice must include dateTax and dateKHDPH; repeat the same date in both when the source DUZP/DPPD equals the deduction date.",
+    description: "Creates up to 50 invoices for one accounting unit in a single POHODA /XML run. Use this instead of repeated create_address/create_invoice calls when creating multiple invoices, especially when each invoice needs a new addressbook contact. Received invoices/commitments require the reviewed Excel workflow; this direct batch tool is for other invoice types.",
     inputSchema: {
       invoices: z.array(batchInvoiceCreateSchema).min(1).max(50),
       dataPackId: z.string().default(""),
@@ -1054,6 +1154,7 @@ export function registerPohodaTools(server: McpServer, context: PohodaServerCont
   }, async ({ invoices, dataPackId, databaseId }) => {
     const plans = invoices.map((entry, index) => batchInvoiceCreatePlan(entry, index));
     const target = await databaseTarget(databaseId);
+    if (plans.some((plan) => ["receivedInvoice", "commitment"].includes(plan.header.type))) requireReviewedExpenseImport();
     const response = await client.createInvoiceBatch(plans.map((plan) => ({
       requestId: plan.requestId,
       ...(plan.address ? { address: plan.address } : {}),
@@ -1079,7 +1180,7 @@ export function registerPohodaTools(server: McpServer, context: PohodaServerCont
 
   server.registerTool("batch_write", {
     title: "Batch multiple Pohoda write/output operations",
-    description: "Runs multiple typed write/output operations for one accounting unit in a single POHODA /XML process by packing them into one dataPack. Use this for mixed creates such as contacts, invoices, other liabilities/receivables, cash vouchers, activities, stock, orders, and print jobs instead of repeated single-write calls.",
+    description: "Runs multiple typed write/output operations for one accounting unit in a single POHODA /XML process by packing them into one dataPack. Use this for non-expense mixed writes instead of repeated single calls. Received invoices, other liabilities and cash expenses require prepare_expense_review and import_expense_review; this batch cannot bypass the review.",
     inputSchema: {
       operations: z.array(batchWriteOperationSchema).min(1).max(100),
       dataPackId: z.string().default(""),
@@ -1089,7 +1190,11 @@ export function registerPohodaTools(server: McpServer, context: PohodaServerCont
   }, async ({ operations, dataPackId, databaseId }) => {
     const plans = operations.map((operation, index) => batchWriteOperationPlan(operation, index));
     const target = await databaseTarget(databaseId);
-    const response = await client.writeBatch(plans.map((plan) => plan.operation), dataPackId, targetOptions(target));
+    const operationsToWrite = plans.map((plan) => plan.operation);
+    if (operationsToWrite.some((op) => op.tool === "create_other_liability" || (op.tool === "create_invoice" && ["receivedInvoice", "commitment"].includes(op.header.type)) || (op.tool === "create_cash_voucher" && op.header.type === "expense"))) {
+      requireReviewedExpenseImport();
+    }
+    const response = await client.writeBatch(operationsToWrite, dataPackId, targetOptions(target));
     const data = response.toArray();
     const results = plans.map((plan, index) => compactBatchWriteResult(plan, data.items[index]));
     const structuredContent = {
@@ -1301,15 +1406,19 @@ export function registerPohodaTools(server: McpServer, context: PohodaServerCont
     title: "Send raw Pohoda XML",
     inputSchema: { xml: z.string().min(1), note: z.string().default(""), dataPackId: z.string().default(""), databaseId: databaseIdSchema },
     annotations: { destructiveHint: true, idempotentHint: false, openWorldHint: true }
-  }, async ({ xml, note, dataPackId, databaseId }) =>
-    jsonResult(assertOk(await client.sendRawXml(xml, note, dataPackId, targetOptions(await databaseTarget(databaseId))))));
+  }, async ({ xml, note, dataPackId, databaseId }) => {
+    assertNoRawExpense(xml);
+    return jsonResult(assertOk(await client.sendRawXml(xml, note, dataPackId, targetOptions(await databaseTarget(databaseId)))));
+  });
 
   server.registerTool("raw_xml_batch", {
     title: "Send raw Pohoda XML batch",
     inputSchema: { items: z.array(z.string().min(1)).min(1), note: z.string().default(""), dataPackId: z.string().default(""), databaseId: databaseIdSchema },
     annotations: { destructiveHint: true, idempotentHint: false, openWorldHint: true }
-  }, async ({ items, note, dataPackId, databaseId }) =>
-    jsonResult(assertOk(await client.sendRawXmlBatch(items, note, dataPackId, targetOptions(await databaseTarget(databaseId))))));
+  }, async ({ items, note, dataPackId, databaseId }) => {
+    items.forEach(assertNoRawExpense);
+    return jsonResult(assertOk(await client.sendRawXmlBatch(items, note, dataPackId, targetOptions(await databaseTarget(databaseId)))));
+  });
 
   server.registerTool("create_data_export", {
     title: "Create compact persisted Pohoda data export",
@@ -1689,84 +1798,12 @@ function registerResources(server: McpServer, context: PohodaServerContext): voi
   server.registerResource("print-agendas", "pohoda://enums/print-agendas", { mimeType: "application/json" }, async (uri) => ({
     contents: [{ uri: uri.href, mimeType: "application/json", text: stringify(Object.fromEntries(printAgendas.map((agenda) => [agenda, "Pohoda print agenda"]))) }]
   }));
-  server.registerResource("guide", "pohoda://guide", { mimeType: "application/json" }, async (uri) => ({
-    contents: [{ uri: uri.href, mimeType: "application/json", text: stringify({
-      listing: {
-        targetDatabase: "For accounting-unit-specific tools, pass databaseId explicitly using a registry id or exact POHODA database name. POHODA validates dat:dataPack ico against the selected unit, so prefer registry/live discovery rows that include ICO; direct database filenames must contain an 8-digit ICO or match live discovery. current_database only shows the configured fallback; there is no select_database step. If databaseId is omitted and no default database is configured, the tool fails before running POHODA.",
-        use: {
-          list_documents: "Transactional documents; invoice requires invoiceType, order requires documentType. Use invoiceType=commitment for Ostatni zavazky, invoiceType=receivable for Ostatni pohledavky, and agenda=voucher for Pokladna cash documents.",
-          list_stock: "Stock cards and inventory items.",
-          list_contacts: "Address book records.",
-          list_export_agenda: "Read-only codebooks/reference lists. Use agenda=activity to find Cinnosti ids before update/delete.",
-          batch_list_records: "Several read/list requests for one accounting unit in a single POHODA /XML run.",
-          list_balance: "Saldo/balance export for open receivables/payables by date and pairing mode."
-        },
-        efficiency: "Tools default server-side count to limit. Increase count only when needed; use idFrom for paging.",
-        filters: "Prefer explicit filters first. extId requires extSystemName."
-      },
-      scannedDocuments: {
-        tool: "prepare_scanned_pdf",
-        use: "Call once for PDFs containing scanned invoices or receipts. It renders pages concurrently, caches unchanged inputs, writes numbered page images, and inlines images by default so they are immediately visible to the model.",
-        delegation: "When there are at least four independent pages/documents and sub-agents are available, give each sub-agent a disjoint set of returned page paths. Sub-agents extract only and return structured fields plus confidence and page-boundary notes. The parent reconciles multi-page documents, duplicates, totals, VAT, supplier/customer identity, and target accounting unit before any POHODA write.",
-        writing: "After extraction and validation, group records by databaseId and use one batch_write or batch_create_invoices call per accounting unit. Different accounting-unit batches may run in parallel; never let parallel readers independently create duplicate POHODA records."
-      },
-      vatDates: {
-        dateTax: "For received taxable documents, the deduction/delivery date that determines the VAT-return and control-statement reporting period.",
-        dateKHDPH: "Datum KH DPH: the supplier's original DUZP/DPPD from the source document. Send it explicitly for received taxable invoices, other liabilities, cash expenses, internal documents, and corrective tax documents. Repeat dateTax when both dates are equal; preserve the original source date when they differ.",
-        issuedInvoices: "Do not normally set dateKHDPH on an ordinary issuedInvoice. Issued corrective tax documents are an exception.",
-        fallback: "As a defensive fallback on applicable document types only, the XML builder copies dateTax to dateKHDPH when dateKHDPH was omitted. This cannot recover a distinct supplier DUZP, so extraction must still provide both fields."
-      },
-      writing: {
-        use: {
-          create_invoice: "One invoice.",
-          create_other_liability: "One Ostatni zavazek; typed invoice XML with invoiceType=commitment.",
-          create_other_receivable: "One Ostatni pohledavka; typed invoice XML with invoiceType=receivable.",
-          create_cash_voucher: "One Pokladna cash receipt/expense; type=receipt or expense, cashAccount is required.",
-          manage_activity: "Add/update/delete one Cinnost. Update/delete require numeric POHODA id as matchId/id.",
-          create_address: "One addressbook contact.",
-          manage_address: "Add/update/delete one addressbook contact with action filters.",
-          create_stock: "One stock card.",
-          manage_stock: "Add/update/delete one stock card with id/extId/code matching.",
-          create_order: "One order.",
-          create_bank_document: "One Banka document.",
-          create_internal_document: "One Interni doklad.",
-          create_stock_receipt: "One Prijemka warehouse receipt.",
-          create_stock_issue: "One Vydejka warehouse issue.",
-          create_stock_transfer: "One Prevodka warehouse transfer.",
-          create_production_document: "One Vyroba production document.",
-          create_sales_receipt: "One Prodejka sales/POS receipt.",
-          create_offer: "One Nabidka.",
-          create_enquiry: "One Poptavka.",
-          manage_contract: "One Zakazka/contract with optional plan items.",
-          manage_centre: "Add/update/delete one Stredisko/Centre.",
-          manage_store: "Create/import one store/warehouse setup record.",
-          manage_storage: "Import storage classification/tree nodes.",
-          manage_bank_account: "Add one bank account setup record; delete is not exposed by the current official schema.",
-          manage_group_stock: "Add/update/delete stock groups and variants.",
-          manage_parameter_definition: "Advanced optional parameter definitions for an agenda.",
-          print: "One print/PDF/email output job.",
-          batch_write: "Several typed write/output operations for one accounting unit in a single POHODA /XML run.",
-          batch_create_invoices: "Convenience tool for several invoices, optionally with one addressbook contact before each invoice, in a single POHODA /XML run."
-        },
-        efficiency: "Use batch_write whenever you need more than one write/output operation in the same accounting unit, including mixed contacts, invoices, cash vouchers, activities, stock/order management, bank/internal/warehouse/production/sales receipt documents, offers, enquiries, contracts, centres, stores/storage, bank accounts, stock groups, parameter definitions, and print jobs. Use batch_create_invoices for repeated contact+invoice workflows. Both avoid paying Pohoda.exe startup once per item while preserving per-operation results.",
-        ordering: "Operations run in the order supplied inside one dataPack. For batch_create_invoices, when createAddress is true, each contact is placed immediately before its invoice.",
-        parallelism: "Do not mix accounting units in one batch. Send one batch per database; different database batches can run in parallel through the transport queue.",
-        extras: "Broad document/setup tools expose typed common fields plus extraHeader, extraItem, extraData, or similar advanced fragments. Prefer typed fields; use extra fragments only with already-prefixed XML-object keys from the official POHODA schema."
-      },
-      xmlTransport: {
-        queueing: "Same-database calls are serialized with a per-database lock. Different databases run in parallel up to the process cap.",
-        batching: "Use batch_list_records when several typed reads are known up front. Use create_data_export_bundle for several persisted exports. Use batch_write for multi-operation writes, batch_create_invoices for invoice-heavy workflows, and raw_xml_batch only for advanced custom multi-item dataPacks.",
-        freshness: "Normal list/create/status calls ask POHODA each time. list_xml_databases refreshes configured/filesystem sources each time. Export snapshots are intentionally point-in-time; create a new export after UI changes.",
-        discovery: "Use list_accounting_units for official live discovery. It always asks POHODA and supports fuzzy query plus ICO, DIČ, city, database, and year filters; use cursors instead of asking for every client at once. list_xml_databases(includeLive=true) combines refreshed configured/filesystem sources with live POHODA sources.",
-        idempotency: "Create/raw tools accept dataPackId for duplicate checking."
-      },
-      largeExports: {
-        use: "Use create_data_export for one large dataset or create_data_export_bundle for several related datasets. They return compact preview rows, summary totals, opaque nextCursor values, and resource links to full JSON/NDJSON data.",
-        paging: "Use read_export_page with the returned exportId and nextCursor. Cursors are opaque and expire with the export snapshot.",
-        summaries: "Use summarize_export for totals without loading full records into model context. For invoice exports, summary.total/byCurrency/byPartner/byMonth are home-currency totals, normally CZK; foreign invoice totals are separate in summary.foreignCurrency keyed by currency code.",
-        cleanup: "Use cleanup_export when the snapshot is no longer needed."
-      }
-    }) }]
+  server.registerResource("guide", POHODA_GUIDE_URI, {
+    title: "POHODA operator guide",
+    description: "Canonical document-processing workflow, accounting policies, tool usage and limitations. Read before processing client documents.",
+    mimeType: "application/json"
+  }, async (uri) => ({
+    contents: [{ uri: uri.href, mimeType: "application/json", text: stringify(POHODA_USAGE_GUIDE) }]
   }));
   if (exportStore) {
     server.registerResource("export-file", new ResourceTemplate("pohoda://exports/{exportId}/{file}", { list: undefined }), {
@@ -1884,7 +1921,7 @@ function normalizeExportRecord(raw: Record<string, any>, index: number): ExportR
   const header = firstRecord(raw.invoiceHeader, raw.stockHeader, raw.addressbookHeader, raw.orderHeader, raw.voucherHeader, raw.bankHeader, raw);
   const identity = firstRecord(header.partnerIdentity, header.identity, header.accountingUnitIdentity, {});
   const address = firstRecord(identity.address, header.address, {});
-  const summary = firstRecord(raw.invoiceSummary, raw.orderSummary, raw.summary, {});
+  const summary = firstRecord(raw.invoiceSummary, raw.voucherSummary, raw.orderSummary, raw.summary, {});
   const amounts = extractCurrencyAmounts(summary, raw, header);
   return clean({
     index,
@@ -1923,40 +1960,21 @@ function maxNumericId(records: ExportRecord[]): number {
 }
 
 function extractTotal(summary: Record<string, any>, raw: Record<string, any>, header: Record<string, any> = {}): number {
-  const candidates = [
-    summary.homeCurrency?.priceHighSum,
-    summary.homeCurrency?.priceSum,
-    summary.homeCurrency?.priceNone,
-    findDeepNumber(raw, "amountHome"),
-    header.sellingPrice,
-    header.price,
-    header.weightedPurchasePrice,
-    raw.total,
-    raw.price
-  ];
-  return firstNumber(...candidates);
+  const total = sumHomeCurrency(summary.homeCurrency ?? {});
+  if (total !== undefined) return total;
+  return firstNumber(summary.homeCurrency?.priceSum, findDeepNumber(raw, "amountHome"), header.sellingPrice, header.price, header.weightedPurchasePrice, raw.total, raw.price);
 }
 
 function extractCurrencyAmounts(summary: Record<string, any>, raw: Record<string, any>, header: Record<string, any>): { homeCurrency: CurrencyTotal; foreignCurrency?: CurrencyTotal } {
   const home = firstRecord(summary.homeCurrency, {});
   const foreign = firstRecord(summary.foreignCurrency, {});
   const homeCurrency = asText(home.currency?.ids ?? home.currency?.id ?? "CZK") || "CZK";
-  const homeTotal = firstNumber(
-    home.priceHighSum,
-    home.priceSum,
-    home.priceNone,
-    findDeepNumber(raw, "amountHome"),
-    extractTotal(summary, raw, header)
-  );
+  const homeTotal = sumHomeCurrency(home) ?? firstNumber(home.priceSum, findDeepNumber(raw, "amountHome"), extractTotal(summary, raw, header));
   const foreignCurrency = asText(foreign.currency?.ids ?? foreign.currency?.id ?? "");
-  const foreignTotal = firstNumber(
-    foreign.priceSum,
-    foreign.amount,
-    findDeepNumber(raw, "amountForeign")
-  );
+  const foreignTotal = foreign.priceSum !== undefined ? Number(foreign.priceSum) : firstNumber(findDeepNumber(raw, "amountForeign"));
   return clean({
-    homeCurrency: { currency: homeCurrency, total: round2(homeTotal) },
-    foreignCurrency: foreignCurrency !== "" && foreignTotal !== 0 ? { currency: foreignCurrency, total: round2(foreignTotal) } : undefined
+    homeCurrency: { currency: homeCurrency, total: homeTotal },
+    foreignCurrency: foreignCurrency !== "" ? clean({ currency: foreignCurrency, total: round2(foreignTotal), rate: foreign.rate !== undefined ? Number(foreign.rate) : undefined, amount: foreign.amount !== undefined ? Number(foreign.amount) : undefined }) : undefined
   }) as { homeCurrency: CurrencyTotal; foreignCurrency?: CurrencyTotal };
 }
 
@@ -2241,6 +2259,7 @@ function batchInvoiceCreatePlan(args: z.infer<typeof batchInvoiceCreateSchema>, 
 } {
   const requestId = args.requestId !== "" ? args.requestId : `invoice-${index + 1}`;
   const { items, ...header } = args.invoice;
+  requireItemMode(header.type, items);
   const address = clean({
     company: args.address.company || args.invoice.partnerName,
     ico: args.address.ico || args.invoice.partnerIco,
@@ -2251,10 +2270,11 @@ function batchInvoiceCreatePlan(args: z.infer<typeof batchInvoiceCreateSchema>, 
     phone: args.address.phone,
     email: args.address.email
   });
-  if (args.createAddress && String(address.company ?? "") === "") {
+  const expense = ["receivedInvoice", "commitment"].includes(args.invoice.type);
+  if (!expense && args.createAddress && String(address.company ?? "") === "") {
     throw new Error(`Invoice batch entry ${requestId}: address.company or invoice.partnerName is required when createAddress is true.`);
   }
-  if (!args.createAddress && Number(args.invoice.partnerId ?? 0) <= 0 && args.invoice.partnerName === "") {
+  if (!expense && !args.createAddress && Number(args.invoice.partnerId ?? 0) <= 0 && args.invoice.partnerName === "") {
     throw new Error(`Invoice batch entry ${requestId}: invoice.partnerName or invoice.partnerId is required.`);
   }
   return clean({
@@ -2297,6 +2317,7 @@ function batchWriteOperationPlan(args: z.infer<typeof batchWriteOperationSchema>
   }
   if (args.tool === "create_invoice" || args.tool === "create_cash_voucher" || args.tool === "create_other_liability" || args.tool === "create_other_receivable") {
     const { items, ...header } = args.data;
+    requireItemMode(args.tool === "create_other_receivable" ? "receivable" : args.tool === "create_other_liability" ? "commitment" : (header as any).type, items);
     return { requestId, tool: args.tool, operation: { requestId, tool: args.tool, header, items } };
   }
   if (args.tool === "create_order") {
@@ -2398,6 +2419,34 @@ function suffixedDataPackId(dataPackId: string, suffix: string): string {
     return `${dataPackId}${suffix}`;
   }
   return `${dataPackId.slice(0, Math.max(1, 64 - suffix.length))}${suffix}`;
+}
+
+function requireReviewedExpenseImport(): never {
+  throw new Error("Expense documents require the reviewed spreadsheet workflow: prepare_expense_review, user review, then import_expense_review with explicit approval. Processing PDFs is not approval to import.");
+}
+
+function requireItemMode(type: string, items: unknown[]): void {
+  if (!["receivedInvoice", "commitment", "expense"].includes(type) && items.length === 0) throw new Error("Non-expense documents require at least one item.");
+}
+
+function assertNoRawExpense(xml: string): void {
+  let parsed: unknown;
+  const decode = (value: string) => value.replace(/&#(x[\da-f]+|\d+);/gi, (_, code: string) => String.fromCodePoint(code[0]!.toLowerCase() === "x" ? parseInt(code.slice(1), 16) : Number(code)));
+  if (/<!DOCTYPE|<!ENTITY/i.test(xml)) throw new Error("Raw XML declarations with custom entities are not supported.");
+  try { parsed = new XMLParser({ removeNSPrefix: true, ignoreAttributes: false, tagValueProcessor: (_tag, value) => decode(value) }).parse(xml); }
+  catch { throw new Error("Malformed raw XML."); }
+  const valueText = (value: any): string => typeof value === "object" && value !== null ? valueText(value["#text"]) : decode(String(value ?? "")).trim();
+  const inspect = (node: any): void => {
+    if (!node || typeof node !== "object") return;
+    for (const [key, value] of Object.entries(node)) {
+      for (const entry of (Array.isArray(value) ? value : [value])) {
+        if (key === "invoice" && ["receivedInvoice", "commitment"].includes(valueText((entry as any)?.invoiceHeader?.invoiceType))) requireReviewedExpenseImport();
+        if (key === "voucher" && valueText((entry as any)?.voucherHeader?.voucherType) === "expense") requireReviewedExpenseImport();
+        inspect(entry);
+      }
+    }
+  };
+  inspect(parsed);
 }
 
 function jsonResult(data: unknown) {

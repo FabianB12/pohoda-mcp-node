@@ -20,6 +20,8 @@ export type ExportRecord = {
 export type CurrencyTotal = {
   currency: string;
   total: number;
+  rate?: number;
+  amount?: number;
 };
 
 export type ExportSummary = {

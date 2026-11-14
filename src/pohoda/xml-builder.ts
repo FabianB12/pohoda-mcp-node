@@ -109,6 +109,11 @@ function writeData(data: XmlObject | XmlValue[]): string {
       continue;
     }
     const key = String(rawKey);
+    if (key === "#text") {
+      if (!isScalar(value) && !(value instanceof Date)) throw new Error("XML #text must be a scalar value.");
+      xml += scalarToText(value);
+      continue;
+    }
     if (key.startsWith("@")) {
       continue;
     }

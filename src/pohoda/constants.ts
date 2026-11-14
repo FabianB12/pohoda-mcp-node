@@ -1,4 +1,5 @@
 export const namespaces = {
+  nms: "http://www.stormware.cz/schema/version_2/numericalSeries.xsd",
   dat: "http://www.stormware.cz/schema/version_2/data.xsd",
   typ: "http://www.stormware.cz/schema/version_2/type.xsd",
   ftr: "http://www.stormware.cz/schema/version_2/filter.xsd",
