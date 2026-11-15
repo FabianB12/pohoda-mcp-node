@@ -1,4 +1,4 @@
-import { buildBankLiquidationDetail, statementMonthNumber, validateBankHeaderText } from './bank-settlement.js';
+import { buildBankLiquidationDetail, buildBankPartnerIdentity, statementMonthNumber, validateBankHeaderText } from './bank-settlement.js';
 import { buildPdfAttachment } from "./pdf-archive.js";
 import { agendaConfig } from "./constants.js";
 import { isExpenseDocument, isForeignCurrency, resolveExpensePolicy } from "./expense-policy.js";
@@ -592,7 +592,8 @@ function buildGenericHeader(config: DocumentConfig, header: Record<string, any>)
     [`${prefix}:classificationKVDPH`]: ref(header.classificationKVDPH ?? ""),
     [`${prefix}:transactionTaxType`]: header.transactionTaxType,
     [`${prefix}:text`]: header.text,
-    [`${prefix}:partnerIdentity`]: buildPartnerIdentity(header),
+    // Bank: a structured partnerIdentity copied from the settled document keeps both its address-book ID and inline address.
+    [`${prefix}:partnerIdentity`]: prefix === "bnk" && header.partnerIdentity ? buildBankPartnerIdentity(header.partnerIdentity) : buildPartnerIdentity(header),
     [`${prefix}:paymentType`]: buildPaymentType(header.paymentType ?? ""),
     [`${prefix}:paymentAccount`]: buildPaymentAccount(header),
     [`${prefix}:priceLevel`]: ref(header.priceLevel ?? ""),

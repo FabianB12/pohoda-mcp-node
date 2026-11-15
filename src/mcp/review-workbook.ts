@@ -108,7 +108,7 @@ export const REVIEW_COLUMNS: readonly ReviewColumn[] = [
   col("targetDateTax", "Datum DPH", "targetDate", "target", 12, TARGET_NOTE),
   col("targetDateAccounting", "Účetní datum", "targetDate", "target", 12, `${TARGET_NOTE} Prázdné = neodesílá se (POHODA použije své výchozí).`),
   col("targetDateKHDPH", "Datum KH DPH", "targetDate", "target", 12, `${TARGET_NOTE} PN nemá datum KH.`),
-  col("dateDue", "Datum splatnosti", "date", "target", 12),
+  col("targetDateDue", "Datum splatnosti", "targetDate", "target", 12, `${TARGET_NOTE} Splatnost podle dokladu; doklad bez splatnosti je splatný dnem vystavení (původní datum, i u pozdního dokladu). Pokladní výdej datum splatnosti v POHODĚ nemá (XML pokladního dokladu je neobsahuje), proto zůstává prázdné a nic se nezapisuje.`),
   col("paymentType", "Forma úhrady", "paymentMethod", "target", 12, "Hotově / Kartou / Převodem / Dobírkou podle dokladu; prázdné = neznámo. Ostatní závazek s Formou Kartou se čísluje řadou PK (do 10 000 Kč Doklad K + číslo a VS = číslo, nad 10 000 Kč číslo dokladu dodavatele). Pokladní výdej je vždy Hotově. Jiné formy POHODY (Složenkou, Inkasem, Šekem, Zápočtem, Zálohou) zůstávají zachovány."),
   col("accountIds", "Účet dokladu", "text", "target", 14),
   col("paymentAccountNumber", "Číslo bankovního účtu", "id", "target", 24),
@@ -341,8 +341,9 @@ function validateWriteInput(input: ReviewWorkbook): void {
 //
 // The main sheet shows only values the import writes to POHODA. Source facts are not
 // columns; they live in the manifest/intNote (legacy source columns are still read).
-// 1. Always visible: control, identity, Doklad/VS, all four target dates, Forma úhrady,
-//    Předkontace, Členění DPH and Celkem. Blank target = not sent (e.g. PN has no KH date).
+// 1. Always visible: control, identity, Doklad/VS, all four target dates, Datum splatnosti,
+//    Forma úhrady, Předkontace, Členění DPH and Celkem. Blank target = not sent (e.g. PN
+//    has no KH date; Pokladna has no due date).
 // 2. Other target fields: shown when any row writes a value or the field applies
 //    (CONDITIONAL_COLUMNS); otherwise collapsed, still editable.
 // 3. plan/advanced/trace stay collapsed and are never revealed automatically.
@@ -352,16 +353,12 @@ function validateWriteInput(input: ReviewWorkbook): void {
 type RowPredicate = (row: ReviewRow) => boolean;
 const blank = (value: unknown) => value === undefined || value === null || (typeof value === "string" && value.trim() === "");
 const isCashVoucher: RowPredicate = (row) => row.tool === "create_cash_voucher";
-const isCardPayment: RowPredicate = (row) => effectiveCardPayment(row.tool, row.data ?? {});
-const isPaidReceipt: RowPredicate = (row) => isCashVoucher(row) || isCardPayment(row)
-  || ["cash", "creditcard"].includes(displayedPaymentMethod(row.tool, row.data ?? {}));
 const isForeign: RowPredicate = (row) => !blank(row.data?.currency) && String(row.data.currency).trim().toUpperCase() !== "CZK";
 
 const ALWAYS_VISIBLE = new Set(["text", "partnerName", "partnerIco", "partnerDic", "partnerCountry", "targetDocument", "targetSymVar",
-  "targetDate", "targetDateTax", "targetDateAccounting", "targetDateKHDPH", "paymentType", "accounting", "classificationVAT", "targetTotal"]);
+  "targetDate", "targetDateTax", "targetDateAccounting", "targetDateKHDPH", "targetDateDue", "paymentType", "accounting", "classificationVAT", "targetTotal"]);
 /** Optional target fields shown when they apply to some row even while blank. */
 const CONDITIONAL_COLUMNS: ReadonlyArray<{ keys: readonly string[]; appliesTo: RowPredicate }> = [
-  { keys: ["dateDue"], appliesTo: (row) => !isPaidReceipt(row) },
   { keys: ["currency", "currencyRate"], appliesTo: isForeign },
   { keys: ["cashAccount"], appliesTo: isCashVoucher }
 ];
@@ -369,7 +366,7 @@ const COLLAPSED_GROUPS = new Set<ColumnGroup>(["plan", "advanced", "trace"]);
 
 /** Policy field -> visible column a reviewer edits to fix it. */
 const FLAG_COLUMN: Record<string, string> = {
-  sourceIssueDate: "targetDate", sourceTaxDate: "targetDateTax", dateTax: "targetDateTax", dateAccounting: "targetDateAccounting", dateKHDPH: "targetDateKHDPH",
+  sourceIssueDate: "targetDate", sourceTaxDate: "targetDateTax", sourceDueDate: "targetDateDue", dateDue: "targetDateDue", dateTax: "targetDateTax", dateAccounting: "targetDateAccounting", dateKHDPH: "targetDateKHDPH",
   sourceDocumentNumber: "targetDocument", sourceSymVar: "targetSymVar", symVar: "targetSymVar", originalDocument: "targetDocument",
   priceNone: "targetPriceNone", priceLow: "targetPriceLow", priceLowVAT: "targetPriceLowVAT", priceLowSum: "targetPriceLow",
   priceHigh: "targetPriceHigh", priceHighVAT: "targetPriceHighVAT", priceHighSum: "targetPriceHigh",
@@ -476,6 +473,8 @@ function projectTargets(row: Pick<ReviewRow, "tool" | "data">, vatPeriod: string
     targetDateTax: value(result.dateTax),
     targetDateAccounting: policyKind(row) === "voucher" ? null : value(result.dateAccounting),
     targetDateKHDPH: policy.taxMode === "nonTax" ? null : value(result.dateKHDPH),
+    // Pokladna has no due date (vch:voucherHeader); only what the import sends is shown.
+    targetDateDue: policyKind(row) === "voucher" ? null : value(result.dateDue),
     targetPriceNone: value(result.priceNone),
     targetPriceLow: value(result.priceLow),
     targetPriceLowVAT: value(result.priceLowVAT),
@@ -710,6 +709,7 @@ function describePlan(row: ReviewRow, vatPeriod: string): string {
     if (result.dateAccounting) dates.push(`účetní ${czDate(result.dateAccounting)}`);
     if (policy.taxMode === "taxable") dates.push(`KH ${czDate(result.dateKHDPH)}`);
     if (kind === "voucher") dates.push(`úhrada ${czDate(result.datePayment)}`);
+    else dates.push(policy.dueDateRule === "issue-date" ? `splatnost ${czDate(result.dateDue)} (doklad splatnost neuvádí = den vystavení)` : `splatnost ${czDate(result.dateDue)}`);
     lines.push(dates.join(", "));
     if (policy.taxMode === "nonTax") lines.push(blank(result.priceNone) ? "PN: v sazbě 0 %, bez data KH." : `PN: celá částka ${czechAmount(result.priceNone)} v sazbě 0 %, bez data KH.`);
     else if (policy.taxMode === "taxable") lines.push("Daňový doklad – odpočet DPH podle zdrojových částek.");
@@ -799,15 +799,16 @@ async function writeGuideSheet(workbook: ExcelJS.Workbook, input: ReviewWorkbook
     ["4. Plán importu", "Skrytý souhrn pravidel importu (rozbalte +); nikdy se neimportuje."],
     ["5. Pozdní doklady", "Je-li DUZP (u PN datum dokladu) ve starším měsíci než zvolené období DPH, Datum dokladu, Datum DPH, Účetní datum a Datum KH DPH jsou 1. den období – tak je list ukazuje i import zapíše. Původní data jsou v interní poznámce."],
     ["6. PN (nedaňový)", "Členění DPH PN: celá částka včetně případné DPH dodavatele je v Bez DPH / PN, bez data KH. Chybějící DIČ samo neprokazuje neplátce."],
-    ["7. Forma úhrady", "Hotově / Kartou / Převodem / Dobírkou podle dokladu; prázdné = neznámo. Ostatní závazek s Formou Kartou pokračuje řadou PK: do 10 000 Kč Doklad K + číslo, VS = číslo; nad 10 000 Kč číslo dokladu dodavatele. Změna z Kartou na jinou formu číslování PK zruší. Pokladní výdej je vždy Hotově."],
-    ["8. Hotovost", "Pokladní výdej má Doklad jen nad 10 000 Kč po zaokrouhlení; datum úhrady je skutečné datum platby."],
-    ["9. Částky", "Celkem je částka k úhradě po zaokrouhlení přesně podle dokladu; zaokrouhlení z dokladu se nevypouští a Celkem se nenahrazuje součtem základu a DPH. Prázdná buňka není totéž co 0."],
-    ["10. Data", "Datum zadejte jako datum Excelu nebo text RRRR-MM-DD či DD.MM.RRRR."],
-    ["11. Vzorce", "Vzorce nejsou povoleny. Pokud je použijete, vložte místo nich hodnoty (Vložit jinak → Hodnoty)."],
-    ["12. Řádky", "Řádky lze řadit, filtrovat i mazat. Neměňte ID řádku. Nové řádky s neznámým ID budou odmítnuty."],
-    ["13. Uložení", "Uložte soubor ve formátu .xlsx (ne .xls, .xlsm ani .csv)."],
-    ["14. Podobné doklady", "List Podobne doklady obsahuje jen vzory z této účetní jednotky pro porovnání; neimportuje se."],
-    ["15. Barvy", "Růžová = možná duplicita (odkaz v poznámce). Žlutá = pole k ověření. Šedá = vynecháno. Zelená akce = připraveno k importu. Kontrola duplicit se opakuje při importu."]
+    ["7. Forma úhrady", "Hotově / Kartou / Převodem / Dobírkou podle dokladu; prázdné = neznámo. Ostatní závazek s Formou Kartou pokračuje řadou PK: do 10 000 Kč Doklad K + číslo, VS = číslo; nad 10 000 Kč číslo dokladu dodavatele. Změna z Kartou na jinou formu číslování PK zruší. Pokladní výdej je vždy Hotově; účtenka placená kartou patří do Ostatních závazků, ne do Pokladny."],
+    ["8. Hotovost", "Pokladní výdej má Doklad jen nad 10 000 Kč po zaokrouhlení; datum úhrady je skutečné datum platby. Datum splatnosti pokladní doklad v POHODĚ nemá, proto zůstává prázdné."],
+    ["9. Splatnost", "Datum splatnosti faktur a závazků je podle dokladu; když jej doklad neuvádí, je to původní datum vystavení."],
+    ["10. Částky", "Celkem je částka k úhradě po zaokrouhlení přesně podle dokladu; zaokrouhlení z dokladu se nevypouští a Celkem se nenahrazuje součtem základu a DPH. Prázdná buňka není totéž co 0."],
+    ["11. Data", "Datum zadejte jako datum Excelu nebo text RRRR-MM-DD či DD.MM.RRRR."],
+    ["12. Vzorce", "Vzorce nejsou povoleny. Pokud je použijete, vložte místo nich hodnoty (Vložit jinak → Hodnoty)."],
+    ["13. Řádky", "Řádky lze řadit, filtrovat i mazat. Neměňte ID řádku. Nové řádky s neznámým ID budou odmítnuty."],
+    ["14. Uložení", "Uložte soubor ve formátu .xlsx (ne .xls, .xlsm ani .csv)."],
+    ["15. Podobné doklady", "List Podobne doklady obsahuje jen vzory z této účetní jednotky pro porovnání; neimportuje se."],
+    ["16. Barvy", "Růžová = možná duplicita (odkaz v poznámce). Žlutá = pole k ověření. Šedá = vynecháno. Zelená akce = připraveno k importu. Kontrola duplicit se opakuje při importu."]
   ];
   lines.forEach(([a, b], index) => {
     const row = ws.getRow(index + 1);

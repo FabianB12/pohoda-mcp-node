@@ -133,3 +133,141 @@ export function statementMonthNumber(period: string): string {
   if (!/^\d{4}-(0[1-9]|1[0-2])$/.test(period)) throw new Error('Statement period must be YYYY-MM.');
   return period.slice(5).padStart(3, '0');
 }
+
+/**
+ * Document-type abbreviations POHODA writes into the generated liquidation item
+ * text (bankLiquidationItem/liquidationItem/text omitted: "Pokud nebude uveden,
+ * bude nastaven text z Globálního nastavení"). Live POHODA 14302.10, all six
+ * agendas: "Úhrada FP c. 261100113", FV, OZ, OP, PZ (přijatá záloha), VZ (vydaná záloha).
+ */
+export const LIQUIDATION_ABBREVIATIONS: Record<SettlementAgenda, string> = {
+  receivedInvoice: 'FP', issuedInvoice: 'FV', commitment: 'OZ', receivable: 'OP', receivedAdvanceInvoice: 'PZ', issuedAdvanceInvoice: 'VZ'
+};
+/** Live default of the generated text when the unit has no own example: "Úhrada FP c. <number>". */
+export const defaultLiquidationPrefix = (agenda: SettlementAgenda) => `Úhrada ${LIQUIDATION_ABBREVIATIONS[agenda]} c. `;
+export type LiquidationTextConvention = { prefixes: Record<SettlementAgenda, string>; source: Record<SettlementAgenda, 'pohoda' | 'derived' | 'default'> };
+const PREFIX_SHAPE = /^[^\d,;]{1,40}\s$/u;
+const scalarText = (v: any): string => v == null ? '' : typeof v === 'object' ? scalarText(v['#text']) : String(v).trim();
+const list = <T>(v: T | T[] | undefined | null): T[] => v == null ? [] : Array.isArray(v) ? v : [v];
+
+/**
+ * Learns the unit's own generated liquidation text ("<prefix><document number>")
+ * from existing bank items whose trailing token is the number of exactly one
+ * liquidable document. Agendas without an example reuse a learned prefix with
+ * their own abbreviation, otherwise the live default. Never fails: the prefix is
+ * a prediction that the post-write read-back compares with POHODA's own item text.
+ */
+export function learnLiquidationConvention(bankRows: Record<string, any>[], documents: { agenda: string; number: string }[]): LiquidationTextConvention {
+  const owners = new Map<string, Set<string>>();
+  for (const d of documents) if (d.number) owners.set(d.number, (owners.get(d.number) ?? new Set()).add(d.agenda));
+  const counts = new Map<SettlementAgenda, Map<string, number>>();
+  for (const raw of bankRows) for (const item of list<Record<string, any>>(raw?.bankDetail?.bankItem)) {
+    const t = scalarText(item?.text), m = /^(.*\s)(\S+)$/su.exec(t);
+    const agendas = m ? owners.get(m[2]!) : undefined;
+    if (!m || !agendas || agendas.size !== 1 || !PREFIX_SHAPE.test(m[1]!)) continue;
+    const agenda = [...agendas][0] as SettlementAgenda;
+    if (!SETTLEMENT_AGENDAS.includes(agenda) || !m[1]!.includes(LIQUIDATION_ABBREVIATIONS[agenda])) continue;
+    const c = counts.get(agenda) ?? new Map<string, number>(); c.set(m[1]!, (c.get(m[1]!) ?? 0) + 1); counts.set(agenda, c);
+  }
+  const prefixes = {} as Record<SettlementAgenda, string>, source = {} as LiquidationTextConvention['source'];
+  const best = (c: Map<string, number>, fallback: string) => [...c.entries()].sort((a, b) => b[1] - a[1] || (a[0] === fallback ? -1 : b[0] === fallback ? 1 : a[0].localeCompare(b[0])))[0]![0];
+  for (const agenda of SETTLEMENT_AGENDAS) {
+    const c = counts.get(agenda);
+    if (c?.size) { prefixes[agenda] = best(c, defaultLiquidationPrefix(agenda)); source[agenda] = 'pohoda'; }
+  }
+  // Template from any learned agenda: replace its abbreviation (whole word) with the missing agenda's.
+  const template = SETTLEMENT_AGENDAS.find(a => source[a] === 'pohoda' && new RegExp(`(^|\\s)${LIQUIDATION_ABBREVIATIONS[a]}(\\s)`).test(prefixes[a]));
+  for (const agenda of SETTLEMENT_AGENDAS) {
+    if (source[agenda]) continue;
+    if (template) { prefixes[agenda] = prefixes[template].replace(new RegExp(`(^|\\s)${LIQUIDATION_ABBREVIATIONS[template]}(\\s)`), `$1${LIQUIDATION_ABBREVIATIONS[agenda]}$2`); source[agenda] = 'derived'; }
+    else { prefixes[agenda] = defaultLiquidationPrefix(agenda); source[agenda] = 'default'; }
+  }
+  return { prefixes, source };
+}
+
+/** POHODA's placeholder text for an XML import without inv:text ("Import FA z XML") is not a purpose. */
+const IMPORT_PLACEHOLDER = /^Import \S{1,4} z XML$/;
+/** Purpose of the settled document: its own header text, whitespace-collapsed. */
+export function documentPurpose(raw: Record<string, any>): string {
+  const t = scalarText((raw?.invoiceHeader ?? raw)?.text).replace(/\s+/g, ' ').trim();
+  return IMPORT_PLACEHOLDER.test(t) ? '' : t;
+}
+/**
+ * Bank header text = POHODA's generated liquidation text + ", " + the settled
+ * document's purpose ("Úhrada FP c. FP26104, telefon.služby 5-6/2026"); without
+ * a purpose only the generated text ("Úhrada FV c. 2025022"). The statement's
+ * counterparty description never replaces it. Only the purpose is shortened to
+ * fit bnk:text (string96); type and number are never cut.
+ */
+export function composeLiquidationText(generated: string, purpose: string): { text: string; truncated: boolean } {
+  const head = generated.trim();
+  if (!head || head.length > BANK_TEXT_MAX_LENGTH) throw new Error('Text úhrady dokladu nelze sestavit (chybí nebo je příliš dlouhé číslo dokladu).');
+  const clean = purpose.replace(/\s+/g, ' ').trim();
+  if (!clean) return { text: head, truncated: false };
+  const room = BANK_TEXT_MAX_LENGTH - head.length - 2;
+  if (clean.length <= room) return { text: `${head}, ${clean}`, truncated: false };
+  const cut = clean.slice(0, Math.max(0, room)).replace(/[\s,;:.\-–/]+$/u, '');
+  return { text: cut ? `${head}, ${cut}` : head, truncated: true };
+}
+
+/** typ:addressType fields copied from the settled document's partnerIdentity (bank.xsd partnerIdentity is typ:address). */
+export const PARTNER_ADDRESS_FIELDS = ['company', 'division', 'name', 'city', 'street', 'zip', 'ico', 'dic', 'VATPayerType', 'icDph', 'phone', 'mobilPhone', 'fax', 'email'] as const;
+export type PartnerIdentity = { id?: number | undefined; address?: Partial<Record<typeof PARTNER_ADDRESS_FIELDS[number] | 'country', string>> | undefined };
+/** Normalized partner of an exported document or bank record: address-book link ID and the inline address. */
+export function partnerIdentityOf(raw: Record<string, any>): PartnerIdentity | undefined {
+  const h = raw?.invoiceHeader ?? raw?.bankHeader ?? raw;
+  const p = h?.partnerIdentity;
+  if (!p || typeof p !== 'object') return undefined;
+  const id = Number(scalarText(p.id)), a = p.address && typeof p.address === 'object' ? p.address : {};
+  const address: NonNullable<PartnerIdentity['address']> = {};
+  for (const f of PARTNER_ADDRESS_FIELDS) { const v = scalarText(a[f]); if (v) address[f] = v; }
+  const country = scalarText(a.country?.ids ?? a.country);
+  if (country) address.country = country;
+  const result: PartnerIdentity = {};
+  if (Number.isSafeInteger(id) && id > 0) result.id = id;
+  if (Object.keys(address).length) result.address = address;
+  return Object.keys(result).length ? result : undefined;
+}
+/** bnk:partnerIdentity with the linked address-book ID and the document's own inline address (live: both are stored as sent). */
+export function buildBankPartnerIdentity(partner: PartnerIdentity | undefined): XmlObject | undefined {
+  if (!partner) return undefined;
+  const out: XmlObject = {};
+  if (partner.id !== undefined) {
+    if (!Number.isSafeInteger(partner.id) || partner.id <= 0) throw new Error('Invalid partner address-book ID.');
+    out['typ:id'] = partner.id;
+  }
+  const a = partner.address ?? {}, address: XmlObject = {};
+  for (const f of PARTNER_ADDRESS_FIELDS) if (a[f]) address[`typ:${f}`] = a[f]!;
+  if (a.country) address['typ:country'] = { 'typ:ids': a.country };
+  if (Object.keys(address).length) out['typ:address'] = address;
+  return Object.keys(out).length ? out : undefined;
+}
+/** Field-level differences between the expected and the stored partner ("" = absent). */
+export function partnerDifferences(expected: PartnerIdentity | undefined, stored: PartnerIdentity | undefined): { field: string; expected: string; stored: string }[] {
+  const diffs: { field: string; expected: string; stored: string }[] = [];
+  const e = String(expected?.id ?? ''), s = String(stored?.id ?? '');
+  if (e !== s) diffs.push({ field: 'partnerIdentity.id', expected: e, stored: s });
+  for (const f of [...PARTNER_ADDRESS_FIELDS, 'country'] as const) {
+    const ev = expected?.address?.[f] ?? '', sv = stored?.address?.[f] ?? '';
+    if (ev !== sv) diffs.push({ field: `partnerIdentity.address.${f}`, expected: ev, stored: sv });
+  }
+  return diffs;
+}
+/** A generated-text prefix ("Úhrada FP c. ") for this agenda: no digits/commas, its abbreviation as a word. */
+export function isLiquidationPrefix(prefix: string, agenda: SettlementAgenda): boolean {
+  return PREFIX_SHAPE.test(prefix) && new RegExp(`(^|\\s)${LIQUIDATION_ABBREVIATIONS[agenda]}(\\s)`).test(prefix);
+}
+/**
+ * Stored bank text follows the rule for this document whatever generated prefix
+ * variant was used when it was written ("c." / "č." or a learned wording):
+ * "<prefix><number>[, <purpose, possibly shortened to 96>]".
+ */
+export function followsLiquidationText(stored: string, agenda: SettlementAgenda, number: string, purpose: string): boolean {
+  if (!number) return false;
+  for (let i = stored.indexOf(number); i > 0; i = stored.indexOf(number, i + 1)) {
+    const prefix = stored.slice(0, i);
+    if (!isLiquidationPrefix(prefix, agenda)) continue;
+    try { if (composeLiquidationText(prefix + number, purpose).text === stored) return true; } catch { /* not this split */ }
+  }
+  return false;
+}

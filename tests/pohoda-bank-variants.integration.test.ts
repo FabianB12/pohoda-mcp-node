@@ -61,7 +61,8 @@ live('POHODA bank liquidation-state variants (live)', () => {
   const hideU = (data: any) => { for (const raw of recordsIn(data)) if (Number(h(raw).id) === ids.U) { delete h(raw).liquidation; delete raw.liquidations; } };
   const faulty = () => ({
     listRecordsBatch: async (...a: Parameters<PohodaClient['listRecordsBatch']>) => { const r = await client.listRecordsBatch(...a); r.items.forEach(i => hideU(i.data)); return r; },
-    writeBatch: client.writeBatch.bind(client)
+    writeBatch: client.writeBatch.bind(client),
+    listAccountingUnits: client.listAccountingUnits.bind(client)
   });
   async function readState(keys: string[], withLinks = true) {
     const agendaOf = (k: string) => SPECS.find(s => s[0] === k)![1];

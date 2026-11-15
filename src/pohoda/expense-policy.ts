@@ -55,27 +55,50 @@ const HOME_CURRENCY = "CZK";
  */
 const DOMESTIC_TAXABLE_CLASSIFICATION_ALIASES: Readonly<Record<string, string>> = { pdzjed: "PD" };
 
-/** Exact fuel-only texts and their canonical POHODA text. Mixed or unknown texts stay as given. */
+/**
+ * Fuel texts and their canonical POHODA text, classified from the fuel printed on the
+ * receipt (never from the supplier name). A bare "PHM" or an unknown text stays as given.
+ */
 export const FUEL_TEXT_NAFTA = "PHM nafta";
-export const FUEL_TEXT_BENZIN = "PHM benzin";
+export const FUEL_TEXT_BENZIN = "PHM benzín";
 const FUEL_TEXT_ALIASES: ReadonlyMap<string, string> = new Map([
   ...["nafta", "diesel", "motorova nafta", "nafta motorova", "phm nafta", "phm diesel", "nafta phm", "diesel phm",
     "pohonne hmoty nafta", "pohonne hmoty diesel"].map((key) => [key, FUEL_TEXT_NAFTA] as const),
   ...["benzin", "natural", "natural 95", "natural 98", "natural95", "natural98", "ba 95", "ba 98", "phm benzin",
     "phm natural", "phm natural 95", "phm natural 98", "benzin natural 95", "benzin natural 98", "pohonne hmoty benzin"].map((key) => [key, FUEL_TEXT_BENZIN] as const)
 ]);
+/**
+ * Separators of a mixed description ("Natural 95 + olej", "Nafta, kapalina do ostřikovačů",
+ * "Diesel a AdBlue"). Only whole components are compared; "/" and "-" are not separators.
+ */
+const TEXT_COMPONENT_SEPARATOR = /(\s*[+,;&]\s*|\s+a\s+)/i;
 
 const foldText = (value: string): string => value.normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase()
   .replace(/[\s_\-\u2013\u2014:,]+/g, " ").replace(/[.\s]+$/, "").trim();
 
 /**
- * Canonical expense header text: an unambiguous fuel-only text (Diesel, Nafta, Natural 95,
- * Benzín, ...) becomes exactly "PHM nafta" / "PHM benzin". Anything else, including a bare
- * "PHM", a supplier name or a mixed fuel/non-fuel text, is returned unchanged.
+ * Canonical expense header text: an unambiguous fuel text (Diesel, Nafta, Natural 95,
+ * Benzín, ...) becomes exactly "PHM nafta" / "PHM benzín". In a mixed description each
+ * fuel component is canonicalized and every other component and separator is kept as
+ * given ("Natural 95 + olej" -> "PHM benzín + olej"). A bare "PHM", a supplier name or
+ * a text without a recognizable fuel component is returned unchanged. Idempotent.
  */
 export function canonicalExpenseText(value: unknown): string {
-  const raw = text(value);
-  return FUEL_TEXT_ALIASES.get(foldText(raw)) ?? raw;
+  const raw = text(value).normalize("NFC");
+  const whole = FUEL_TEXT_ALIASES.get(foldText(raw));
+  if (whole !== undefined) return whole;
+  const parts = raw.split(TEXT_COMPONENT_SEPARATOR);
+  if (parts.length < 3) return text(value);
+  let changed = false;
+  // Odd indexes are the captured separators; they are kept exactly.
+  const result = parts.map((part, index) => {
+    if (index % 2 === 1) return part;
+    const fuel = FUEL_TEXT_ALIASES.get(foldText(part));
+    if (fuel === undefined) return part;
+    if (fuel !== part) changed = true;
+    return fuel;
+  });
+  return changed ? result.join("") : text(value);
 }
 
 /** True for a CZK document from a supplier identified as Czech (country CZ, or no country and a CZ DIČ). */
@@ -111,6 +134,8 @@ export function isForeignCurrency(header: Record<string, any>): boolean {
  * source facts (sourceIssueDate/sourceTaxDate/sourceDocumentNumber/sourcePaymentDate/
  * sourceSymVar) and an `_expensePolicy` descriptor. Idempotent: calling it again on its
  * own output (for example after the card sequence changed) yields a consistent result.
+ * Received invoices and commitments always get dateDue: the source due date (sourceDueDate
+ * or dateDue), otherwise the original issue date.
  * Non-expense headers are returned as a shallow copy without changes.
  */
 export function resolveExpensePolicy(header: Record<string, any>, items: Record<string, any>[] = [], kind: ExpenseKind = "invoice"): Record<string, any> {
@@ -183,6 +208,7 @@ function resolve(header: Record<string, any>, items: Record<string, any>[], kind
   const sourceDocumentNumber = firstText(header.sourceDocumentNumber, applied ? "" : header.originalDocument);
   const sourcePaymentDate = date(firstText(header.sourcePaymentDate, applied ? "" : header.datePayment), "sourcePaymentDate");
   const sourceSymVar = firstText(header.sourceSymVar, applied ? "" : header.symVar);
+  const sourceDueDate = date(firstText(header.sourceDueDate, applied ? "" : header.dateDue), "sourceDueDate");
   const requestedDateTax = applied ? "" : date(text(header.dateTax), "dateTax");
   const requestedDateAccounting = applied ? "" : date(text(header.dateAccounting), "dateAccounting");
 
@@ -201,6 +227,12 @@ function resolve(header: Record<string, any>, items: Record<string, any>[], kind
   const foreign = isForeignCurrency(header);
   const isCard = header.cardPayment === true;
   const type = kind === "voucher" ? "expense" : String(header.type);
+  if (kind === "voucher" && (isCard || ["creditcard", "card"].includes(text(header.paymentType)))) {
+    // Client convention: a receipt paid by card is an Ostatní závazek (commitment with
+    // paymentType creditcard, PK numbering), never a Pokladna cash expense. The agenda
+    // is not switched here; the caller prepares the document again as a commitment.
+    soft("CARD_RECEIPT_IN_CASH", "A receipt paid by card belongs in Ostatni zavazky (commitment, paymentType creditcard), not in Pokladna as a cash expense; prepare it as a commitment.", "paymentType", true);
+  }
 
   if (taxMode === "taxable" && sourceTaxDate === "" && !invalidDates.has("sourceTaxDate")) {
     soft("SOURCE_TAX_DATE_REQUIRED", "Taxable expense requires the source DUZP/DPPD (sourceTaxDate or dateKHDPH); it is never derived from the issue date.", "sourceTaxDate", true);
@@ -296,6 +328,18 @@ function resolve(header: Record<string, any>, items: Record<string, any>[], kind
     // The actual cash payment date is a source fact; it is never taken from the
     // receipt, due or tax date. A missing date is a review issue (expenseSourceIssues).
     setOrDelete(result, "datePayment", sourcePaymentDate);
+  }
+  // Datum splatnosti: the source due date; a source without one is due on its original
+  // issue date (client convention), also for a late document. vch:voucherHeader has no
+  // due-date element, so a cash expense never sends one.
+  let dueDateRule: "source" | "issue-date" | "unknown" | "not-supported";
+  if (kind === "invoice") {
+    const dueDate = sourceDueDate || (invalidDates.has("sourceDueDate") ? "" : sourceIssueDate);
+    setOrDelete(result, "dateDue", dueDate);
+    dueDateRule = sourceDueDate !== "" ? "source" : dueDate !== "" ? "issue-date" : "unknown";
+  } else {
+    delete result.dateDue;
+    dueDateRule = "not-supported";
   }
   // A CZK cash payable with haléře and no stated rounding is a source-evidence issue
   // (see expenseSourceIssues: CASH_ROUNDING_UNCONFIRMED); an explicit rounding, even 0,
@@ -412,6 +456,7 @@ function resolve(header: Record<string, any>, items: Record<string, any>[], kind
   setOrDelete(result, "sourceDocumentNumber", sourceDocumentNumber);
   setOrDelete(result, "sourcePaymentDate", sourcePaymentDate);
   setOrDelete(result, "sourceSymVar", sourceSymVar);
+  setOrDelete(result, "sourceDueDate", sourceDueDate);
   if (!foreign) {
     delete result.currency;
     delete result.currencyRate;
@@ -434,6 +479,7 @@ function resolve(header: Record<string, any>, items: Record<string, any>[], kind
     payableCZK: payableMinor === undefined ? undefined : fromMinorUnits(payableMinor),
     originalDocumentRule,
     symVarRule,
+    dueDateRule,
     roundingRule: amounts.roundingRule,
     sourceVatBreakdown: collapsedVat ? sourceVatBreakdown : undefined,
     notices,
@@ -442,7 +488,8 @@ function resolve(header: Record<string, any>, items: Record<string, any>[], kind
       taxDate: sourceTaxDate || undefined,
       documentNumber: sourceDocumentNumber || undefined,
       paymentDate: sourcePaymentDate || undefined,
-      symVar: sourceSymVar || undefined
+      symVar: sourceSymVar || undefined,
+      dueDate: sourceDueDate || undefined
     },
     warnings
   };

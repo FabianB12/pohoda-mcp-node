@@ -10,6 +10,7 @@
  * (it is sent as typ:ids, a POHODA Forma úhrady abbreviation) but must be verified.
  */
 import type { ReviewTool } from "./review-contract.js";
+import { CARD_RECEIPT_IN_CASH_TEXT } from "./review-messages.js";
 
 type Fields = Record<string, any>;
 
@@ -91,7 +92,8 @@ export function reconcilePaymentMethod(tool: ReviewTool, input: Fields, legacyCa
 
   if (tool === "create_cash_voucher") {
     // A cash voucher is cash by agenda; vch:voucherHeader has no paymentType element.
-    if (method !== "" && method !== "cash") conflict ??= `Pokladní výdej se hradí hotově, Forma úhrady je ${label(method)}. Změňte Formu úhrady nebo připravte doklad jako fakturu/závazek.`;
+    if (method === "creditcard") conflict ??= CARD_RECEIPT_IN_CASH_TEXT;
+    else if (method !== "" && method !== "cash") conflict ??= `Pokladní výdej se hradí hotově, Forma úhrady je ${label(method)}. Změňte Formu úhrady nebo připravte doklad jako fakturu/závazek.`;
     else method = "";
   } else if (method === "creditcard" && !isCommitment(tool, data) && card === true) {
     conflict ??= "Platba kartou u Přijaté faktury: číslování řady PK platí jen pro Ostatní závazek. Doklad zůstane Přijatou fakturou s Formou úhrady Kartou; potvrďte, nebo připravte jako Ostatní závazek.";

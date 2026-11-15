@@ -22,7 +22,8 @@ const h=(raw:any)=>raw.invoiceHeader??raw.bankHeader??raw.bankAccountHeader??raw
 live('POHODA bank settlement production path',()=>{
   let transport:ParallelsPohodaTransport,client:PohodaClient,target:TransportOptions,service:BankStatementService,input:StatementInput;
   let invoiceIds:number[]=[],accountId:number,sourceBytes:Buffer,result:any;
-  const values=[148.37,148.37,779.23,389.11];
+  // Run-specific cents: earlier runs' identical movements would (correctly) be held for review as possible duplicates.
+  const cents=(Number(code)%89+10)/100,values=[148,148,779,389].map(v=>Number((v+cents).toFixed(2)));
   async function readInvoices(){
     const response=await client.listRecordsBatch(invoiceIds.map(id=>({agenda:'invoice',subType:'receivedInvoice',filter:{id},options:{restrictions:{'lst:liquidations':true}}})),'',target);
     expect(response.isOk()).toBe(true);return response.items.map((item,i)=>recordsIn(item.data).find(raw=>Number(h(raw).id)===invoiceIds[i])!);

@@ -240,47 +240,31 @@ describe("review workbook round trip", () => {
     expect(metaKeys).toEqual(["format", "schemaVersion", "reviewId", "databaseId", "vatPeriod", "generatedAt", "notice"]);
   });
 
-  it("collapses an unused due-date column for cash/card receipts without changing blank values", async () => {
+  it("always shows Datum splatnosti as written: source due date, else the issue date; blank only for Pokladna", async () => {
     const input = syntheticReview();
-    input.rows = input.rows.slice(1); // one card receipt and one cash receipt
+    input.rows[0]!.data.dateDue = "2026-02-28"; // invoice with a printed due date (caller alias)
     const target = await written(input);
     const wb = new ExcelJS.Workbook(); await wb.xlsx.readFile(target);
     const sheet = wb.getWorksheet(REVIEW_SHEET_NAME)!;
-    expect(sheet.getColumn(colOf("dateDue")).hidden).toBe(true);
-    expect(sheet.getColumn(colOf("dateDue")).outlineLevel).toBe(1);
-    expect(sheet.getColumn(colOf("targetTotal")).hidden).toBe(false);
-    expect(sheet.getColumn(colOf("targetDateTax")).hidden).toBe(false);
-    expect((await readReviewWorkbook(target)).rows.map((row) => row.data.dateDue)).toEqual(["", ""]);
-
-    // It remains an ordinary editable column; hiding never drops an edit.
-    const changed = await edit(target, (ws) => {
-      ws.getColumn(colOf("dateDue")).hidden = false;
-      ws.getCell(3, colOf("dateDue")).value = "2026-03-20";
-    });
-    expect((await readReviewWorkbook(changed)).rows[0]!.data.dateDue).toBe("2026-03-20");
+    const due = (rowId: string) => sheet.getCell(rowNumberOf(sheet, rowId), colOf("targetDateDue")).value;
+    expect(sheet.getColumn(colOf("targetDateDue")).hidden).toBe(false);
+    expect(sheet.getCell(2, colOf("targetDateDue")).value).toBe("Datum splatnosti");
+    expect(due("r001")).toEqual(new Date(Date.UTC(2026, 1, 28)));
+    // Card receipt (Ostatní závazek) without a printed due date: due on its issue date.
+    expect(due("r002")).toEqual(new Date(Date.UTC(2026, 2, 5)));
+    // Pokladna: vch:voucherHeader has no due date, so nothing is shown as sent.
+    expect(due("r003")).toBeNull();
+    const read = await readReviewWorkbook(target);
+    expect(read.rows.map((row) => row.targets?.targetDateDue)).toEqual(["2026-02-28", "2026-03-05", null]);
+    for (const row of read.rows) expect(row.data).not.toHaveProperty("dateDue");
   });
 
-  it.each(["create_invoice", "create_other_liability"] as const)("keeps a blank due date available for an unpaid %s in a mixed batch", async (tool) => {
-    const input = syntheticReview();
-    input.rows = input.rows.slice(1);
-    input.rows.push({ ...input.rows[0]!, rowId: "unpaid", tool, data: { ...input.rows[0]!.data, cardPayment: false, paymentType: "draft" } });
-    const wb = new ExcelJS.Workbook(); await wb.xlsx.readFile(await written(input));
-    expect(wb.getWorksheet(REVIEW_SHEET_NAME)!.getColumn(colOf("dateDue")).hidden).toBe(false);
-  });
-
-  it("keeps any populated due date visible even in an otherwise cash/card-only batch", async () => {
+  it("keeps Datum splatnosti visible in a cash/card-only batch", async () => {
     const input = syntheticReview(); input.rows = input.rows.slice(1);
-    input.rows[0]!.data.dateDue = "2026-03-20";
-    const target = await written(input), wb = new ExcelJS.Workbook(); await wb.xlsx.readFile(target);
-    expect(wb.getWorksheet(REVIEW_SHEET_NAME)!.getColumn(colOf("dateDue")).hidden).toBe(false);
-    expect((await readReviewWorkbook(target)).rows[0]!.data.dateDue).toBe("2026-03-20");
-  });
-
-  it("recognizes a card commitment supplied through create_invoice as a paid receipt", async () => {
-    const input = syntheticReview();
-    input.rows = [{ ...input.rows[1]!, tool: "create_invoice", data: { ...input.rows[1]!.data, type: "commitment" } }];
     const wb = new ExcelJS.Workbook(); await wb.xlsx.readFile(await written(input));
-    expect(wb.getWorksheet(REVIEW_SHEET_NAME)!.getColumn(colOf("dateDue")).hidden).toBe(true);
+    expect(wb.getWorksheet(REVIEW_SHEET_NAME)!.getColumn(colOf("targetDateDue")).hidden).toBe(false);
+    input.rows = [input.rows[1]!];
+    expect(collapsedReviewColumns(input.rows, input.vatPeriod)).not.toContain("targetDateDue");
   });
 
   it("keeps ordinary rows quiet and highlights duplicates and invalid amounts without another status column", async () => {
@@ -337,7 +321,7 @@ describe("user edits", () => {
       ws.getCell(r, colOf("targetDate")).value = "06.03.2026";
       ws.getCell(r, colOf("targetDateTax")).value = new Date(Date.UTC(2026, 2, 7));
       ws.getCell(r, colOf("targetSymVar")).value = 42026;
-      ws.getCell(r, colOf("dateDue")).value = "2026-03-08";
+      ws.getCell(r, colOf("targetDateDue")).value = "2026-03-08";
       ws.getCell(r, colOf("classificationVAT")).value = "PD";
       ws.getCell(r, colOf("paymentType")).value = "převodem";
       ws.getCell(r, colOf("currencyRate")).value = "25,125";
@@ -349,10 +333,10 @@ describe("user edits", () => {
     const row = read.rows.find((r) => r.rowId === "r002")!;
     expect(row.action).toBe("import");
     expect(row.reviewNotes).toBe("Kontrolováno, karta");
-    expect(row.data).toMatchObject({ dateDue: "2026-03-08", classificationVAT: "PD", paymentType: "draft", currencyRate: 25.125, sourcePages: [3, 4, 5, 7] });
+    expect(row.data).toMatchObject({ classificationVAT: "PD", paymentType: "draft", currencyRate: 25.125, sourcePages: [3, 4, 5, 7] });
     // Target cells never become data keys in the codec; the import maps them deliberately.
-    expect(row.targets).toMatchObject({ targetTotal: "1234.50", targetPriceNone: 1234.5, targetDate: "2026-03-06", targetDateTax: "2026-03-07", targetSymVar: "42026" });
-    for (const key of ["total", "priceNone", "sourceIssueDate", "sourceTaxDate", "sourceSymVar"]) expect(row.data).not.toHaveProperty(key);
+    expect(row.targets).toMatchObject({ targetTotal: "1234.50", targetPriceNone: 1234.5, targetDate: "2026-03-06", targetDateTax: "2026-03-07", targetSymVar: "42026", targetDateDue: "2026-03-08" });
+    for (const key of ["total", "priceNone", "sourceIssueDate", "sourceTaxDate", "sourceSymVar", "dateDue", "sourceDueDate"]) expect(row.data).not.toHaveProperty(key);
     expect(JSON.stringify(row.data)).not.toContain("Kontrolováno");
     expect(read.rows.find((r) => r.rowId === "r003")!.action).toBe("review");
   });
@@ -413,7 +397,7 @@ describe("user edits", () => {
       ws.getCell(3, colOf("sourcePages")).value = "0";
       ws.getCell(3, colOf("tool")).value = null;
       ws.getCell(3, colOf("paymentType")).value = true;
-      ws.getCell(4, colOf("dateDue")).value = new Date(Date.UTC(2026, 2, 5, 13, 30));
+      ws.getCell(4, colOf("targetDateDue")).value = new Date(Date.UTC(2026, 2, 5, 13, 30));
     });
     const error = await rejection(edited);
     expect(error.issues.map((i) => i.code).sort()).toEqual([
@@ -581,7 +565,7 @@ describe("column visibility contract", () => {
     return new Set(REVIEW_COLUMNS.filter((c) => !ws.getColumn(colOf(c.key)).hidden).map((c) => c.key));
   };
   const ALWAYS = ["rowId", "action", "reviewNotes", "tool", "text", "partnerName", "partnerIco", "partnerDic", "partnerCountry",
-    "targetDocument", "targetSymVar", "targetDate", "targetDateTax", "targetDateAccounting", "targetDateKHDPH",
+    "targetDocument", "targetSymVar", "targetDate", "targetDateTax", "targetDateAccounting", "targetDateKHDPH", "targetDateDue",
     "paymentType", "targetTotal", "accounting", "classificationVAT"];
 
   it.each(Object.keys(scenarios))("keeps essential review and accounting fields visible for %s previews, even when blank", async (name) => {
@@ -596,19 +580,19 @@ describe("column visibility contract", () => {
     const hidden = (rows: ReviewRow[]) => collapsedReviewColumns(rows, "2026-03");
     // Invoice: CZ so no currency, no 12 % bucket, no rounding.
     for (const key of ["currency", "targetPriceLow", "targetPriceLowVAT", "targetRounding", "cashAccount"]) expect(hidden(scenarios.invoice!), key).toContain(key);
-    for (const key of ["dateDue", "targetPriceNone", "targetPriceHigh"]) expect(hidden(scenarios.invoice!), key).not.toContain(key);
-    // Card and cash receipts: no due date; PN card has no rate buckets.
-    for (const name of ["card", "cash"]) expect(hidden(scenarios[name]!)).toContain("dateDue");
+    for (const key of ["targetDateDue", "targetPriceNone", "targetPriceHigh"]) expect(hidden(scenarios.invoice!), key).not.toContain(key);
+    // Datum splatnosti is always visible (blank for Pokladna); PN card has no rate buckets.
+    for (const name of ["card", "cash"]) expect(hidden(scenarios[name]!)).not.toContain("targetDateDue");
     expect(hidden(scenarios.card!)).toContain("targetPriceHigh");
     // Mixed batches keep fields any row writes; a zero rounding is a value, not a blank.
     const mixed = hidden(scenarios.mixed!);
-    for (const key of ["dateDue", "targetPriceLow", "targetPriceHigh", "targetPriceNone", "targetRounding", "cashAccount"]) expect(mixed, key).not.toContain(key);
+    for (const key of ["targetDateDue", "targetPriceLow", "targetPriceHigh", "targetPriceNone", "targetRounding", "cashAccount"]) expect(mixed, key).not.toContain(key);
     expect(mixed).toContain("currency");
   });
 
   it("shows populated optional values and marks the visible field for a policy problem", () => {
     const hidden = (data: Record<string, unknown>, row: ReviewRow = invoice) => collapsedReviewColumns([{ ...asImport(row), data: { ...row.data, ...data } }], "2026-03");
-    expect(hidden({ paymentType: "draft", dateDue: "2026-03-01" }, card)).not.toContain("dateDue");
+    expect(hidden({ paymentType: "draft", dateDue: "2026-03-01" }, card)).not.toContain("targetDateDue");
     expect(hidden({ priceNone: null, roundingAmount: 0, total: 1210 })).not.toContain("targetRounding");
     expect(hidden({ partnerStreet: "Ulice 1" })).not.toContain("partnerStreet");
     expect(hidden({ currency: "EUR", taxMode: "nonTax", classificationVAT: "PN", priceNone: 1210, priceHigh: null, priceHighVAT: null, priceHighSum: null })).not.toContain("currency");

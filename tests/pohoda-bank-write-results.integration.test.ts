@@ -250,7 +250,10 @@ live('POHODA bank write results: 34 exact matches via registered MCP tool', () =
     for (const row of settledRows) {
       const bank = fresh.find(r => Number(h(r).id) === row.bankId)!, src = rows.find(r => r.movement === row.movement)!;
       expect(h(bank).statementNumber?.statementNumber).toBe('007');
-      expect(Number(h(bank).statementNumber?.numberMovement)).toBe(row.movement);
+      // The movement number is kept only in the marker/report; POHODA's movement field stays blank.
+      expect(h(bank).statementNumber?.numberMovement).toBeUndefined();
+      expect(String(h(bank).text)).toBe(row.bankText);
+      expect(row.bankText).toMatch(/^Úhrada (FP|FV|OZ|OP|PZ|VZ) c\. \S+/);
       expect(h(bank).datePayment).toBe(src.date); expect(h(bank).dateStatement).toBe('2026-07-31');
       expect(h(bank).bankType).toBe(src.direction);
       expect(String(h(bank).intNote)).toMatch(/^MCP-BANK:[0-9a-f]{32}\|/);
@@ -379,8 +382,10 @@ live('POHODA bank write results: 34 exact matches via registered MCP tool', () =
     expect(res.body).toMatchObject({ ok: true, settled: 3, rejected: 0, writeUncertain: 0, needsReview: 0 });
     expect(res.body.write).toMatchObject({ attempted: 3, created: 3, rejected: 0, uncertain: 0, conflicting: 0 });
     expect(fresh.map(r => Number(h(r).id)).sort((a, b) => a - b)).toEqual([...res.body.createdIds].sort((a: number, b: number) => a - b));
-    const byMove = (m: number) => fresh.find(r => Number(h(r).statementNumber?.numberMovement) === m)!;
-    expect(String(h(byMove(movementBase + 91)).text)).toBe(text96);
+    const byMove = (m: number) => fresh.find(r => Number(h(r).id) === res.body.rows.find((x: any) => x.movement === m)?.bankId)!;
+    // A 96-character statement description is accepted but never stored: the bank text comes from the settled document.
+    expect(String(h(byMove(movementBase + 91)).text)).not.toBe(text96);
+    expect(String(h(byMove(movementBase + 91)).text)).toBe(res.body.rows.find((x: any) => x.movement === movementBase + 91).bankText);
     expect(String(h(byMove(movementBase + 92)).symVar)).toBe(vs20);
     for (const d of X.slice(0, 3)) {
       const row = res.body.rows.find((r: any) => r.document?.id === ids[d.key]);

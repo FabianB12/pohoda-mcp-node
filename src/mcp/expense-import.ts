@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import type { PohodaClient, WriteBatchOperation } from "../pohoda/client.js";
 import type { TransportOptions } from "../pohoda/transport.js";
-import { PdfArchive, verifyPdfAttachmentLink } from "../pohoda/pdf-archive.js";
+import { PdfArchive, PdfDocumentArchiver, normalizeSourcePages, shortcutTargetsMatch, verifyPdfAttachmentLink } from "../pohoda/pdf-archive.js";
 import { resolveExpensePolicy } from "../pohoda/expense-policy.js";
 import { toMinorUnits, sumHomeCurrency, moneyValue } from "../pohoda/money.js";
 import { CzechRegistryClient, companyKey, classifyVat, mapAresAddress, matchSubjects, normalizeDic, normalizeIco, adisCandidates, decideNonPayerTreatment, type AresSubject } from "../registry/czech-registry.js";
@@ -67,6 +67,17 @@ export function classifyImportDetails(data: Fields | undefined): { review: Field
     else warnings.push(entry);
   }
   return { review, warnings };
+}
+
+/** Retry found a document from before per-document PDFs that links the whole source PDF. */
+export const PDF_LINK_FULL_SOURCE = "PDF_LINK_FULL_SOURCE";
+
+/** Result summary of the linked document PDF and the preserved original. */
+function pdfResult(header: Fields): Fields | undefined {
+  if (!header.sourcePdfArchivePath) return undefined;
+  const pdf = header._sourcePdf ?? {};
+  return { path: header.sourcePdfArchivePath, sha256: pdf.sha256 ?? header.sourcePdfSha256, pages: header.sourcePages, pageRanges: pdf.pageRanges, pageCount: pdf.pageCount, wholeSource: pdf.wholeSource,
+    source: { path: pdf.original?.path, sha256: header.sourcePdfSha256, bytes: header.sourcePdfBytes } };
 }
 
 export function isExpenseOperation(op: WriteBatchOperation): op is ExpenseOperation {
@@ -183,7 +194,12 @@ export function verifyExpense(header: Fields, raw: Fields, kind: "invoice" | "vo
   if (header.paymentBankCode) compare("paymentBankCode", header.paymentBankCode, stored.paymentAccount?.bankCode);
   if (header.sourcePdfArchivePath) {
     const linked = verifyPdfAttachmentLink(header.sourcePdfArchivePath, raw);
-    if (!linked.linked) differences.push({ field: "sourcePdfAttachment", expected: header.sourcePdfArchivePath, actual: linked.targets });
+    if (!linked.linked) {
+      // Imports before per-document PDFs linked the whole original; name that case explicitly.
+      const original = text(header._sourcePdf?.original?.path);
+      const legacy = original !== "" && !header._sourcePdf?.wholeSource && linked.targets.some((target) => shortcutTargetsMatch(original, target));
+      differences.push({ field: "sourcePdfAttachment", expected: header.sourcePdfArchivePath, actual: linked.targets, ...(legacy ? { code: PDF_LINK_FULL_SOURCE } : {}) });
+    }
   }
   const partnerId = Number(identityOf(raw).id || 0);
   if (!partnerId || partnerId !== Number(header.partnerId)) differences.push({ field: "partnerId", expected: header.partnerId, actual: partnerId });
@@ -237,9 +253,9 @@ export class ExpenseImporter {
       if (op.items.length) throw new Error("Expense imports require summary amounts and no invoice items.");
       if (op.header.sourceType !== "manual" && !op.header.sourcePdfPath) throw new Error("PDF imports require sourcePdfPath so the source can be archived and linked. Set sourceType=manual only for documents not imported from a PDF.");
       if (op.header.sourceType !== "manual" || op.header.sourcePdfPath) {
-        const pages = op.header.sourcePages;
-        if (!Array.isArray(pages) || !pages.length || pages.some((page) => !Number.isInteger(page) || page < 1)) throw new Error("PDF imports require non-empty positive sourcePages.");
-        op.header.sourcePages = [...new Set(pages)].sort((a, b) => a - b);
+        // Canonical order is the original's page order; the page range is checked against the PDF before archiving.
+        try { op.header.sourcePages = normalizeSourcePages(op.header.sourcePages); }
+        catch { throw new Error("PDF imports require non-empty positive sourcePages."); }
       }
       if (!/^\d{4}-(0[1-9]|1[0-2])$/.test(text(op.header.vatPeriod))) throw new Error("Expense imports require vatPeriod in YYYY-MM format.");
     }
@@ -392,19 +408,24 @@ export class ExpenseImporter {
     }
     // Source arithmetic/date validation also precedes the filesystem archive write.
     for (const op of expenses) replaceHeader(op.header, resolveExpensePolicy({ ...op.header, ...(op.header.cardPayment ? { cardSequence: 1 } : {}) }, op.items, op.tool === "create_cash_voucher" ? "voucher" : "invoice"));
-    const archivedSources = new Map<string, Awaited<ReturnType<PdfArchive["archive"]>>>();
-    for (const op of expenses) {
-      if (op.header.sourcePdfPath) {
-        const key = text(op.header.sourcePdfPath);
-        let archived = archivedSources.get(key);
-        if (!archived) {
-          archived = await this.pdfArchive.archive(key, { database: text(target.databaseOverride || this.client.getDatabase()), ico: text(target.dataPackIco), year: text(op.header.vatPeriod).slice(0, 4) });
-          archivedSources.set(key, archived);
-        }
-        op.header.sourcePdfArchivePath = archived.path;
-        op.header.sourcePdfSha256 = archived.sha256;
-        op.header.sourcePdfBytes = archived.bytes;
-      }
+    // Each document links a PDF with only its sourcePages; the original is archived unchanged.
+    // The retry identity stays the original hash + pages (sourcePdfSha256), independent of the subset bytes.
+    const pdfOps = expenses.filter((op) => op.header.sourcePdfPath);
+    if (pdfOps.length) {
+      const pdfs = new PdfDocumentArchiver(this.pdfArchive);
+      try {
+        // All pages are checked against their PDFs before the first archive write.
+        const archived = await pdfs.archiveDocuments(pdfOps.map((op) => ({ sourcePath: text(op.header.sourcePdfPath), pages: op.header.sourcePages,
+          context: { database: text(target.databaseOverride || this.client.getDatabase()), ico: text(target.dataPackIco), year: text(op.header.vatPeriod).slice(0, 4) } })));
+        pdfOps.forEach((op, index) => {
+          const document = archived[index]!;
+          op.header.sourcePages = document.pages;
+          op.header.sourcePdfArchivePath = document.path;
+          op.header.sourcePdfSha256 = document.original.sha256;
+          op.header.sourcePdfBytes = document.original.bytes;
+          op.header._sourcePdf = { sha256: document.sha256, bytes: document.bytes, reused: document.reused, pageRanges: document.pageRanges, pageCount: document.pageCount, wholeSource: document.wholeSource, original: document.original };
+        });
+      } finally { await pdfs.close(); }
     }
     for (const op of expenses) {
       const normalized = resolveExpensePolicy({ ...op.header, ...(op.header.cardPayment ? { cardSequence: 1 } : {}) }, op.items, op.tool === "create_cash_voucher" ? "voucher" : "invoice");
@@ -563,12 +584,15 @@ export class ExpenseImporter {
       if (supplied) { results.push({ requestId: op.requestId, tool: op.tool, ok: true, state: "supplier_resolved", id: supplied.header.partnerId, verified: true }); continue; }
       const old = existing.get(op);
       if (old && isExpenseOperation(op)) {
-        const diffs = verifyExpense(op.header, old, op.tool === "create_cash_voucher" ? "voucher" : "invoice");
-        results.push({ requestId: op.requestId, tool: op.tool, registry: op.header._registry, pdf: op.header.sourcePdfArchivePath ? { path: op.header.sourcePdfArchivePath, sha256: op.header.sourcePdfSha256, pages: op.header.sourcePages } : undefined, ok: diffs.length === 0, state: "already_exists", created: false, id: headerOf(old).id, matchedBy: matchedBy.get(op), retryMarker: op.header._retryMarker, verified: diffs.length === 0, differences: diffs, doNotRetry: true });
+        const checked = verifyExpense(op.header, old, op.tool === "create_cash_voucher" ? "voucher" : "invoice");
+        const diffs = checked.filter((diff) => diff.code !== PDF_LINK_FULL_SOURCE);
+        const legacy = checked.filter((diff) => diff.code === PDF_LINK_FULL_SOURCE).map((diff) => ({ code: PDF_LINK_FULL_SOURCE, linked: diff.actual, documentPdf: diff.expected,
+          message: "Existující doklad odkazuje na celé zdrojové PDF ze staršího importu. PDF pouze se stránkami dokladu je uložené v documentPdf; opravte odkaz v POHODĚ na záložce Dokumenty. Doklad znovu neimportujte." }));
+        results.push({ requestId: op.requestId, tool: op.tool, registry: op.header._registry, pdf: pdfResult(op.header), ok: diffs.length === 0 && legacy.length === 0, state: "already_exists", created: false, id: headerOf(old).id, matchedBy: matchedBy.get(op), retryMarker: op.header._retryMarker, verified: diffs.length === 0, differences: diffs, ...(legacy.length ? { reviewRequired: legacy } : {}), doNotRetry: true });
         continue;
       }
       const item = output?.items[offset++];
-      const result: Fields = { requestId: op.requestId, tool: op.tool, ...(isExpenseOperation(op) ? { registry: op.header._registry, pdf: op.header.sourcePdfArchivePath ? { path: op.header.sourcePdfArchivePath, sha256: op.header.sourcePdfSha256, pages: op.header.sourcePages } : undefined } : {}), ok: item?.state === "ok" && response?.items[offset - 1]?.isOk(), state: item?.state ?? "missing", producedDetails: item?.data.producedDetails, importDetails: item?.data.importDetails };
+      const result: Fields = { requestId: op.requestId, tool: op.tool, ...(isExpenseOperation(op) ? { registry: op.header._registry, pdf: pdfResult(op.header) } : {}), ok: item?.state === "ok" && response?.items[offset - 1]?.isOk(), state: item?.state ?? "missing", producedDetails: item?.data.producedDetails, importDetails: item?.data.importDetails };
       results.push(result);
       if (isExpenseOperation(op)) {
         const id = Number(item?.data.producedDetails?.id);

@@ -1,8 +1,10 @@
 import { createHash, randomBytes } from "node:crypto";
 import { constants as fsConstants } from "node:fs";
-import { copyFile, link, lstat, mkdir, open, realpath, unlink, type FileHandle } from "node:fs/promises";
+import { copyFile, link, lstat, mkdir, mkdtemp, open, realpath, rm, unlink, writeFile, type FileHandle } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import path from "node:path";
 import iconv from "iconv-lite";
+import { PDFDocument } from "pdf-lib";
 import type { XmlObject } from "./xml-builder.js";
 
 /**
@@ -14,6 +16,8 @@ import type { XmlObject } from "./xml-builder.js";
  * export-only, so the PDF must already exist at a path POHODA can open when the
  * document is imported. This module copies the source PDF into a
  * content-addressed archive and returns that path for the shortcut target.
+ * PdfDocumentArchiver additionally archives, next to the unchanged original, a
+ * PDF with only the source pages of each document, which is what the document links.
  */
 
 export const DEFAULT_PDF_ARCHIVE_ROOT = "C:\\Účetnictví\\PDF DOKLADY KLIENTŮ Z POHODY";
@@ -44,7 +48,12 @@ export type PdfArchiveErrorCode =
   | "TARGET_INVALID"
   | "TARGET_TOO_LONG"
   | "TARGET_CONFLICT"
-  | "COPY_FAILED";
+  | "COPY_FAILED"
+  | "PAGES_INVALID"
+  | "PAGES_OUT_OF_RANGE"
+  | "SOURCE_UNREADABLE"
+  | "SOURCE_ENCRYPTED"
+  | "SUBSET_FAILED";
 
 export class PdfArchiveError extends Error {
   public constructor(public readonly code: PdfArchiveErrorCode, message: string, options?: { cause?: unknown }) {
@@ -219,6 +228,271 @@ export class PdfArchive {
       if (this.locks.get(key) === settled) this.locks.delete(key);
     }
   }
+}
+
+/** Subject written into every page-subset PDF so the file names its original and pages. */
+export const PDF_SUBSET_PROVENANCE_PREFIX = "MCP-SOURCE";
+
+/** Canonical source pages: unique original page numbers (1-based) in ascending source order. */
+export function normalizeSourcePages(pages: unknown): number[] {
+  if (!Array.isArray(pages) || pages.length === 0 || pages.some((page) => !Number.isSafeInteger(page) || page < 1)) {
+    throw new PdfArchiveError("PAGES_INVALID", "sourcePages must be a non-empty list of positive whole page numbers.");
+  }
+  return [...new Set(pages as number[])].sort((a, b) => a - b);
+}
+
+/** Compact page label, e.g. [1, 2, 3, 5] -> "1-3,5". Expects normalized pages. */
+export function formatPageRanges(pages: readonly number[]): string {
+  const ranges: string[] = [];
+  for (let i = 0; i < pages.length; i += 1) {
+    const start = pages[i]!;
+    let end = start;
+    while (i + 1 < pages.length && pages[i + 1] === end + 1) end = pages[++i]!;
+    ranges.push(start === end ? String(start) : `${start}-${end}`);
+  }
+  return ranges.join(",");
+}
+
+/**
+ * Builds a PDF containing only the given original pages, in ascending source order.
+ * Output is deterministic for the same source and pages (no dates or random IDs), so
+ * the content-addressed archive deduplicates retries and renamed copies.
+ */
+export async function buildPdfPageSubset(source: PDFDocument, pages: readonly number[], sourceSha256: string): Promise<Uint8Array> {
+  const normalized = normalizeSourcePages(pages);
+  if (normalized.join(",") !== pages.join(",")) {
+    throw new PdfArchiveError("PAGES_INVALID", "Page subsets require unique pages in ascending source order.");
+  }
+  const pageCount = source.getPageCount();
+  assertPagesInRange(normalized, pageCount, "the source PDF");
+  try {
+    const subset = await PDFDocument.create({ updateMetadata: false });
+    for (const page of await subset.copyPages(source, normalized.map((page) => page - 1))) subset.addPage(page);
+    subset.setSubject(`${PDF_SUBSET_PROVENANCE_PREFIX} sha256=${sourceSha256} pages=${formatPageRanges(normalized)} of ${pageCount}`);
+    const bytes = await subset.save();
+    const check = await PDFDocument.load(bytes, { updateMetadata: false });
+    if (check.getPageCount() !== normalized.length) throw new Error(`subset has ${check.getPageCount()} pages, expected ${normalized.length}`);
+    return bytes;
+  } catch (error) {
+    if (error instanceof PdfArchiveError) throw error;
+    throw new PdfArchiveError("SUBSET_FAILED", `Cannot build the PDF for pages ${formatPageRanges(normalized)} (${(error as Error).message}).`, { cause: error });
+  }
+}
+
+export type PdfSourceInfo = {
+  sourcePath: string;
+  /** SHA-256 of the exact original bytes; the stable retry identity of the source. */
+  sha256: string;
+  bytes: number;
+  pageCount: number;
+  encrypted: boolean;
+};
+
+/** The archived file one POHODA document links, plus the preserved original. */
+export type PdfDocumentArchiveResult = PdfArchiveResult & {
+  pages: number[];
+  pageRanges: string;
+  pageCount: number;
+  /** True when the pages cover the whole source, so the original itself is linked. */
+  wholeSource: boolean;
+  original: PdfArchiveResult;
+};
+
+export type PdfDocumentArchiverOptions = {
+  /** Source size limit; defaults to the archive's maxBytes. */
+  maxBytes?: number;
+  /** Parallel archive writes in archiveDocuments (each write is fsynced). Defaults to 8. */
+  concurrency?: number;
+  /** Parent of the temporary folder for subset files before they are archived. */
+  stagingDir?: string;
+};
+
+/**
+ * Per-document source PDFs on top of the byte-exact `archive` primitive.
+ *
+ * Every original is archived unchanged. A document whose sourcePages do not cover
+ * the whole original gets its own subset PDF (only those pages, source order),
+ * archived content-addressed next to the original. One instance serves one import
+ * run: sources are hashed and parsed once per path, originals and subsets are cached
+ * per accounting unit/year, and only the most recently parsed source stays in memory.
+ */
+export class PdfDocumentArchiver {
+  private readonly maxBytes: number;
+  private readonly sources = new Map<string, Promise<PdfSourceInfo>>();
+  private readonly originals = new Map<string, Promise<PdfArchiveResult>>();
+  private readonly documents = new Map<string, Promise<PdfDocumentArchiveResult>>();
+  private parsed: { sha256: string; document: Promise<PDFDocument> } | undefined;
+  private staging: Promise<string> | undefined;
+
+  public constructor(private readonly archive: Pick<PdfArchive, "archive">, private readonly options: PdfDocumentArchiverOptions = {}) {
+    this.maxBytes = options.maxBytes ?? (archive as Partial<PdfArchive>).maxBytes ?? DEFAULT_PDF_ARCHIVE_MAX_BYTES;
+  }
+
+  /** Reads, hashes and parses a source once; no archive writes. */
+  public inspect(sourcePath: string): Promise<PdfSourceInfo> {
+    let info = this.sources.get(sourcePath);
+    if (!info) {
+      info = (async () => {
+        const { bytes, sha256 } = await readSourcePdf(sourcePath, this.maxBytes);
+        const document = await loadSourcePdf(bytes, sourcePath);
+        this.parsed = { sha256, document: Promise.resolve(document) };
+        return { sourcePath, sha256, bytes: bytes.length, pageCount: document.getPageCount(), encrypted: document.isEncrypted };
+      })();
+      this.sources.set(sourcePath, info);
+    }
+    return info;
+  }
+
+  /** Canonical pages within the source's page count; throws before any archive write otherwise. */
+  public async validatePages(sourcePath: string, pages: unknown): Promise<number[]> {
+    const info = await this.inspect(sourcePath);
+    const normalized = normalizeSourcePages(pages);
+    assertPagesInRange(normalized, info.pageCount, sourcePath);
+    if (info.encrypted && normalized.length !== info.pageCount) {
+      throw new PdfArchiveError("SOURCE_ENCRYPTED", `Source PDF ${sourcePath} is encrypted, so pages ${formatPageRanges(normalized)} cannot be extracted into a separate document PDF.`);
+    }
+    return normalized;
+  }
+
+  /** Archives the original and returns the file that this document must link. */
+  public async archiveDocument(sourcePath: string, pages: unknown, context: PdfArchiveContext): Promise<PdfDocumentArchiveResult> {
+    const normalized = await this.validatePages(sourcePath, pages);
+    const info = await this.inspect(sourcePath);
+    const unit = archiveSegments(context).join("/");
+    const originalKey = `${info.sha256}|${unit}`;
+    let original = this.originals.get(originalKey);
+    if (!original) {
+      original = this.archive.archive(sourcePath, context).then((stored) => {
+        if (stored.sha256 !== info.sha256 || stored.bytes !== info.bytes) {
+          throw new PdfArchiveError("SOURCE_CHANGED", `Source PDF ${sourcePath} changed after its pages were checked.`);
+        }
+        return stored;
+      });
+      this.originals.set(originalKey, original);
+    }
+    const stored = await original;
+    const shared = { pages: normalized, pageRanges: formatPageRanges(normalized), pageCount: info.pageCount, original: stored };
+    if (normalized.length === info.pageCount) return { ...stored, ...shared, wholeSource: true };
+
+    const documentKey = `${originalKey}|${shared.pageRanges}`;
+    let document = this.documents.get(documentKey);
+    if (!document) {
+      document = this.storeSubset(info, normalized, context).then((subset) => ({ ...subset, ...shared, wholeSource: false }));
+      this.documents.set(documentKey, document);
+    }
+    return document;
+  }
+
+  /**
+   * Validates every request first, then archives them grouped by source with bounded
+   * concurrency. Results keep the request order. Stops starting new work on the first error.
+   */
+  public async archiveDocuments(requests: ReadonlyArray<{ sourcePath: string; pages: unknown; context: PdfArchiveContext }>): Promise<PdfDocumentArchiveResult[]> {
+    for (const request of requests) await this.validatePages(request.sourcePath, request.pages);
+    const order = requests.map((_, index) => index).sort((a, b) => compareText(requests[a]!.sourcePath, requests[b]!.sourcePath) || a - b);
+    const results = new Array<PdfDocumentArchiveResult>(requests.length);
+    let next = 0;
+    let failure: { error: unknown } | undefined;
+    const worker = async (): Promise<void> => {
+      while (!failure && next < order.length) {
+        const index = order[next++]!;
+        const request = requests[index]!;
+        try {
+          results[index] = await this.archiveDocument(request.sourcePath, request.pages, request.context);
+        } catch (error) {
+          failure ??= { error };
+        }
+      }
+    };
+    const limit = Math.max(1, Math.min(this.options.concurrency ?? 8, order.length));
+    await Promise.all(Array.from({ length: limit }, worker));
+    if (failure) throw failure.error;
+    return results;
+  }
+
+  /** Removes the temporary staging folder; archived files are kept. */
+  public async close(): Promise<void> {
+    const staging = this.staging;
+    this.staging = undefined;
+    this.parsed = undefined;
+    if (staging) await rm(await staging.catch(() => ""), { recursive: true, force: true }).catch(() => undefined);
+  }
+
+  private async storeSubset(info: PdfSourceInfo, pages: number[], context: PdfArchiveContext): Promise<PdfArchiveResult> {
+    const bytes = await buildPdfPageSubset(await this.parsedSource(info), pages, info.sha256);
+    const sha256 = createHash("sha256").update(bytes).digest("hex");
+    this.staging ??= mkdtemp(path.join(this.options.stagingDir ?? tmpdir(), "pohoda-pdf-pages-"));
+    const temp = path.join(await this.staging, `${sha256}-${randomBytes(4).toString("hex")}.pdf`);
+    await writeFile(temp, bytes, { flag: "wx" });
+    try {
+      const stored = await this.archive.archive(temp, context);
+      if (stored.sha256 !== sha256 || stored.bytes !== bytes.length) {
+        throw new PdfArchiveError("COPY_FAILED", `Archived page PDF ${stored.path} does not match the generated pages ${formatPageRanges(pages)}.`);
+      }
+      return stored;
+    } finally {
+      await unlink(temp).catch(() => undefined);
+    }
+  }
+
+  /** Only the most recent source stays parsed; concurrent callers share one parse. */
+  private parsedSource(info: PdfSourceInfo): Promise<PDFDocument> {
+    if (this.parsed?.sha256 === info.sha256) return this.parsed.document;
+    const document = (async () => {
+      const { bytes, sha256 } = await readSourcePdf(info.sourcePath, this.maxBytes);
+      if (sha256 !== info.sha256) {
+        throw new PdfArchiveError("SOURCE_CHANGED", `Source PDF ${info.sourcePath} changed while documents were being archived.`);
+      }
+      return loadSourcePdf(bytes, info.sourcePath);
+    })();
+    this.parsed = { sha256: info.sha256, document };
+    return document;
+  }
+}
+
+function compareText(a: string, b: string): number {
+  return a < b ? -1 : a > b ? 1 : 0;
+}
+
+function assertPagesInRange(pages: readonly number[], pageCount: number, label: string): void {
+  const outside = pages.filter((page) => page > pageCount);
+  if (outside.length) {
+    throw new PdfArchiveError("PAGES_OUT_OF_RANGE", `sourcePages ${formatPageRanges(outside)} do not exist in ${label}, which has ${pageCount} page${pageCount === 1 ? "" : "s"}.`);
+  }
+}
+
+async function readSourcePdf(sourcePath: string, maxBytes: number): Promise<{ bytes: Buffer; sha256: string }> {
+  validateSourcePath(sourcePath);
+  const handle = await openSource(sourcePath);
+  try {
+    const stats = await handle.stat();
+    if (!stats.isFile()) throw new PdfArchiveError("SOURCE_NOT_FILE", `Source PDF ${sourcePath} is not a regular file.`);
+    if (stats.size === 0) throw new PdfArchiveError("SOURCE_EMPTY", `Source PDF ${sourcePath} is empty.`);
+    if (stats.size > maxBytes) {
+      throw new PdfArchiveError("SOURCE_TOO_LARGE", `Source PDF ${sourcePath} has ${stats.size} bytes; the archive limit is ${maxBytes} bytes.`);
+    }
+    const bytes = await handle.readFile();
+    if (bytes.length > maxBytes) throw new PdfArchiveError("SOURCE_TOO_LARGE", `Source PDF ${sourcePath} exceeds the archive limit of ${maxBytes} bytes.`);
+    if (bytes.length < PDF_HEADER.length || !bytes.subarray(0, PDF_HEADER.length).equals(PDF_HEADER)) {
+      throw new PdfArchiveError("SOURCE_NOT_PDF", `Source ${sourcePath} is not a PDF (missing %PDF- header).`);
+    }
+    return { bytes, sha256: createHash("sha256").update(bytes).digest("hex") };
+  } finally {
+    await handle.close();
+  }
+}
+
+async function loadSourcePdf(bytes: Uint8Array, sourcePath: string): Promise<PDFDocument> {
+  let document: PDFDocument;
+  let pageCount: number;
+  try {
+    document = await PDFDocument.load(bytes, { ignoreEncryption: true, updateMetadata: false });
+    pageCount = document.getPageCount();
+  } catch (error) {
+    throw new PdfArchiveError("SOURCE_UNREADABLE", `Source PDF ${sourcePath} cannot be read to check its pages (${(error as Error).message}).`, { cause: error });
+  }
+  if (pageCount < 1) throw new PdfArchiveError("SOURCE_UNREADABLE", `Source PDF ${sourcePath} has no pages.`);
+  return document;
 }
 
 /** Builds one root-level attachments child: { "typ:shortcut": { "typ:target": path } }. */

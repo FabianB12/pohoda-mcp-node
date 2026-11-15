@@ -3,12 +3,17 @@ import { existsSync } from "node:fs";
 import { mkdir, mkdtemp, readdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { PDFDocument } from "pdf-lib";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   DEFAULT_PDF_ARCHIVE_ROOT,
   PdfArchive,
   PdfArchiveError,
+  PdfDocumentArchiver,
   archiveSegments,
+  buildPdfPageSubset,
+  formatPageRanges,
+  normalizeSourcePages,
   buildPdfAttachment,
   extractShortcutTargets,
   isWindows1250RoundTrip,
@@ -19,6 +24,7 @@ import {
   verifyPdfAttachmentLink
 } from "../src/pohoda/pdf-archive.js";
 import { XmlBuilder } from "../src/pohoda/xml-builder.js";
+import { fixturePages, pageWidth, writePagedPdf } from "./support/pdf-fixtures.js";
 
 const UNIT = { database: "StwPh_12345678_2026", ico: "12345678", year: 2026 };
 const posixOnly = process.platform === "win32" ? it.skip : it;
@@ -307,4 +313,160 @@ describe("POHODA attachment shortcut helpers", () => {
     expect(shortcutTargetsMatch("/srv/A.pdf", "/srv/a.pdf")).toBe(false);
     expect(shortcutTargetsMatch(target, target.replace(".pdf", "x.pdf"))).toBe(false);
   });
+});
+
+describe("per-document source PDFs", () => {
+  const staging = () => path.join(work, "staging");
+
+  it("normalizes pages to unique ascending source order and labels ranges", () => {
+    expect(normalizeSourcePages([3, 1, 2, 3])).toEqual([1, 2, 3]);
+    expect(formatPageRanges([1, 2, 3, 5, 7, 8])).toBe("1-3,5,7-8");
+    for (const bad of [[], [0], [1.5], [-1], "1", undefined, [Number.NaN]]) {
+      expect(() => normalizeSourcePages(bad), JSON.stringify(bad)).toThrow(PdfArchiveError);
+    }
+  });
+
+  it("builds a deterministic subset with exactly the requested pages, order, sizes and rotation", async () => {
+    const file = path.join(sources, "five.pdf");
+    const bytes = await writePagedPdf(file, 5, "five", { rotatePage: 4 });
+    const source = await PDFDocument.load(bytes);
+    const a = await buildPdfPageSubset(source, [2, 4, 5], sha(bytes));
+    const b = await buildPdfPageSubset(await PDFDocument.load(bytes), [2, 4, 5], sha(bytes));
+    expect(Buffer.from(a).equals(Buffer.from(b))).toBe(true);
+    const subset = await PDFDocument.load(a);
+    expect(subset.getPages().map((page) => page.getWidth())).toEqual([pageWidth(2), pageWidth(4), pageWidth(5)]);
+    expect(subset.getPages().map((page) => page.getRotation().angle)).toEqual([0, 90, 0]);
+    expect(subset.getSubject()).toBe(`MCP-SOURCE sha256=${sha(bytes)} pages=2,4-5 of 5`);
+    await expect(buildPdfPageSubset(source, [4, 2], sha(bytes))).rejects.toMatchObject({ code: "PAGES_INVALID" });
+    await expect(buildPdfPageSubset(source, [5, 6], sha(bytes))).rejects.toMatchObject({ code: "PAGES_OUT_OF_RANGE" });
+  });
+
+  it("archives a multi-page document subset next to the byte-identical original", async () => {
+    const file = path.join(sources, "batch.pdf");
+    const bytes = await writePagedPdf(file, 6, "batch");
+    await mkdir(staging(), { recursive: true });
+    const archiver = new PdfDocumentArchiver(new PdfArchive({ rootDir: root }), { stagingDir: staging() });
+    const doc = await archiver.archiveDocument(file, [5, 3, 4], UNIT);
+    await archiver.close();
+
+    expect(doc).toMatchObject({ pages: [3, 4, 5], pageRanges: "3-5", pageCount: 6, wholeSource: false, reused: false });
+    expect(doc.original).toMatchObject({ sha256: sha(bytes), bytes: bytes.length });
+    expect(path.dirname(doc.path)).toBe(path.dirname(doc.original.path));
+    expect(doc.path).toBe(planPdfArchiveTarget(root, doc.sha256, UNIT).path);
+    expect(await fixturePages(doc.path)).toEqual([3, 4, 5]);
+    expect((await readFile(doc.original.path)).equals(bytes)).toBe(true);
+    expect((await readFile(file)).equals(bytes)).toBe(true);
+    expect((await listFiles(root)).sort()).toEqual([doc.original.path, doc.path].sort());
+    expect(await listFiles(staging())).toEqual([]);
+  });
+
+  it("links the original for a whole-source document without writing a subset", async () => {
+    const file = path.join(sources, "one.pdf");
+    const bytes = await writePagedPdf(file, 3);
+    const archiver = new PdfDocumentArchiver(new PdfArchive({ rootDir: root }));
+    const doc = await archiver.archiveDocument(file, [3, 2, 1], UNIT);
+    expect(doc).toMatchObject({ wholeSource: true, path: doc.original.path, sha256: sha(bytes), pages: [1, 2, 3] });
+    expect(await listFiles(root)).toEqual([doc.original.path]);
+  });
+
+  it("reuses the same subset on retry, for a renamed copy and for repeated pages", async () => {
+    const file = path.join(sources, "scan.pdf");
+    await writePagedPdf(file, 4, "scan");
+    const renamed = path.join(sources, "other", "renamed scan.pdf");
+    await mkdir(path.dirname(renamed), { recursive: true });
+    await writeFile(renamed, await readFile(file));
+    const stored: string[] = [];
+    const real = new PdfArchive({ rootDir: root });
+    const recording = { archive: (source: string, context: typeof UNIT) => { stored.push(source); return real.archive(source, context); } };
+
+    const first = new PdfDocumentArchiver(recording);
+    const a = await first.archiveDocument(file, [2, 3], UNIT);
+    const again = await first.archiveDocument(file, [3, 2, 2], UNIT);
+    await first.close();
+    expect(again.path).toBe(a.path);
+    expect(stored).toHaveLength(2);
+
+    const retry = new PdfDocumentArchiver(recording);
+    const b = await retry.archiveDocument(renamed, [2, 3], UNIT);
+    await retry.close();
+    expect(b).toMatchObject({ path: a.path, sha256: a.sha256, reused: true, original: { path: a.original.path, reused: true } });
+    expect((await listFiles(root)).sort()).toEqual([a.original.path, a.path].sort());
+  });
+
+  it("keeps accounting years apart for documents of one source PDF", async () => {
+    const file = path.join(sources, "years.pdf");
+    await writePagedPdf(file, 2);
+    const archiver = new PdfDocumentArchiver(new PdfArchive({ rootDir: root }));
+    const a = await archiver.archiveDocument(file, [1], UNIT);
+    const b = await archiver.archiveDocument(file, [1], { ...UNIT, year: 2025 });
+    expect(path.dirname(a.path)).not.toBe(path.dirname(b.path));
+    expect(path.dirname(b.original.path)).toBe(path.dirname(b.path));
+    expect(await listFiles(root)).toHaveLength(4);
+  });
+
+  it("validates pages before archiving anything", async () => {
+    const file = path.join(sources, "three.pdf");
+    await writePagedPdf(file, 3);
+    const archive = { archive: vi.fn() };
+    const archiver = new PdfDocumentArchiver(archive as any);
+    await expect(archiver.validatePages(file, [2, 3, 4, 7])).rejects.toMatchObject({ code: "PAGES_OUT_OF_RANGE", message: expect.stringContaining("sourcePages 4,7") });
+    await expect(archiver.archiveDocument(file, [0], UNIT)).rejects.toMatchObject({ code: "PAGES_INVALID" });
+    await expect(archiver.validatePages(await source("fake.pdf", pdfBytes("fake")), [1])).rejects.toMatchObject({ code: "SOURCE_UNREADABLE" });
+    await expect(archiver.validatePages(path.join(sources, "missing.pdf"), [1])).rejects.toMatchObject({ code: "SOURCE_NOT_FOUND" });
+    expect(archive.archive).not.toHaveBeenCalled();
+  });
+
+  it("validates a whole batch before the first archive write and keeps request order", async () => {
+    const a = path.join(sources, "b.pdf"), b = path.join(sources, "a.pdf");
+    await writePagedPdf(a, 3, "b");
+    await writePagedPdf(b, 2, "a");
+    const archive = { archive: vi.fn((source: string, context: typeof UNIT) => new PdfArchive({ rootDir: root }).archive(source, context)) };
+    const archiver = new PdfDocumentArchiver(archive);
+    await expect(archiver.archiveDocuments([{ sourcePath: a, pages: [1], context: UNIT }, { sourcePath: b, pages: [3], context: UNIT }]))
+      .rejects.toMatchObject({ code: "PAGES_OUT_OF_RANGE" });
+    expect(archive.archive).not.toHaveBeenCalled();
+    const results = await archiver.archiveDocuments([{ sourcePath: a, pages: [3], context: UNIT }, { sourcePath: b, pages: [2], context: UNIT }, { sourcePath: a, pages: [1, 2], context: UNIT }]);
+    await archiver.close();
+    expect(await Promise.all(results.map((r) => fixturePages(r.path)))).toEqual([[3], [2], [1, 2]]);
+  });
+
+  it("refuses a source that changed after its pages were checked", async () => {
+    const file = path.join(sources, "changing.pdf");
+    await writePagedPdf(file, 3, "before");
+    const archiver = new PdfDocumentArchiver(new PdfArchive({ rootDir: root }));
+    await archiver.validatePages(file, [1, 2]);
+    await writePagedPdf(file, 3, "after");
+    await expect(archiver.archiveDocument(file, [1, 2], UNIT)).rejects.toMatchObject({ code: "SOURCE_CHANGED" });
+  });
+
+  it("rejects an archive adapter that stores different bytes", async () => {
+    const file = path.join(sources, "adapter.pdf");
+    await writePagedPdf(file, 2);
+    const archiver = new PdfDocumentArchiver({ archive: async () => ({ path: "/x/y.pdf", sha256: "0".repeat(64), bytes: 1, reused: false }) });
+    await expect(archiver.archiveDocument(file, [1], UNIT)).rejects.toMatchObject({ code: "SOURCE_CHANGED" });
+  });
+
+  it("splits hundreds of documents from one PDF with a single source parse", async () => {
+    const pages = 240;
+    const file = path.join(sources, "large.pdf");
+    const bytes = await writePagedPdf(file, pages, "large");
+    const load = vi.spyOn(PDFDocument, "load");
+    const archiver = new PdfDocumentArchiver(new PdfArchive({ rootDir: root }));
+    const documents = [
+      ...Array.from({ length: 200 }, (_, i) => [i + 1]),
+      ...Array.from({ length: 20 }, (_, i) => [201 + 2 * i, 202 + 2 * i])
+    ];
+    const started = performance.now();
+    const results = await archiver.archiveDocuments(documents.map((docPages) => ({ sourcePath: file, pages: docPages, context: UNIT })));
+    await archiver.close();
+    const elapsed = performance.now() - started;
+
+    expect(load.mock.calls.filter(([input]) => (input as Uint8Array).length === bytes.length)).toHaveLength(1);
+    expect(new Set(results.map((r) => r.original.path)).size).toBe(1);
+    expect(new Set(results.map((r) => r.path)).size).toBe(documents.length);
+    expect(await fixturePages(results[57]!.path)).toEqual([58]);
+    expect(await fixturePages(results.at(-1)!.path)).toEqual([239, 240]);
+    expect(await listFiles(root)).toHaveLength(documents.length + 1);
+    expect(elapsed).toBeLessThan(20_000);
+  }, 60_000);
 });

@@ -86,8 +86,8 @@ const dateApplicationVATSchema = z.string().default("").describe(
 const moneySchema = z.union([z.number().finite(), z.string().regex(/^-?\d+(?:\.\d{1,2})?$/)]);
 const expenseHeaderShape = {
   sourceType: z.enum(["pdf", "manual"]).default("pdf").describe("PDF imports must supply sourcePdfPath; manual is only for sources not imported from a PDF."),
-  sourcePdfPath: z.string().default("").describe("Original PDF accessible to this MCP process. It is archived under the configured Windows PDF root and linked to the document."),
-  sourcePages: z.array(z.number().int().positive()).default([]).describe("Original PDF page numbers belonging to this document."),
+  sourcePdfPath: z.string().default("").describe("Original PDF accessible to this MCP process. It is archived unchanged; the document links a PDF containing only its sourcePages."),
+  sourcePages: z.array(z.number().int().positive()).default([]).describe("All original PDF pages belonging to this document, including continuation pages. Only these pages are attached."),
   vatPeriod: z.string().default("").describe("Required for expense imports: selected VAT month YYYY-MM. Older source dates move to its first day; originals are preserved."),
   taxMode: z.enum(["auto", "taxable", "nonTax"]).default("auto").describe("Explicit VAT treatment. Auto PN requires confirmed Czech non-payer evidence; foreign suppliers require a decision."),
   partnerDic: z.string().default(""),
@@ -102,6 +102,7 @@ const expenseHeaderShape = {
   sourceDocumentNumber: z.string().default(""),
   sourceSymVar: z.string().default(""),
   sourcePaymentDate: z.string().default(""),
+  sourceDueDate: z.string().default(""),
   cardPayment: z.boolean().default(false).describe("Card purchase in Ostatni zavazky. PK series determines K/variable symbol for amounts <=10000 CZK."),
   numberSeries: z.string().default(""),
   numberSeriesId: z.number().int().positive().optional(),
@@ -724,8 +725,8 @@ export function registerPohodaTools(server: McpServer, context: PohodaServerCont
       payments: z.array(z.object({
         movement: z.number().int().min(1).max(999999).describe("Stable movement number from the statement, including unmatched rows; never renumber only matched rows."),
         date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/), amount: z.union([z.number().positive(),z.string().min(1)]),
-        direction: z.enum(["expense","receipt"]), variableSymbol: z.string().max(BANK_SYMBOL_MAX_LENGTH).optional(), text: z.string().max(BANK_TEXT_MAX_LENGTH).optional(),
-        mark: z.object({page:z.number().int().min(1),x:z.number().min(0).max(.97),y:z.number().min(.03).max(.97)}).describe("Check-mark position in a blank margin beside this transaction; x/y are fractions of the displayed page from top-left.")
+        direction: z.enum(["expense","receipt"]), variableSymbol: z.string().max(BANK_SYMBOL_MAX_LENGTH).optional(), text: z.string().max(BANK_TEXT_MAX_LENGTH).optional().describe("Informational statement description only; the stored bank text is built from the matched document."),
+        mark: z.object({page:z.number().int().min(1),x:z.number().min(0).max(.97),y:z.number().min(.03).max(.97)}).describe("Position of this transaction: y is its vertical centre as a fraction of the displayed page from top-left. The check is drawn at the far right; x is retained for compatibility but ignored.")
       })).min(1).max(1000)
     },
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true }

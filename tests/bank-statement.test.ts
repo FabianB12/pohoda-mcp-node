@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { PDFDocument } from 'pdf-lib';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { BankStatementService, classifyBankWriteResponse, classifySettlementDocument, matchStatementPayments, normalizeSymbol, resolveStatementAccount, settlementDocument, type StatementInput, type StatementPayment, type UnknownDocument } from '../src/mcp/bank-statement.js';
-import { accountingModeOf, buildBankLiquidationDetail, sourceVatBuckets, statementMonthNumber, validateBankHeaderText } from '../src/pohoda/bank-settlement.js';
+import { LIQUIDATION_ABBREVIATIONS, SETTLEMENT_AGENDAS, composeLiquidationText, documentPurpose, followsLiquidationText, learnLiquidationConvention, partnerIdentityOf, accountingModeOf, buildBankLiquidationDetail, sourceVatBuckets, statementMonthNumber, validateBankHeaderText } from '../src/pohoda/bank-settlement.js';
 import { toMinorUnits } from '../src/pohoda/money.js';
 import { PohodaResponse } from '../src/pohoda/response.js';
 import { recordsIn } from '../src/mcp/expense-import.js';
@@ -13,7 +13,8 @@ type Fields=Record<string,any>;
 const target={databaseOverride:'12345678_2026.mdb',dataPackIco:'12345678'};
 const head=(raw:Fields)=>raw.invoiceHeader??raw.bankHeader??raw.bankAccountHeader;
 const account=(id=2,number='000019-2000145399',code='0800',currency='CZK'):Fields=>({bankAccountHeader:{id,ids:`B${id}`,numberAccount:number,codeBank:code,...(currency==='CZK'?{}:{currencyBankAccount:{currency:{ids:currency}}})}});
-const invoice=(id=1,amount=100,extras:Fields={}):Fields=>({invoiceHeader:{id,invoiceType:'receivedInvoice',number:{numberRequested:`FP${id}`},date:'2026-09-01',symVar:'123',liquidation:{amountHome:amount},...extras},invoiceSummary:{homeCurrency:{priceNone:amount}}});
+const PARTNER={id:'5',address:{company:'Dodavatel & syn s.r.o.',city:'Brno',street:'Hlavní 1',zip:'60200',ico:'12345679',dic:'CZ12345679',country:{id:'40',ids:'CZ'}}};
+const invoice=(id=1,amount=100,extras:Fields={}):Fields=>({invoiceHeader:{id,invoiceType:'receivedInvoice',number:{numberRequested:`FP${id}`},date:'2026-09-01',symVar:'123',text:'telefon.služby 5-6/2026',partnerIdentity:structuredClone(PARTNER),liquidation:{amountHome:amount},...extras},invoiceSummary:{homeCurrency:{priceNone:amount}}});
 const payment=(movement=1,extras:Partial<StatementPayment>={}):StatementPayment=>({movement,date:'2026-10-15',amount:100,direction:'expense',variableSymbol:'123',mark:{page:1,x:0.03,y:0.1+movement/2000},...extras});
 const response=(items:Fields[])=>({isOk:()=>true,items:items.map(data=>({state:'ok',data}))});
 class Client {
@@ -28,6 +29,8 @@ class Client {
   throwAfterWrite=false; failBeforeWrite=false; failedWriteResponse=false; failTargeted=false; failScan=false;
   /** Returns a raw POHODA response XML (parsed by the real PohodaResponse); index -> per-item fate. */
   writeXml:((pack:string,output:Fields[])=>string)|undefined; applyWrite:((index:number)=>boolean)|undefined;
+  /** POHODA's generated liquidation item text (live: "Úhrada FP c. <number>"). */
+  itemText=(agenda:string,number:string)=>`Úhrada ${(LIQUIDATION_ABBREVIATIONS as Fields)[agenda]} c. ${number}`;
   /** Shapes what an unfiltered scan returns (the scan has no lst:liquidations). */
   scanView:((raw:Fields)=>Fields)|undefined;
   async listRecordsBatch(requests:Fields[],_id:string,options:Fields){
@@ -51,7 +54,9 @@ class Client {
       if(this.applyWrite&&!this.applyWrite(index)){output.push({id:`${pack}-${index+1}`,state:'ok',data:{state:'error',producedDetails:{id:'0'}}});return;}
       const h=op.header,id=100+this.banks.length,l=h.liquidations[0],raw=this.invoices.find(r=>head(r).id===l.id&&head(r).invoiceType===l.agenda)!;
       const currency=h.currency||'CZK';
-      this.banks.push({bankHeader:{id,bankType:h.type,account:{id:2,ids:'B2'},statementNumber:{statementNumber:statementMonthNumber(h.statementPeriod),numberMovement:h.numberMovement},dateStatement:h.dateStatement,datePayment:h.datePayment,symVar:h.symVar,intNote:h.intNote},bankSummary:currency==='CZK'?{homeCurrency:{priceNone:l.amount}}:{foreignCurrency:{currency:{ids:currency},priceSum:l.amount}}});
+      // Live POHODA: an omitted numberMovement stays blank; text and partnerIdentity (ID + inline) are stored as sent.
+      const p=h.partnerIdentity,partner=p?{...(p.id?{id:String(p.id)}:{}),...(p.address?{address:{...p.address,...(p.address.country?{country:{ids:p.address.country}}:{})}}:{})}:undefined;
+      this.banks.push({bankHeader:{id,bankType:h.type,account:{id:2,ids:'B2'},statementNumber:{statementNumber:statementMonthNumber(h.statementPeriod),...(h.numberMovement?{numberMovement:h.numberMovement}:{})},dateStatement:h.dateStatement,datePayment:h.datePayment,symVar:h.symVar,text:h.text??'Import BV z XML',...(partner?{partnerIdentity:partner}:{}),intNote:h.intNote},bankDetail:{bankItem:{text:this.itemText(l.agenda,head(raw).number.numberRequested)}},bankSummary:currency==='CZK'?{homeCurrency:{priceNone:l.amount}}:{foreignCurrency:{currency:{ids:currency},priceSum:l.amount}}});
       raw.invoiceHeader.liquidation={date:h.datePayment};
       raw.liquidations={liquidation:{date:h.datePayment,sourceAgenda:'bank',sourceDocument:{id},amount:l.amount,foreignCurrencySource:l.amount}};
       output.push({id:`${pack}-${index+1}`,state:'ok',data:this.failedWriteResponse?{state:'ok'}:{state:'ok',producedDetails:{id:String(id)}}});
@@ -196,7 +201,8 @@ describe('Bank statement processing and verification',()=>{
     expect(result).toMatchObject({ok:true,settled:1,unmatched:1,statementNumber:'010',annotatedPdf:{marked:1,originalUnchanged:true}});
     expect(result.rows.map((r:Fields)=>r.status)).toEqual(['settled','unmatched']);
     expect(client.writes).toHaveLength(1);expect(client.writes[0]!.operations).toHaveLength(1);
-    expect(client.writes[0]!.operations[0].header).toMatchObject({account:'B2',statementPeriod:'2026-10',numberMovement:'1',liquidations:[{agenda:'receivedInvoice',id:1,amount:100}]});
+    expect(client.writes[0]!.operations[0].header).toMatchObject({account:'B2',statementPeriod:'2026-10',text:'Úhrada FP c. FP1, telefon.služby 5-6/2026',partnerIdentity:{id:5,address:{company:'Dodavatel & syn s.r.o.',ico:'12345679',country:'CZ'}},liquidations:[{agenda:'receivedInvoice',id:1,amount:100}]});
+    expect(client.writes[0]!.operations[0].header).not.toHaveProperty('numberMovement');
     expect(await readFile(source)).toEqual(before);expect(result.annotatedPdf.path).not.toBe(source);expect(client.calls).toHaveLength(4);
   });
   it('reads the live unit type once per run, reports it and routes daňová evidence to the JU branch',async()=>{
@@ -284,7 +290,7 @@ describe('Bank statement processing and verification',()=>{
     const client=new Client();client.invoices=[invoice(5,250,{invoiceType:'issuedInvoice',symVar:'77'})];client.invoices[0]!.invoiceHeader.liquidation.amountHome='60.50';
     const result=await run(client,input({statementPeriod:'2026-12',dateStatement:'2026-12-31',payments:[payment(9,{direction:'receipt',variableSymbol:'77',amount:'60.50',date:'2026-12-03'})]}));
     expect(result).toMatchObject({ok:true,settled:1,statementNumber:'012'});
-    expect(client.writes[0]!.operations[0].header).toMatchObject({type:'receipt',statementPeriod:'2026-12',numberMovement:'9',datePayment:'2026-12-03',liquidations:[{agenda:'issuedInvoice',id:5,amount:'60.50'}]});
+    expect(client.writes[0]!.operations[0].header).toMatchObject({type:'receipt',statementPeriod:'2026-12',datePayment:'2026-12-03',text:'Úhrada FV c. FP5, telefon.služby 5-6/2026',liquidations:[{agenda:'issuedInvoice',id:5,amount:'60.50'}]});
   });
   it('processes 1000 movements with one write and bounded reads',async()=>{
     const client=new Client();client.invoices=Array.from({length:1000},(_,i)=>invoice(i+1,100+i,{symVar:String(i+1)}));
@@ -553,5 +559,137 @@ describe('Bank write response outcomes (real parser)',()=>{
     expect(dup[0]).toMatchObject({outcome:'missing'});expect(dup[0]!.detail).toMatch(/2 položky/);
     const ok=classifyBankWriteResponse(new PohodaResponse(rsp('P',[`<rsp:responsePackItem version="2.0" id="P-1" state="ok"><bnk:bankResponse version="2.0" state="ok"/></rsp:responsePackItem>`])),'P',1);
     expect(ok[0]).toMatchObject({outcome:'missing'});
+  });
+});
+
+describe('Bank text, partner and movement field from the settled document',()=>{
+  it('composes "<generated>, <purpose>" and shortens only the purpose at the 96-character boundary',()=>{
+    expect(composeLiquidationText('Úhrada FP c. FP26104','telefon.služby 5-6/2026')).toEqual({text:'Úhrada FP c. FP26104, telefon.služby 5-6/2026',truncated:false});
+    expect(composeLiquidationText('Úhrada FV c. 2025022','')).toEqual({text:'Úhrada FV c. 2025022',truncated:false});
+    const head='Úhrada OZ c. PK26071',room=96-head.length-2;
+    expect(composeLiquidationText(head,'x'.repeat(room)).text).toHaveLength(96);
+    const cut=composeLiquidationText(head,`${'y'.repeat(room-2)}, z`);expect(cut).toEqual({text:`${head}, ${'y'.repeat(room-2)}`,truncated:true});
+    expect(composeLiquidationText('x'.repeat(96),'purpose')).toEqual({text:'x'.repeat(96),truncated:true});
+    expect(()=>composeLiquidationText('x'.repeat(97),'')).toThrow();expect(()=>composeLiquidationText(' ','a')).toThrow();
+    expect(documentPurpose({invoiceHeader:{text:'  díly   do auta '}})).toBe('díly do auta');
+    expect(documentPurpose({invoiceHeader:{text:'Import FA z XML'}})).toBe('');expect(documentPurpose({invoiceHeader:{}})).toBe('');
+  });
+  it('learns the unit\'s generated prefix from existing liquidation items and derives missing agendas',()=>{
+    const bank=(t:string)=>({bankDetail:{bankItem:{text:t}}});
+    const docs=[{agenda:'receivedInvoice',number:'FP1'},{agenda:'receivedInvoice',number:'FP2'},{agenda:'issuedInvoice',number:'2025022'},{agenda:'commitment',number:'2025022'}];
+    const learned=learnLiquidationConvention([bank('Úhrada FP č. FP1'),bank('Úhrada FP č. FP2'),bank('Úhrada FP c. FP1'),bank('Úhrada FV č. 2025022'),bank('Platba 12 FP1')],docs);
+    expect(learned.prefixes.receivedInvoice).toBe('Úhrada FP č. ');expect(learned.source.receivedInvoice).toBe('pohoda');
+    // 2025022 belongs to two agendas: not evidence for either.
+    expect(learned.source.issuedInvoice).toBe('derived');expect(learned.prefixes.issuedAdvanceInvoice).toBe('Úhrada VZ č. ');
+    const none=learnLiquidationConvention([],[]);
+    expect(SETTLEMENT_AGENDAS.map(a=>none.prefixes[a])).toEqual(['Úhrada FP c. ','Úhrada OZ c. ','Úhrada FV c. ','Úhrada OP c. ','Úhrada PZ c. ','Úhrada VZ c. ']);
+    expect(followsLiquidationText('Úhrada FP č. FP1, díly','receivedInvoice','FP1','díly')).toBe(true);
+    expect(followsLiquidationText('Úhrada FP c. FP1','receivedInvoice','FP1','díly')).toBe(false); // generic text without purpose
+    expect(followsLiquidationText('Úhrada FV c. FP1, díly','receivedInvoice','FP1','díly')).toBe(false); // wrong type
+    expect(followsLiquidationText('Platba FP1, díly','receivedInvoice','FP1','díly')).toBe(false);
+  });
+  it('settles all six agendas with the POHODA type abbreviation, document purpose and copied partner',async()=>{
+    const client=new Client();
+    const types=[...SETTLEMENT_AGENDAS];
+    client.invoices=types.map((invoiceType,i)=>invoice(i+1,100+i,{invoiceType,symVar:String(700+i),text:`účel ${i+1}`}));
+    const receipt=(a:string)=>['issuedInvoice','receivable','issuedAdvanceInvoice'].includes(a);
+    const payments=types.map((a,i)=>payment(i+1,{variableSymbol:String(700+i),amount:100+i,direction:receipt(a)?'receipt':'expense',text:'KARTA *STATEMENT COUNTERPARTY'}));
+    const result=await run(client,input({payments}));
+    expect(result).toMatchObject({ok:true,settled:6,needsReview:0});
+    const headers=client.writes[0]!.operations.map((o:Fields)=>o.header);
+    expect(headers.map((hd:Fields)=>hd.text)).toEqual(['Úhrada FP c. FP1, účel 1','Úhrada OZ c. FP2, účel 2','Úhrada FV c. FP3, účel 3','Úhrada OP c. FP4, účel 4','Úhrada PZ c. FP5, účel 5','Úhrada VZ c. FP6, účel 6']);
+    expect(headers.every((hd:Fields)=>!('numberMovement' in hd)&&hd.partnerIdentity?.id===5&&hd.partnerIdentity.address.company==='Dodavatel & syn s.r.o.')).toBe(true);
+    expect(client.banks.every(b=>b.bankHeader.statementNumber.numberMovement===undefined)).toBe(true);
+    expect(result.rows[0]).toMatchObject({bankText:'Úhrada FP c. FP1, účel 1',partner:{id:5,company:'Dodavatel & syn s.r.o.'}});
+    expect(result.annotatedPdf.marked).toBe(6);
+  });
+  it('previews the bank text and partner; the statement description never replaces the purpose',async()=>{
+    const client=new Client();client.invoices[0]!.invoiceHeader.text='Import FA z XML';
+    const preview=await run(client,input({execute:false,payments:[payment(1,{text:'Úhrada faktury'})]}));
+    expect(preview.rows[0]).toMatchObject({status:'matched',bankText:'Úhrada FP c. FP1',partner:{id:5}});
+    expect(preview.bankTextConvention.source.receivedInvoice).toBe('default');
+  });
+  it('copies an inline-only partner, writes none for a document without partner, and shortens a long purpose',async()=>{
+    const client=new Client();
+    client.invoices=[invoice(1,100,{symVar:'1',partnerIdentity:{address:{company:'Jen Inline',name:'Jan Novák'}}}),invoice(2,100,{symVar:'2',partnerIdentity:undefined,text:'p'.repeat(120)})];
+    const result=await run(client,input({payments:[payment(1,{variableSymbol:'1'}),payment(2,{variableSymbol:'2'})]}));
+    expect(result).toMatchObject({ok:true,settled:2});
+    const [a,b]=client.writes[0]!.operations.map((o:Fields)=>o.header);
+    expect(a.partnerIdentity).toEqual({address:{company:'Jen Inline',name:'Jan Novák'}});
+    expect(b).not.toHaveProperty('partnerIdentity');expect(b.text).toHaveLength(96);expect(result.rows[1].textTruncated).toBe(true);
+  });
+  it('uses the purpose and partner read fresh before writing',async()=>{
+    const client=new Client();
+    client.onList=requests=>{if(requests.some(r=>r.filter?.id)&&!client.writes.length){client.invoices[0]!.invoiceHeader.text='opraveno';client.invoices[0]!.invoiceHeader.partnerIdentity={id:'6',address:{company:'Nový'}};}};
+    const result=await run(client);expect(result.settled).toBe(1);
+    expect(client.writes[0]!.operations[0].header).toMatchObject({text:'Úhrada FP c. FP1, opraveno',partnerIdentity:{id:6,address:{company:'Nový'}}});
+  });
+  it('blocks a document without number before any write',async()=>{
+    const client=new Client();client.invoices[0]!.invoiceHeader.number={};
+    const result=await run(client,input({execute:false}));
+    expect(result.rows[0]).toMatchObject({status:'needs_review'});expect(result.rows[0].reason).toMatch(/nemá číslo/);
+    expect((await run(client)).settled).toBe(0);expect(client.writes).toHaveLength(0);
+  });
+  it.each<[string,(c:Client)=>void,string]>([
+    ['partner company',c=>c.banks[0]!.bankHeader.partnerIdentity.address.company='Jiná firma','partnerIdentity.address.company'],
+    ['partner link',c=>delete c.banks[0]!.bankHeader.partnerIdentity.id,'partnerIdentity.id'],
+    ['missing partner',c=>delete c.banks[0]!.bankHeader.partnerIdentity,'partnerIdentity.id'],
+    ['text',c=>c.banks[0]!.bankHeader.text='Úhrada FP c. FP1','text'],
+    ['movement field',c=>c.banks[0]!.bankHeader.statementNumber.numberMovement='1','statementNumber.numberMovement'],
+  ])('reports a stored %s difference as needs_review with the created ID, no retry and no PDF mark',async(_,change,field)=>{
+    const client=new Client();client.onWrite=change;
+    const result=await run(client);
+    expect(result).toMatchObject({ok:false,settled:0,createdIds:[100],annotatedPdf:{marked:0}});
+    expect(result.rows[0]).toMatchObject({status:'needs_review',verified:true,doNotRetry:true,bankId:100});
+    expect(result.rows[0].fieldDifferences.map((d:Fields)=>d.field)).toContain(field);
+    const again=await run(client);expect(client.writes).toHaveLength(1);expect(again.rows[0]).toMatchObject({status:'needs_review',verified:true,doNotRetry:true});
+  });
+  it('keeps settled with a warning when POHODA generated another prefix variant, and still verifies on retry',async()=>{
+    const client=new Client();client.itemText=(agenda,number)=>`Úhrada ${(LIQUIDATION_ABBREVIATIONS as Fields)[agenda]} č. ${number}`;
+    const first=await run(client);
+    expect(first).toMatchObject({settled:1});expect(first.rows[0].warnings[0]).toMatch(/Úhrada FP č\. FP1/);
+    const retry=await run(client);
+    expect(retry).toMatchObject({settled:1,createdIds:[]});expect(retry.bankTextConvention.prefixes.receivedInvoice).toBe('Úhrada FP č. ');expect(client.writes).toHaveLength(1);
+  });
+  it('finds a legacy record (movement field filled, statement text, no partner) by its marker; reports it, never rewrites it',async()=>{
+    const client=new Client();
+    client.onWrite=c=>{const hd=c.banks[0]!.bankHeader;hd.statementNumber.numberMovement='1';hd.text='KARTA COUNTERPARTY';delete hd.partnerIdentity;};
+    await run(client);
+    client.onWrite=undefined;
+    const retry=await run(client);
+    expect(client.writes).toHaveLength(1);expect(retry.createdIds).toEqual([]);
+    expect(retry.rows[0]).toMatchObject({status:'needs_review',verified:true,doNotRetry:true,bankId:100});
+    expect(retry.rows[0].fieldDifferences.map((d:Fields)=>d.field)).toEqual(expect.arrayContaining(['statementNumber.numberMovement','text','partnerIdentity.id','partnerIdentity.address.company']));
+    expect(retry.annotatedPdf.marked).toBe(0);
+  });
+  it('verifies a legacy record whose only difference is the movement field as needs_review, not as a new write',async()=>{
+    const client=new Client();client.onWrite=c=>{c.banks[0]!.bankHeader.statementNumber.numberMovement='1';};
+    await run(client);client.onWrite=undefined;
+    const retry=await run(client);
+    expect(retry.rows[0].fieldDifferences).toEqual([{field:'statementNumber.numberMovement',expected:'',stored:'1'}]);expect(client.writes).toHaveLength(1);
+  });
+  it('treats a record with another stored movement number as foreign, not as this movement',async()=>{
+    const client=new Client();client.onWrite=c=>{c.banks[0]!.bankHeader.statementNumber.numberMovement='77';};
+    await run(client);client.onWrite=undefined;
+    const retry=await run(client);
+    expect(retry.rows[0]).toMatchObject({status:'needs_review',bankId:100,doNotRetry:true});expect(retry.rows[0].verified).toBeUndefined();expect(client.writes).toHaveLength(1);
+  });
+  it('never duplicates when two records carry the same marker or the movement was renumbered',async()=>{
+    const client=new Client();await run(client);
+    const copy=structuredClone(client.banks[0]!);copy.bankHeader.id=101;client.banks.push(copy);
+    const dup=await run(client);
+    expect(dup.rows[0]).toMatchObject({status:'needs_review',bankIds:[100,101],doNotRetry:true});expect(client.writes).toHaveLength(1);
+    client.banks.pop();
+    const renumbered=await run(client,input({payments:[payment(5)]}));
+    expect(renumbered.rows[0]).toMatchObject({status:'needs_review',bankId:100,doNotRetry:true});expect(client.writes).toHaveLength(1);
+  });
+  it('leaves an unclaimed slot holding the same statement and movement number for review',async()=>{
+    const client=new Client();
+    client.banks.push({bankHeader:{id:90,bankType:'expense',account:{id:2,ids:'B2'},statementNumber:{statementNumber:'010',numberMovement:'1'},datePayment:'2026-10-01',dateStatement:'2026-10-31',symVar:'555',intNote:'ručně'},bankSummary:{homeCurrency:{priceNone:42}}});
+    const result=await run(client);expect(result.rows[0]).toMatchObject({status:'needs_review',bankId:90});expect(client.writes).toHaveLength(0);
+  });
+  it('partnerIdentityOf normalizes linked ID, inline fields and country code',()=>{
+    expect(partnerIdentityOf({invoiceHeader:{partnerIdentity:PARTNER}})).toEqual({id:5,address:{company:'Dodavatel & syn s.r.o.',city:'Brno',street:'Hlavní 1',zip:'60200',ico:'12345679',dic:'CZ12345679',country:'CZ'}});
+    expect(partnerIdentityOf({bankHeader:{partnerIdentity:{id:'0'}}})).toBeUndefined();expect(partnerIdentityOf({bankHeader:{}})).toBeUndefined();
   });
 });

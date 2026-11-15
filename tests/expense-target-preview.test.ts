@@ -98,6 +98,10 @@ describe("target-only preview", () => {
     expect([await t.cell("PN", "targetPriceNone"), await t.cell("PN", "targetPriceHigh"), await t.cell("PN", "classificationVAT")]).toEqual([121, null, "PN"]);
     expect(await t.cell("CASH", "targetDocument")).toBeNull(); // cash <= 10 000 CZK has no Doklad
     expect(await t.cell("LATE", "targetDocument")).toBe("MCPTEST-0804");
+    // Datum splatnosti: printed due date (kept on a late document), else the original issue
+    // date; Pokladna has no due date in POHODA XML, so its cell stays blank.
+    const due = async (id: string) => iso(await t.cell(id, "targetDateDue")) ?? null;
+    expect([await due("LATE"), await due("CURRENT"), await due("PN"), await due("CASH")]).toEqual(["2026-08-18", "2026-10-12", "2026-09-21", null]);
 
     await t.importAll();
     expect((await t.submit()).ok).toBe(true);
@@ -105,6 +109,7 @@ describe("target-only preview", () => {
       const tool: Tool = id === "CASH" ? "create_cash_voucher" : "create_invoice";
       const out = written(t.header(id), tool);
       expect([id, ...(await dates(id))]).toEqual([id, out.date ?? null, out.dateTax ?? null, tool === "create_cash_voucher" ? null : out.dateAccounting ?? null, out.dateKHDPH ?? null]);
+      expect([id, await due(id)]).toEqual([id, out.dateDue ?? null]);
     }
     // Source facts reach the import unchanged even though no source column is shown.
     expect(t.header("LATE")).toMatchObject({ sourceIssueDate: "2026-08-04", sourceTaxDate: "2026-08-04", sourceDocumentNumber: "MCPTEST-0804" });
@@ -125,6 +130,9 @@ describe("target-only preview", () => {
     await t.edit("CURRENT", { targetDate: "2026-10-15", targetDocument: "MCPTEST-1015", targetPriceHigh: 2000, targetPriceHighVAT: 420, targetTotal: 2420 });
     // The VS derived from the old number would be stale: the reviewer brings it up to date.
     await t.edit("CURRENT", { targetSymVar: "1015" });
+    // So would the issue-date default of Datum splatnosti (the source prints no due date).
+    expect((await t.inspect()).rows.find((r: any) => r.rowId === "CURRENT")).toMatchObject({ valid: false, error: expect.stringContaining("Datum splatnosti 2026-10-12 → 2026-10-15") });
+    await t.edit("CURRENT", { targetDateDue: "2026-10-15" });
     // PN keeps the whole gross in Bez DPH / PN; a VAT bucket cannot appear there.
     await t.edit("PN", { targetPriceHigh: 100 });
     const view = await t.inspect();
@@ -133,7 +141,8 @@ describe("target-only preview", () => {
     expect(row("PN")).toMatchObject({ valid: false, error: expect.stringContaining("PN: celá částka") });
     expect(row("CURRENT")).toMatchObject({ valid: true, changedFields: expect.arrayContaining(["sourceIssueDate", "sourceDocumentNumber", "priceHigh", "priceHighVAT", "total"]) });
     expect(row("CURRENT").changedFields).not.toContain("sourceSymVar"); // updated dependent cell, not a new source fact
-    expect(row("CURRENT").preview.planned).toMatchObject({ date: "2026-10-15", originalDocument: "MCPTEST-1015", priceHigh: 2000, total: 2420 });
+    expect(row("CURRENT").changedFields).not.toContain("sourceDueDate");
+    expect(row("CURRENT").preview.planned).toMatchObject({ date: "2026-10-15", dateDue: "2026-10-15", dueDateRule: "issue-date", originalDocument: "MCPTEST-1015", priceHigh: 2000, total: 2420 });
     await expect(t.submit()).rejects.toThrow(/nelze zapsat/);
     expect(t.runs).toHaveLength(0);
 
@@ -142,7 +151,7 @@ describe("target-only preview", () => {
     await t.edit("PN", { targetPriceHigh: null });
     expect((await t.submit()).ok).toBe(true);
     expect(t.header("LATE").sourceIssueDate).toBe("2026-08-04");
-    expect(written(t.header("CURRENT"), "create_invoice")).toMatchObject({ date: "2026-10-15", originalDocument: "MCPTEST-1015", priceHigh: 2000, priceHighVAT: 420, total: 2420 });
+    expect(written(t.header("CURRENT"), "create_invoice")).toMatchObject({ date: "2026-10-15", dateDue: "2026-10-15", originalDocument: "MCPTEST-1015", priceHigh: 2000, priceHighVAT: 420, total: 2420 });
   });
 
   it("blocks a Celkem edit until the derived rounding is visible, without making it a source fact", async () => {
@@ -249,7 +258,7 @@ describe("Forma úhrady", () => {
     await t.edit("CASH", { paymentType: "Kartou" });
     await t.edit("INV", { paymentType: "Bitcoin" });
     const view = await t.inspect();
-    expect(view.rows.find((r: any) => r.rowId === "CASH")).toMatchObject({ valid: false, error: expect.stringContaining("Pokladní výdej se hradí hotově") });
+    expect(view.rows.find((r: any) => r.rowId === "CASH")).toMatchObject({ valid: false, error: expect.stringContaining("Účtenka placená kartou patří do Ostatních závazků") });
     expect(view.rows.find((r: any) => r.rowId === "INV")).toMatchObject({ valid: false, error: expect.stringContaining('Forma úhrady "Bitcoin" není známá') });
     await expect(t.submit()).rejects.toThrow();
     expect(t.runs).toHaveLength(0);
@@ -276,6 +285,30 @@ describe("Forma úhrady", () => {
     expect(t.header("NONCARD").paymentType).toBeUndefined();
   });
 
+  it("routes a card receipt to Ostatní závazky: blocks it as Pokladna, keeps a real card-paid invoice", async () => {
+    const receipt = taxable({ sourceIssueDate: "2026-10-05", sourceTaxDate: "2026-10-05", sourcePaymentDate: "2026-10-05", sourceDocumentNumber: "MCPTEST-UCT", priceHigh: 100, priceHighVAT: 21, total: 121, roundingAmount: 0, paymentType: "Kartou" });
+    const t = await setup([
+      { requestId: "CASHCARD", tool: "create_cash_voucher", data: { ...receipt, cashAccount: "HP" } },
+      { requestId: "PK", tool: "create_other_liability", data: { ...receipt, partnerIco: "27082440", partnerName: "MCPTEST Other s.r.o." } },
+      { requestId: "FP", tool: "create_invoice", data: taxable({ sourceIssueDate: "2026-10-12", sourceTaxDate: "2026-10-12", sourceDocumentNumber: "MCPTEST-FPK", paymentType: "creditcard", dateDue: "2026-10-26" }) }
+    ]);
+    const row = (id: string) => t.prepared.rows.find((r: any) => r.rowId === id);
+    // Wrong agenda: flagged before the preview is delivered, never switched silently.
+    expect(row("CASHCARD")).toMatchObject({ action: "review", reviewNotes: expect.stringContaining("Účtenka placená kartou patří do Ostatních závazků") });
+    expect(row("PK").action).toBe("import");
+    expect([await t.cell("PK", "targetDocument"), iso(await t.cell("PK", "targetDateDue"))]).toEqual(["Přidělí se z PK", "2026-10-05"]);
+    expect(row("FP").action).toBe("import");
+    expect([await t.cell("FP", "paymentType"), await t.cell("FP", "targetDocument"), iso(await t.cell("FP", "targetDateDue"))]).toEqual(["Kartou", "MCPTEST-FPK", "2026-10-26"]);
+    await t.importAll();
+    await expect(t.submit()).rejects.toThrow(/Ostatních závazků/);
+    await t.edit("CASHCARD", { action: "Vynechat" });
+    await t.submit();
+    expect(t.header("PK")).toMatchObject({ type: "commitment", cardPayment: true, paymentType: "creditcard" });
+    expect(t.header("FP")).toMatchObject({ type: "receivedInvoice", paymentType: "creditcard" });
+    expect(t.header("FP").cardPayment).toBeUndefined();
+    expect(written(t.header("FP"), "create_invoice")).toMatchObject({ originalDocument: "MCPTEST-FPK", dateDue: "2026-10-26" });
+  });
+
   it("reads an older workbook's Platba kartou column, and blocks a contradiction with Forma úhrady", async () => {
     const t = await setup([
       { requestId: "OLD", tool: "create_other_liability", data: card() },
@@ -296,7 +329,7 @@ describe("Forma úhrady", () => {
     await t.importAll();
     const { wb, ws } = await t.load();
     ws.getCell(2, t.colOf("targetDocument")).value = "Doklad v POHODĚ (vypočteno)";
-    ws.getCell(2, t.colOf("dateDue")).value = "Datum splatnosti (zdroj)";
+    ws.getCell(2, t.colOf("targetDateDue")).value = "Datum splatnosti (zdroj)";
     ws.getCell(3, t.colOf("paymentType")).value = "delivery"; // old layout wrote the raw enum
     await wb.xlsx.writeFile(t.path);
     await t.addLegacy({ FP: { cardPayment: "Ne", sourceIssueDate: "2026-08-04", sourceTaxDate: "2026-08-04", total: 1210 } });
@@ -304,6 +337,6 @@ describe("Forma úhrady", () => {
     expect(view.errors).toEqual([]);
     expect(view.rows[0]).toMatchObject({ valid: true, changedFields: [] });
     await t.submit();
-    expect(written(t.header("FP"), "create_invoice")).toMatchObject({ paymentType: "delivery", date: "2026-10-01", sourceIssueDate: "2026-08-04" });
+    expect(written(t.header("FP"), "create_invoice")).toMatchObject({ paymentType: "delivery", date: "2026-10-01", sourceIssueDate: "2026-08-04", dateDue: "2026-08-04" });
   });
 });

@@ -225,3 +225,46 @@ unmatched payments and duplicate-free retries.
 The DE path does not guess VAT allocation after partial payment, for rounding or for an
 unsupported third or historical VAT bucket: those rows remain `needs_review` before writes. The double-entry
 path retains its previous exact-remaining-amount behavior. Foreign-currency execution remains blocked.
+
+
+### Per-document PDF attachments
+
+Expense imports now archive the original PDF unchanged and attach a PDF containing
+only the document's canonical sourcePages. Whole-source documents reuse the original.
+Offline tests verify page content/order, multi-page documents, crop/rotation, invalid
+pages before writes, stable retries and preservation of the original bytes. A 220-document
+fixture shares source parsing and uses bounded archive writes. Legacy full-source links
+are reported for review without duplicating or changing existing accounting records.
+Live POHODA attachment acceptance remains covered by the existing shortcut mechanism;
+this new page-extraction path has not yet been run through POHODA in this change.
+
+
+### Latest expense conventions
+
+Received invoices and commitments use the printed due date, or their original issue
+date if the source has no due date. This does not shift with the VAT period.
+The preview keeps Datum splatnosti visible; cash vouchers leave it empty because
+`voucherHeader` has no due-date element. A card-paid cash voucher is rejected for
+reclassification as a commitment; an actual invoice paid by card remains an invoice.
+Policy/workbook/XML tests cover these distinctions and edits to the derived due date.
+
+Fuel descriptions use `PHM nafta` or `PHM benzín`. Unambiguous fuel components in mixed
+texts are normalized while preserving the other items; ambiguous descriptions remain
+unchanged. Tests cover mixed items, accents, idempotency and preview/import consistency.
+
+
+### Bank document fields and right-side marks
+
+Live runs `bt2` (new partner/text suite, 3/3), `btde2` (DE, 5/5),
+`bt2rules` (7/7), `bt2variants` (5/5), `btwrite-results` (5/5), and
+`btbase2` (4/4) used only positively identified MCPTEST units. The new suite
+covered all six agendas, linked and inline partners, blank movement fields,
+document-purpose text, length limits, legacy records and duplicate-free retries.
+PU generated “c.” and DE “č.”; the service learns the unit's existing convention
+and checks POHODA's generated item text. Evidence is under ignored
+`tests/output/banktext-bt2*` and `tests/output/bankde-btde2*`.
+
+Only rows with status settled receive right-margin checks. Offline rendered-pixel
+tests cover all four page rotations and cropped pages. Existing settled records
+with differing partner/text/movement fields are reported for manual review and
+never rewritten. Partners with extra phone/email fields have not been tested live.

@@ -1,6 +1,6 @@
 /**
  * Invalid rows keep every determinable POHODA value, Czech-only reviewer texts, client
- * conventions PDzjed -> PD and fuel-only text -> PHM nafta / PHM benzin
+ * conventions PDzjed -> PD and fuel text -> PHM nafta / PHM benzín
  * (synthetic MCPTEST data only; real XLSX + shared XML builder, fake transport).
  */
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
@@ -10,7 +10,7 @@ import ExcelJS from "exceljs";
 import { afterEach, describe, expect, it } from "vitest";
 import { ExpenseReviewService } from "../src/mcp/expense-review.js";
 import { computeReviewTargets, REVIEW_COLUMNS } from "../src/mcp/review-workbook.js";
-import { canonicalClassificationVAT, canonicalExpenseText, ExpensePolicyError, projectExpensePolicy, resolveExpensePolicy } from "../src/pohoda/expense-policy.js";
+import { canonicalClassificationVAT, canonicalExpenseText, ExpensePolicyError, FUEL_TEXT_BENZIN, projectExpensePolicy, resolveExpensePolicy } from "../src/pohoda/expense-policy.js";
 import { PohodaClient } from "../src/pohoda/client.js";
 import type { CliXmlJobResult, XmlTransport } from "../src/pohoda/transport.js";
 
@@ -129,13 +129,13 @@ describe("reviewed preview of invalid cash and card rows", () => {
     expect(cash.reviewNotes).toBe("Součet základů a DPH 2 400,00 se zaokrouhlením -0,30 dává 2 399,70, ale Celkem je 2 400,00; ověřte zaokrouhlení a částku k úhradě na dokladu.");
     expect(String(cash.plannedImport)).toMatch(/^Import zatím nelze – důvod je v poznámce\.\nDatum 12\.10\.2026, DPH 12\.10\.2026, KH 12\.10\.2026, úhrada 12\.10\.2026/);
     const card = await cells("PK1");
-    expect(card).toMatchObject({ text: "PHM benzin", classificationVAT: "PD", targetDate: "2026-10-05", targetDocument: "Přidělí se z PK", targetSymVar: "Přidělí se z PK",
+    expect(card).toMatchObject({ text: "PHM benzín", classificationVAT: "PD", targetDate: "2026-10-05", targetDocument: "Přidělí se z PK", targetSymVar: "Přidělí se z PK",
       targetPriceHigh: 1757.35, targetPriceHighVAT: 369.04, targetRounding: null, targetTotal: 2126.4 });
     expect(card.reviewNotes).toBe("Součet částek 2 126,39 neodpovídá částce Celkem 2 126,40; ověřte částky na dokladu.");
     for (const row of [cash, card]) for (const key of ["reviewNotes", "plannedImport"]) expect(String(row[key])).not.toMatch(codesIn);
     // Machine codes stay in structured metadata.
     const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
-    expect(manifest.targetProjection).toBe(2);
+    expect(manifest.targetProjection).toBe(3);
     expect(manifest.rows.map((r: any) => r.issues.map((i: any) => i.code))).toEqual([["SUMMARY_MISMATCH"], ["SUMMARY_MISMATCH"]]);
     expect(manifest.rows[0].data).toMatchObject({ priceHigh: 1983.47, priceHighVAT: 416.53, roundingAmount: -0.3, total: 2400, classificationVAT: "PD", text: "PHM nafta" });
 
@@ -238,22 +238,44 @@ describe("Členění DPH PD for domestic taxable expenses", () => {
   });
 });
 
-describe("fuel text PHM nafta / PHM benzin", () => {
-  it("maps only unambiguous fuel-only texts, idempotently", () => {
+describe("fuel text PHM nafta / PHM benzín", () => {
+  it("maps unambiguous fuel texts to the canonical text, idempotently", () => {
     for (const value of ["Diesel", "DIESEL", " nafta ", "Nafta motorová", "Motorová nafta", "PHM - nafta", "phm diesel", "PHM nafta"]) expect(canonicalExpenseText(value)).toBe("PHM nafta");
-    for (const value of ["Natural 95", "natural95", "Benzín", "BENZIN", "Natural 98", "PHM benzín", "PHM benzin"]) expect(canonicalExpenseText(value)).toBe("PHM benzin");
-    for (const value of ["PHM", "Globus", "ORLEN", "Diesel a voda do ostřikovačů", "AdBlue", "Nafta, myčka", "Materiál"]) expect(canonicalExpenseText(value)).toBe(value);
+    for (const value of ["Natural 95", "natural95", "Benzín", "BENZIN", "Natural 98", "PHM benzín", "PHM benzin", "PHM benzi\u0301n"]) expect(canonicalExpenseText(value)).toBe("PHM benzín");
+    expect(FUEL_TEXT_BENZIN).toBe("PHM benz\u00edn"); // long í, precomposed (cp1250-safe)
     expect(canonicalExpenseText(canonicalExpenseText("Diesel"))).toBe("PHM nafta");
+    expect(canonicalExpenseText(canonicalExpenseText("Natural 95"))).toBe("PHM benzín");
+  });
+
+  it("keeps the non-fuel part of a mixed text while canonicalizing its fuel component", () => {
+    const mixed: Array<[string, string]> = [
+      ["Natural 95 + olej", "PHM benzín + olej"],
+      ["Benzín + olej", "PHM benzín + olej"],
+      ["PHM benzin + olej", "PHM benzín + olej"],
+      ["Diesel + kapalina do ostřikovačů", "PHM nafta + kapalina do ostřikovačů"],
+      ["Diesel a voda do ostřikovačů", "PHM nafta a voda do ostřikovačů"],
+      ["Nafta, myčka", "PHM nafta, myčka"],
+      ["olej + Natural 98", "olej + PHM benzín"],
+      ["Nafta + AdBlue", "PHM nafta + AdBlue"]
+    ];
+    for (const [given, written] of mixed) {
+      expect(canonicalExpenseText(given), given).toBe(written);
+      expect(canonicalExpenseText(written), written).toBe(written);
+    }
+  });
+
+  it("never infers fuel from a supplier, a bare PHM or an unrecognized component", () => {
+    for (const value of ["PHM", "PHM + olej", "Pohonné hmoty", "Globus", "ORLEN", "Shell", "AdBlue", "Materiál", "Nafta 45,3 l", "Natural 95 olej", "Mytí + olej"]) expect(canonicalExpenseText(value)).toBe(value);
   });
 
   it("previews the canonical text for every expense agenda and writes the same text to XML", async () => {
     const docs = [
       { requestId: "FP1", tool: "create_invoice" as const, data: { ...invoiceOk, text: "Diesel" } },
       { requestId: "PK1", tool: "create_other_liability" as const, data: { ...cardMismatch, roundingAmount: 0.01, text: "Benzín" } },
-      { requestId: "VD1", tool: "create_cash_voucher" as const, data: { ...cashMismatch, roundingAmount: undefined, text: "nafta" } }
+      { requestId: "VD1", tool: "create_cash_voucher" as const, data: { ...cashMismatch, roundingAmount: undefined, text: "nafta + olej" } }
     ];
     const { cells, edit, submit, runs } = await setup(docs);
-    const expected: Record<string, string> = { FP1: "PHM nafta", PK1: "PHM benzin", VD1: "PHM nafta" };
+    const expected: Record<string, string> = { FP1: "PHM nafta", PK1: "PHM benzín", VD1: "PHM nafta + olej" };
     for (const doc of docs) { expect((await cells(doc.requestId)).text).toBe(expected[doc.requestId]); await edit(doc.requestId, { action: "Importovat" }); }
     await submit();
     for (const op of runs[0].ops) {

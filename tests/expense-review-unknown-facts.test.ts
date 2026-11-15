@@ -31,6 +31,15 @@ const header = (data: Record<string, any>, type = "receivedInvoice") => ({ ...da
 const codes = (issues: ExpensePolicyError[]) => issues.map((i) => i.code);
 
 describe("policy projection keeps independent facts", () => {
+  it("a card receipt routed to cash remains blocked but retains its known amounts and dates", () => {
+    const input = { ...header(domesticTaxable, "expense"), paymentType: "creditcard", sourcePaymentDate: "2026-10-04", roundingAmount: 0 };
+    expect(() => resolveExpensePolicy(input, [], "voucher")).toThrow(/CARD_RECEIPT_IN_CASH/);
+    const { result, issues } = projectExpensePolicy(input, "voucher");
+    expect(codes(issues)).toContain("CARD_RECEIPT_IN_CASH");
+    expect(result).toMatchObject({ priceHigh: 1000, priceHighVAT: 210, total: 1210, date: "2026-10-02", datePayment: "2026-10-04" });
+    const shown = computeReviewTargets({ tool: "create_cash_voucher", data: input }, PERIOD);
+    expect(shown).toMatchObject({ targetPriceHigh: 1000, targetPriceHighVAT: 210, targetTotal: 1210, targetDate: "2026-10-02" });
+  });
   it("unknown foreign tax mode: base, VAT, total, issue/tax dates and Doklad stay; KH, Členění DPH and PN do not", () => {
     expect(() => resolveExpensePolicy(header(foreignUnknown))).toThrow(/TAX_MODE_REQUIRED/);
     const { result, issues } = projectExpensePolicy(header(foreignUnknown));

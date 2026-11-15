@@ -63,7 +63,7 @@ const movementBase = 300000 + (Number(code) % 8999) * 10;
 
 function invoiceXml(d: Doc, i: number): string {
   const price = d.vat ? `<typ:priceHigh>${d.base}</typ:priceHigh>` : `<typ:priceNone>${d.base}</typ:priceNone>`;
-  return `<inv:invoice version="2.0"><inv:invoiceHeader><inv:invoiceType>${d.agenda}</inv:invoiceType><inv:symVar>${vs(i)}</inv:symVar><inv:date>2026-10-0${1 + (i % 9)}</inv:date><inv:dateTax>2026-10-0${1 + (i % 9)}</inv:dateTax><inv:dateDue>2026-10-25</inv:dateDue><inv:text>${tag} ${d.key}</inv:text><inv:intNote>${tag} ${d.key}</inv:intNote></inv:invoiceHeader><inv:invoiceSummary><inv:homeCurrency>${price}</inv:homeCurrency></inv:invoiceSummary></inv:invoice>`;
+  return `<inv:invoice version="2.0"><inv:invoiceHeader><inv:invoiceType>${d.agenda}</inv:invoiceType><inv:symVar>${vs(i)}</inv:symVar><inv:date>2026-10-0${1 + (i % 9)}</inv:date><inv:dateTax>2026-10-0${1 + (i % 9)}</inv:dateTax><inv:dateDue>2026-10-25</inv:dateDue><inv:text>${tag} ${d.key}</inv:text><inv:partnerIdentity><typ:address><typ:company>MCPTEST DE Partner ${d.key}</typ:company><typ:city>Plzen</typ:city><typ:ico>9911${String(i).padStart(4, '0')}</typ:ico></typ:address></inv:partnerIdentity><inv:intNote>${tag} ${d.key}</inv:intNote></inv:invoiceHeader><inv:invoiceSummary><inv:homeCurrency>${price}</inv:homeCurrency></inv:invoiceSummary></inv:invoice>`;
 }
 
 function responseShape(xml: string) {
@@ -246,6 +246,22 @@ live('POHODA daňová evidence bank liquidation (homeCurrencyJU) via registered 
       expect(after[d.key].liquidation?.amountHome ?? '0', d.key).toMatch(/^0(\.0+)?$/);
     }
     expect(after.OLD).toEqual(evidence.docsBefore.OLD);
+    // Bank record fields from the settled document: blank movement field, "<generated>, <purpose>", copied partner.
+    const abbr: Record<Agenda, string> = { receivedInvoice: 'FP', commitment: 'OZ', receivedAdvanceInvoice: 'PZ', issuedInvoice: 'FV', issuedAdvanceInvoice: 'VZ' };
+    evidence.bankFields = fresh.map(r => ({ id: Number(h(r).id), statementNumber: h(r).statementNumber, text: h(r).text, partner: h(r).partnerIdentity, items: arr(r.bankDetail?.bankItem).map((i: any) => i.text) }));
+    for (const [i, d] of DOCS.entries()) {
+      const row = body.rows.find((r: any) => r.document?.id === ids[d.key]), bank = fresh.find(r => Number(h(r).id) === row.bankId)!;
+      expect(h(bank).statementNumber, d.key).toEqual({ statementNumber: '010' });
+      // The unit's own generated item text (this DE unit: "č.", the PU demo: "c.") followed by the purpose.
+      const items = arr(bank.bankDetail?.bankItem).map((x: any) => String(x.text));
+      expect(items.length, d.key).toBeGreaterThan(0);
+      for (const t of items) expect(t, d.key).toMatch(new RegExp(`^Úhrada ${abbr[d.agenda]} [cč]\\. ${row.document.number}$`));
+      expect(new Set(items).size, d.key).toBe(1);
+      expect(String(h(bank).text), d.key).toBe(`${items[0]}, ${tag} ${d.key}`);
+      expect(row.bankText, d.key).toBe(String(h(bank).text));
+      expect(row.warnings, d.key).toBeUndefined();
+      expect(h(bank).partnerIdentity?.address, d.key).toMatchObject({ company: `MCPTEST DE Partner ${d.key}`, city: 'Plzen', ico: `9911${String(i).padStart(4, '0')}` });
+    }
     expect(await readFile(pdfPath)).not.toHaveLength(0);
   }, 1_800_000);
 

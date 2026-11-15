@@ -16,6 +16,7 @@ import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { loadImage, createCanvas } from '@napi-rs/canvas';
 import { getDocument } from 'pdfjs-dist/legacy/build/pdf.mjs';
 import { BankStatementService, type StatementInput, type StatementPayment } from '../src/mcp/bank-statement.js';
+import { checkMarkGeometry } from '../src/mcp/bank-statement-pdf.js';
 import { recordsIn } from '../src/mcp/expense-import.js';
 import { registerPohodaTools } from '../src/mcp/tools.js';
 import { preparePdfPages } from '../src/mcp/pdf-pages.js';
@@ -89,16 +90,21 @@ async function extractStatement(path: string) {
   return { header: { accountNumber: header.account?.[1], bankCode: header.account?.[2], iban: header.iban, currency: header.currency, period: header.period, dateStatement: header.date }, movements };
 }
 
-/** Green check pixels near each mark, in the rendered (cropped) page. */
+/** Green check pixels in each row's far-right check area of the rendered (cropped) page, and anywhere left of it. */
 async function greenAtMarks(pdfPath: string, payments: StatementPayment[], dir: string) {
   const rendered = await preparePdfPages({ pdfPath, outputDirectory: dir, format: 'png', dpi: 100 });
   const img = await loadImage(await readFile(rendered.pages[0]!.path)), canvas = createCanvas(img.width, img.height), ctx = canvas.getContext('2d');
   ctx.drawImage(img, 0, 0);
-  return payments.map(p => {
-    const cx = Math.round(p.mark.x * img.width), cy = Math.round(p.mark.y * img.height), sx = img.width / PAGE.crop.width;
-    const data = ctx.getImageData(Math.max(0, cx - 2), Math.max(0, cy - Math.round(8 * sx)), Math.round(16 * sx), Math.round(14 * sx)).data;
+  const sx = img.width / PAGE.crop.width;
+  const count = (x: number, y: number, w: number, hgt: number) => {
+    const data = ctx.getImageData(Math.max(0, Math.round(x)), Math.max(0, Math.round(y)), Math.max(1, Math.round(w)), Math.max(1, Math.round(hgt))).data;
     let green = 0; for (let i = 0; i < data.length; i += 4) if (data[i + 1]! > 90 && data[i]! < 90 && data[i + 2]! < 130 && data[i + 1]! - data[i]! > 40) green++;
-    return { movement: p.movement, green };
+    return green;
+  };
+  return payments.map(p => {
+    const g = checkMarkGeometry(PAGE.crop.width, PAGE.crop.height, p.mark.y);
+    const top = (g.centerY - g.size / 2 - 2) * sx, height = (g.size + 4) * sx;
+    return { movement: p.movement, green: count((g.left - 2) * sx, top, (g.size + 4) * sx, height), leftOfCheck: count(0, top, (g.left - 3) * sx, height) };
   });
 }
 
@@ -276,6 +282,7 @@ live('POHODA bank statement rules (independent live checks)', () => {
     evidence.markPixels = { annotated: green, source: base };
     expect(base.every(g => g.green === 0)).toBe(true);
     for (const g of green) expect(g.green > 0).toBe([3, 4, 7].includes(g.movement - movementBase));
+    expect(green.every(g => g.leftOfCheck === 0)).toBe(true); // far right only, nothing in the row's text area
   }, 900_000);
 
   it('MCP tool retry with renamed identical PDF writes nothing and reverifies the same IDs', async () => {
@@ -310,7 +317,7 @@ live('POHODA bank statement rules (independent live checks)', () => {
       { movement: movementBase + 30, date: '2026-10-14', amount: amt(66), direction: 'expense', vs: vs('10'), counterparty: '2000145399/0800', text: 'lost response' }
     ]);
     const input: StatementInput = { databaseId: database, sourcePdfPath: pdf, statementPeriod: '2026-10', dateStatement: '2026-10-31', iban: czIban(OWN.number, OWN.bank), currency: 'CZK', execute: true, payments };
-    const lossy = { listRecordsBatch: client.listRecordsBatch.bind(client), writeBatch: async (...a: Parameters<PohodaClient['writeBatch']>) => { await client.writeBatch(...a); throw Error('Simulated lost response after POHODA wrote'); } };
+    const lossy = { listRecordsBatch: client.listRecordsBatch.bind(client), listAccountingUnits: client.listAccountingUnits.bind(client), writeBatch: async (...a: Parameters<PohodaClient['writeBatch']>) => { await client.writeBatch(...a); throw Error('Simulated lost response after POHODA wrote'); } };
     const before = transport.results.length;
     const first = await new BankStatementService(lossy).process(input, target);
     evidence.lostFirst = first;

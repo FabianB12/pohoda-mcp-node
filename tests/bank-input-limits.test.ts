@@ -120,3 +120,24 @@ describe('liquidation price branch in serialized bank XML', () => {
     await expect(write()).rejects.toThrow(/accounting mode/);
   });
 });
+
+describe('bank liquidation record XML (shared builder)', () => {
+  it('writes the copied partner (ID + inline, escaped), the composed text and no numberMovement', async () => {
+    const { transport, client, close } = await setup();
+    try {
+      await client.writeBatch([{ tool: 'create_bank_document', requestId: 'm1', header: {
+        type: 'expense', account: 'TSB2', statementPeriod: '2026-07', dateStatement: '2026-07-31', datePayment: '2026-07-01', symVar: '123',
+        text: 'Úhrada FP c. FP26104, telefon.služby 5-6/2026', intNote: 'MCP-BANK:x', accountingMode: 'doubleEntry',
+        partnerIdentity: { id: 5, address: { company: 'Dodavatel & syn s.r.o.', name: 'Jan <Novák>', ico: '12345679', country: 'CZ' } },
+        liquidations: [{ agenda: 'receivedInvoice', id: 7, amount: '100.00' }] }, items: [] }], 'pack-1', { databaseOverride: 'Db', dataPackIco: '12345678' });
+      const xml = transport.calls.at(-1)!;
+      expect(xml).toMatch(/<bnk:statementNumber>\s*<bnk:statementNumber>007<\/bnk:statementNumber>\s*<\/bnk:statementNumber>/);
+      expect(xml).not.toContain('numberMovement');
+      expect(xml).toContain('<bnk:text>Úhrada FP c. FP26104, telefon.služby 5-6/2026</bnk:text>');
+      expect(xml).toMatch(/<bnk:partnerIdentity>\s*<typ:id>5<\/typ:id>\s*<typ:address>\s*<typ:company>Dodavatel &amp; syn s\.r\.o\.<\/typ:company>\s*<typ:name>Jan &lt;Novák&gt;<\/typ:name>\s*<typ:ico>12345679<\/typ:ico>\s*<typ:country>\s*<typ:ids>CZ<\/typ:ids>\s*<\/typ:country>\s*<\/typ:address>\s*<\/bnk:partnerIdentity>/);
+      // Without a structured partner the generic partner fields keep working.
+      await client.writeBatch([{ tool: 'create_bank_document', requestId: 'm2', header: bankHeader({ partnerName: 'Plain' }), items: [] }], 'pack-2', { databaseOverride: 'Db', dataPackIco: '12345678' });
+      expect(transport.calls.at(-1)).toMatch(/<bnk:partnerIdentity>\s*<typ:address>\s*<typ:company>Plain<\/typ:company>/);
+    } finally { await close(); }
+  });
+});

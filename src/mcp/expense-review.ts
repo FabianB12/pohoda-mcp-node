@@ -49,7 +49,7 @@ export const REVIEW_EDITABLE_FIELDS = [
   "paymentType", "cashAccount", "accountIds", "paymentAccountNumber", "paymentBankCode", "taxMode", "sourceChargesVat",
   "partnerId", "partnerName", "partnerIco", "partnerDic", "partnerStreet", "partnerCity", "partnerZip", "partnerCountry",
   "partnerVatStatus", "vatStatusEvidence",
-  "sourceIssueDate", "sourceTaxDate", "sourcePaymentDate", "sourceDocumentNumber", "sourceSymVar",
+  "sourceIssueDate", "sourceTaxDate", "sourcePaymentDate", "sourceDocumentNumber", "sourceSymVar", "sourceDueDate",
   "date", "dateTax", "dateAccounting", "dateKHDPH", "datePayment", "dateDue", "originalDocument", "symVar",
   "cardPayment", "total", "roundingAmount", "priceNone", "priceLow", "priceLowVAT", "priceLowSum",
   "priceHigh", "priceHighVAT", "priceHighSum", "price3", "price3VAT", "price3Sum",
@@ -62,8 +62,8 @@ const REVIEW_ONLY_KEYS = ["rowId", "action", "reviewNotes", "requestId", "items"
 const TOOLS: ReviewTool[] = ["create_invoice", "create_other_liability", "create_cash_voucher"];
 const ACTIONS: ReviewAction[] = ["import", "review", "skip"];
 const MONEY_FIELDS = new Set(["total", "roundingAmount", "priceNone", "priceLow", "priceLowVAT", "priceLowSum", "priceHigh", "priceHighVAT", "priceHighSum", "price3", "price3VAT", "price3Sum", "currencyPriceSum", "homePayableCZK"]);
-const DATE_FIELDS = new Set(["sourceIssueDate", "sourceTaxDate", "sourcePaymentDate", "date", "dateTax", "dateAccounting", "dateKHDPH", "datePayment", "dateDue"]);
-const SOURCE_FACT_FIELDS = ["sourceIssueDate", "sourceTaxDate", "sourcePaymentDate", "sourceDocumentNumber", "sourceSymVar", "taxMode", "total", "priceNone", "priceLow", "priceLowVAT", "priceHigh", "priceHighVAT", "price3", "price3VAT", "roundingAmount", "currency", "homePayableCZK", "text", "accounting", "paymentType", "cardPayment"];
+const DATE_FIELDS = new Set(["sourceIssueDate", "sourceTaxDate", "sourcePaymentDate", "sourceDueDate", "date", "dateTax", "dateAccounting", "dateKHDPH", "datePayment", "dateDue"]);
+const SOURCE_FACT_FIELDS = ["sourceIssueDate", "sourceTaxDate", "sourcePaymentDate", "sourceDueDate", "sourceDocumentNumber", "sourceSymVar", "taxMode", "total", "priceNone", "priceLow", "priceLowVAT", "priceHigh", "priceHighVAT", "price3", "price3VAT", "roundingAmount", "currency", "homePayableCZK", "text", "accounting", "paymentType", "cardPayment"];
 const PREFERRED_TEXT_LENGTH = 60;
 const HISTORY_COUNT = 50;
 const EXAMPLES_PER_QUERY = 5;
@@ -74,10 +74,14 @@ const locks = new Map<string, Promise<unknown>>();
 /**
  * Manifest marker: target cells of rows the import rejects show the policy projection.
  * Older workbooks left every target cell of such rows blank; those blanks are not edits.
+ * Version 3: Datum splatnosti is a policy target (source due date, else the issue date);
+ * before it was a plain cell, blank when the source had no due date.
  */
-const TARGET_PROJECTION_VERSION = 2;
+const TARGET_PROJECTION_VERSION = 3;
+const DUE_DATE_TARGET_VERSION = 3;
 
 const text = (v: unknown): string => v == null ? "" : String(v).trim();
+const firstValue = (...values: unknown[]): string => values.map(text).find(Boolean) ?? "";
 const sha256 = (v: string | Buffer): string => createHash("sha256").update(v).digest("hex");
 const empty = (v: unknown): boolean => v === undefined || v === null || (typeof v === "string" && v.trim() === "");
 
@@ -491,7 +495,8 @@ function draftData(tool: ReviewTool, input: Fields, vatPeriod: string): { data: 
   // see and correct the actual facts used by the policy, not hidden fallback data.
   for (const [field, aliases] of Object.entries({
     sourceIssueDate: ["date"], sourceTaxDate: ["dateKHDPH", "dateTax"],
-    sourcePaymentDate: ["datePayment"], sourceDocumentNumber: ["originalDocument"], sourceSymVar: ["symVar"]
+    sourcePaymentDate: ["datePayment"], sourceDocumentNumber: ["originalDocument"], sourceSymVar: ["symVar"],
+    sourceDueDate: ["dateDue"]
   })) if (empty(data[field])) {
     const value = aliases.map((alias) => data[alias]).find((v) => !empty(v));
     if (!empty(value)) data[field] = value;
@@ -499,7 +504,7 @@ function draftData(tool: ReviewTool, input: Fields, vatPeriod: string): { data: 
   if (empty(data.total) && !empty(data.currencyPriceSum)) data.total = data.currencyPriceSum;
   // These aliases are represented by their visible source columns; retaining a
   // second hidden value could undo a reviewer clearing or correcting a cell.
-  for (const key of ["date", "dateTax", "dateKHDPH", "datePayment", "originalDocument", "symVar", "currencyPriceSum"]) delete data[key];
+  for (const key of ["date", "dateTax", "dateKHDPH", "datePayment", "dateDue", "originalDocument", "symVar", "currencyPriceSum"]) delete data[key];
   if (tool === "create_other_liability") data.type = "commitment";
   if (tool === "create_cash_voucher") data.type = "expense";
   if (tool === "create_invoice" && !["receivedInvoice", "commitment"].includes(text(data.type))) {
@@ -510,12 +515,18 @@ function draftData(tool: ReviewTool, input: Fields, vatPeriod: string): { data: 
   const payment = reconcilePaymentMethod(tool, data, "cardPayment" in data ? coerce("cardPayment", data.cardPayment) : undefined);
   if (payment.conflict) { blocking = true; notes.push(payment.conflict); }
   if (payment.notes.length) { blocking = true; notes.push(...payment.notes); }
-  // Text is shown exactly as written to POHODA (fuel-only texts -> PHM nafta / PHM benzin).
+  // Text is shown exactly as written to POHODA (fuel -> PHM nafta / PHM benzín, also in a mixed text).
   if (!empty(payment.data.text)) payment.data.text = canonicalExpenseText(payment.data.text);
   return { data: payment.data, notes, issues, blocking };
 }
 
-const legacyTargets = (manifest: Fields): boolean => manifest.targetProjection !== TARGET_PROJECTION_VERSION;
+const legacyTargets = (manifest: Fields): LegacyTargets => ({
+  rejectedBlank: !(Number(manifest.targetProjection) >= 2),
+  dueDateBlank: !(Number(manifest.targetProjection) >= DUE_DATE_TARGET_VERSION)
+});
+/** Blank target cells an older workbook wrote that are not reviewer edits (see mapTargetEdits). */
+type LegacyTargets = { rejectedBlank: boolean; dueDateBlank: boolean };
+const CURRENT_TARGETS: LegacyTargets = { rejectedBlank: false, dueDateBlank: false };
 
 const kindOf = (tool: ReviewTool) => tool === "create_cash_voucher" ? "voucher" as const : "invoice" as const;
 const policyInput = (tool: ReviewTool, data: Fields): Fields => {
@@ -552,7 +563,7 @@ function rowIssues(tool: ReviewTool, data: Fields): ReviewIssue[] {
 /** Visible POHODA target cell -> the source field an edit of it changes (see mapTargetEdits). */
 const TARGET_SOURCE: Record<string, string> = {
   targetDocument: "sourceDocumentNumber", targetSymVar: "sourceSymVar",
-  targetDate: "sourceIssueDate", targetDateTax: "sourceTaxDate", targetDateAccounting: "dateAccounting", targetDateKHDPH: "sourceTaxDate",
+  targetDate: "sourceIssueDate", targetDateTax: "sourceTaxDate", targetDateAccounting: "dateAccounting", targetDateKHDPH: "sourceTaxDate", targetDateDue: "sourceDueDate",
   targetPriceNone: "priceNone", targetPriceLow: "priceLow", targetPriceLowVAT: "priceLowVAT", targetPriceHigh: "priceHigh", targetPriceHighVAT: "priceHighVAT",
   targetPrice3: "price3", targetPrice3VAT: "price3VAT", targetRounding: "roundingAmount", targetTotal: "total"
 };
@@ -577,7 +588,7 @@ function sameTarget(key: string, a: unknown, b: unknown): boolean {
  *   every visible target cell must equal what is imported: a cell left stale by another
  *   edit blocks the row until the reviewer updates it (inspect lists the value to type).
  */
-function mergeReviewedRow(tool: ReviewTool, original: Fields, decoded: Fields, targets?: Fields, legacy = false): { data: Fields; changed: string[]; ignored: string[] } {
+function mergeReviewedRow(tool: ReviewTool, original: Fields, decoded: Fields, targets?: Fields, legacy: LegacyTargets = CURRENT_TARGETS): { data: Fields; changed: string[]; ignored: string[] } {
   const vatPeriod = text(original.vatPeriod);
   const before = workbookCodec.computeReviewTargets({ tool, data: original }, vatPeriod);
   const edits: Fields = { ...(decoded ?? {}) };
@@ -611,8 +622,13 @@ function mergeReviewedRow(tool: ReviewTool, original: Fields, decoded: Fields, t
   if (error) merged.data._paymentReviewError = error;
   delete merged.data._registryReviewError;
   // An older workbook left every target cell of a rejected row blank: those blanks are not edits.
-  const legacyBlank = legacy && Boolean(workbookCodec.reviewPolicyIssue({ tool, data: original }, vatPeriod));
-  const errors = [mapTargetEdits(tool, merged, original, before, targets ?? {}, vatPeriod, legacyBlank), ...writtenLabelErrors(tool, merged.data, decoded ?? {}, vatPeriod)].filter(Boolean);
+  const rejectedBlank = legacy.rejectedBlank && Boolean(workbookCodec.reviewPolicyIssue({ tool, data: original }, vatPeriod));
+  // An older workbook showed Datum splatnosti as the plain source value (blank when the
+  // source had none): that unchanged cell is not an edit, but it is stale once importable.
+  const oldDueDate = legacy.dueDateBlank ? firstValue(original.sourceDueDate, original.dateDue) : undefined;
+  const priorLayout = ([key, value]: TargetCell): boolean => (rejectedBlank && empty(value) && !empty(before[key]))
+    || (oldDueDate !== undefined && key === "targetDateDue" && sameTarget(key, value, oldDueDate) && !sameTarget(key, value, before[key]));
+  const errors = [mapTargetEdits(tool, merged, original, before, targets ?? {}, vatPeriod, priorLayout), ...writtenLabelErrors(tool, merged.data, decoded ?? {}, vatPeriod)].filter(Boolean);
   if (errors.length) merged.data._targetReviewError = errors.join(" ");
   return merged;
 }
@@ -633,9 +649,8 @@ function writtenLabelErrors(tool: ReviewTool, data: Fields, decoded: Fields, vat
 
 type TargetCell = [string, unknown];
 
-function mapTargetEdits(tool: ReviewTool, merged: { data: Fields; changed: string[] }, original: Fields, before: Fields, targets: Fields, vatPeriod: string, legacyBlank = false): string | undefined {
+function mapTargetEdits(tool: ReviewTool, merged: { data: Fields; changed: string[] }, original: Fields, before: Fields, targets: Fields, vatPeriod: string, priorBlank: (cell: TargetCell) => boolean = () => false): string | undefined {
   const cells: TargetCell[] = Object.entries(targets).filter(([key]) => key in TARGET_SOURCE);
-  const priorBlank = ([key, value]: TargetCell) => legacyBlank && empty(value) && !empty(before[key]);
   const edited = cells.filter((cell) => !sameTarget(cell[0], cell[1], before[cell[0]]) && !priorBlank(cell));
   const label = (key: string) => TARGET_LABELS.get(key) ?? key;
   const shown = (v: unknown) => empty(v) ? "(prázdné)" : String(v);
@@ -669,7 +684,7 @@ function mapTargetEdits(tool: ReviewTool, merged: { data: Fields; changed: strin
     }
     // The table must show what is imported: an unchanged cell made stale by another edit
     // (Členění DPH, Forma úhrady, Celkem, ...) blocks the row until the reviewer updates it.
-    // A legacy blank is stale only once the row is importable (it must then show the values).
+    // A legacy cell is stale only once the row is importable (it must then show the values).
     const importable = !workbookCodec.reviewPolicyIssue({ tool, data: merged.data }, vatPeriod);
     const stale = cells.filter((cell) => !(priorBlank(cell) && !importable))
       .filter(([key, value]) => !edited.some(([k]) => k === key) && !sameTarget(key, after[key], value))
@@ -699,6 +714,7 @@ function assignTargetEdits(row: { data: Fields; changed: string[] }, mapped: Tar
     if (!changed.includes(field)) changed.push(field);
   }
   if (assigned.has("sourceTaxDate") && !assigned.has("dateTax")) delete data.dateTax;
+  if (assigned.has("sourceDueDate")) delete data.dateDue;
   // Edited VAT amounts are the reviewer's statement of whether the document charges VAT.
   if (["priceLowVAT", "priceHighVAT", "price3VAT"].some((field) => assigned.has(field))) {
     const chargesVat = ["priceLowVAT", "priceHighVAT", "price3VAT"].some((field) => !empty(data[field]) && Number(data[field]) !== 0);
@@ -713,6 +729,9 @@ function policyOf(tool: ReviewTool, data: Fields): Fields {
 }
 
 function targetLockReason(key: string, policy: Fields, tool: ReviewTool): string {
+  if (key === "targetDateDue" && tool === "create_cash_voucher") return " (pokladní doklad nemá v POHODĚ datum splatnosti)";
+  if (key === "targetDateDue" && policy.dueDateRule === "issue-date") return " (doklad bez splatnosti je splatný dnem vystavení)";
+  if (key === "targetDateDue") return "";
   if (key.startsWith("targetDate") && policy.lateSource) return " (pozdní doklad: data jsou 1. den období DPH; původní data zůstávají v interní poznámce)";
   if (key === "targetDateKHDPH" && policy.taxMode === "nonTax") return " (PN nemá datum KH)";
   if (key === "targetDateAccounting" && tool === "create_cash_voucher") return " (pokladní doklad nemá účetní datum)";
@@ -742,7 +761,7 @@ function mergeRow(original: Fields, decoded: Fields): { data: Fields; changed: s
   // value through an invisible legacy alias preserved in the manifest.
   const aliases: Record<string, string[]> = {
     sourceIssueDate: ["date"], sourceTaxDate: ["dateTax", "dateKHDPH"],
-    sourcePaymentDate: ["datePayment"], sourceDocumentNumber: ["originalDocument"], sourceSymVar: ["symVar"]
+    sourcePaymentDate: ["datePayment"], sourceDocumentNumber: ["originalDocument"], sourceSymVar: ["symVar"], sourceDueDate: ["dateDue"]
   };
   for (const field of changed) for (const alias of aliases[field] ?? []) delete data[alias];
   return { data, changed, ignored };
@@ -840,6 +859,7 @@ function preflight(tool: ReviewTool, data: Fields): { ok: boolean; error?: strin
     const sourceFacts = Object.fromEntries(SOURCE_FACT_FIELDS.filter((f) => !empty(data[f])).map((f) => [f, data[f]]));
     const planned: Fields = {
       date: resolved.date, dateTax: resolved.dateTax, dateAccounting: resolved.dateAccounting, dateKHDPH: resolved.dateKHDPH, datePayment: resolved.datePayment,
+      dateDue: resolved.dateDue, dueDateRule: policy.dueDateRule,
       classificationVAT: resolved.classificationVAT, taxMode: policy.taxMode, lateSource: policy.lateSource, payableCZK: policy.payableCZK,
       priceNone: resolved.priceNone, priceLow: resolved.priceLow, priceLowVAT: resolved.priceLowVAT, priceHigh: resolved.priceHigh, priceHighVAT: resolved.priceHighVAT,
       price3: resolved.price3, price3VAT: resolved.price3VAT, roundingAmount: resolved.roundingAmount, roundingRule: policy.roundingRule, total: resolved.total,

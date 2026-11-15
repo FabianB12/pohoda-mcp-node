@@ -1,4 +1,4 @@
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import ExcelJS from "exceljs";
@@ -50,27 +50,61 @@ describe("Real XLSX reviewed-import integration", () => {
     expect(prepared.status).toBe("readyForReview");
     expect(runs).toHaveLength(0);
     expect(reads).toHaveLength(1);
-    await edit({ text: "Oprava", targetPriceHigh: "200,00", targetPriceHighVAT: 42, targetTotal: 242, accounting: null, dateDue: null, reviewNotes: "PRIVATE REVIEW NOTE", action: "Importovat" });
+    await edit({ text: "Oprava", targetPriceHigh: "200,00", targetPriceHighVAT: 42, targetTotal: 242, accounting: null, reviewNotes: "PRIVATE REVIEW NOTE", action: "Importovat" });
     expect((await submit()).ok).toBe(true);
     expect(runs).toHaveLength(1);
     const header = runs[0].ops[0].header;
     // Target amount edits become the source amounts the policy uses; other source facts stay.
     expect(header).toMatchObject({ text: "Oprava", priceHigh: "200.00", priceHighVAT: 42, total: 242, sourceDocumentNumber: "000123", sourceSymVar: "00123", sourceIssueDate: "2026-10-10", intNote: "Source provenance" });
     for (const field of ["accounting", "dateDue", "symVar"]) expect(header[field]).toBeUndefined();
+    // The caller's dateDue is the source due date; the policy writes it unchanged (also when late).
+    expect(header.sourceDueDate).toBe("2026-11-25");
+    expect(resolveExpensePolicy(header, [], "invoice").dateDue).toBe("2026-11-25");
     expect(JSON.stringify(runs)).not.toContain("PRIVATE REVIEW NOTE");
     expect((await submit()).repeated).toBe(true);
     expect(runs).toHaveLength(1);
   });
 
-  it("keeps an unused receipt due date out of view without losing a reviewer-entered value", async () => {
-    const { prepared, edit, submit, runs } = await setup({ paymentType: "cash", dateDue: undefined });
-    const wb = new ExcelJS.Workbook(); await wb.xlsx.readFile(prepared.workbookPath);
-    const sheet = wb.getWorksheet("Doklady")!;
-    const dueColumn = REVIEW_COLUMNS.findIndex((c) => c.key === "dateDue") + 1;
-    expect(sheet.getColumn(dueColumn).hidden).toBe(true);
-    await edit({ dateDue: "2026-11-25" });
+  it("shows and writes Datum splatnosti: source value, issue-date default, reviewer edit; never blank", async () => {
+    const dueOf = async (path: string) => {
+      const wb = new ExcelJS.Workbook(); await wb.xlsx.readFile(path);
+      const sheet = wb.getWorksheet("Doklady")!, column = REVIEW_COLUMNS.findIndex((c) => c.key === "targetDateDue") + 1;
+      return { hidden: sheet.getColumn(column).hidden, value: sheet.getCell(3, column).value };
+    };
+    // No printed due date on a late document: due on its original issue date, not on day one of the period.
+    const missing = await setup({ dateDue: undefined });
+    expect(await dueOf(missing.prepared.workbookPath)).toEqual({ hidden: false, value: new Date(Date.UTC(2026, 9, 10)) });
+    expect(missing.prepared.rows[0].preview.planned).toMatchObject({ date: "2026-11-01", dateDue: "2026-10-10", dueDateRule: "issue-date" });
+    await missing.edit({ targetDateDue: null });
+    await expect(missing.submit()).rejects.toMatchObject({ details: { invalid: [expect.objectContaining({ errorCode: "TARGET_EDIT_REJECTED", error: expect.stringContaining("Datum splatnosti: (prázdné) nelze zapsat, podle pravidel importu bude 2026-10-10 (doklad bez splatnosti je splatný dnem vystavení)") })] } });
+    await missing.edit({ targetDateDue: "2026-11-30" });
+    await missing.submit();
+    expect(missing.runs[0].ops[0].header).toMatchObject({ sourceDueDate: "2026-11-30" });
+    expect(resolveExpensePolicy(missing.runs[0].ops[0].header, [], "invoice").dateDue).toBe("2026-11-30");
+  });
+
+  it("does not read an older workbook's blank Datum splatnosti as an edit, but requires the written value before import", async () => {
+    const { prepared, edit, submit, runs } = await setup({ dateDue: undefined });
+    // Previous layout: Datum splatnosti was a plain cell, blank when the source had no due date.
+    const manifest = JSON.parse(await readFile(prepared.manifestPath, "utf8"));
+    manifest.targetProjection = 2;
+    await writeFile(prepared.manifestPath, JSON.stringify(manifest));
+    await edit({ targetDateDue: null, action: "Importovat" });
+    await expect(submit()).rejects.toMatchObject({ details: { invalid: [expect.objectContaining({ error: "Po úpravách tabulka neukazuje importované hodnoty: Datum splatnosti (prázdné) → 2026-10-10. Přepište tyto buňky (sbalené sloupce rozbalte)." })] } });
+    await edit({ targetDateDue: "2026-10-10" });
     await submit();
-    expect(runs[0].ops[0].header.dateDue).toBe("2026-11-25");
+    expect(resolveExpensePolicy(runs[0].ops[0].header, [], "invoice")).toMatchObject({ dateDue: "2026-10-10", _expensePolicy: { dueDateRule: "issue-date" } });
+  });
+
+  it("keeps Datum splatnosti blank for a cash voucher and rejects a typed one instead of dropping it", async () => {
+    const { prepared, edit, submit, runs } = await setup({ cashAccount: "HP", sourcePaymentDate: "2026-10-10", roundingAmount: 0 }, undefined, "create_cash_voucher");
+    const wb = new ExcelJS.Workbook(); await wb.xlsx.readFile(prepared.workbookPath);
+    const column = REVIEW_COLUMNS.findIndex((c) => c.key === "targetDateDue") + 1;
+    expect(wb.getWorksheet("Doklady")!.getColumn(column).hidden).toBe(false);
+    expect(wb.getWorksheet("Doklady")!.getCell(3, column).value).toBeNull();
+    await edit({ targetDateDue: "2026-11-25" });
+    await expect(submit()).rejects.toMatchObject({ details: { invalid: [expect.objectContaining({ error: expect.stringContaining("pokladní doklad nemá v POHODĚ datum splatnosti") })] } });
+    expect(runs).toHaveLength(0);
   });
 
   it("does not resurrect a cleared source document number through the originalDocument alias", async () => {

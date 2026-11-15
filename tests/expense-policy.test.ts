@@ -302,6 +302,44 @@ describe("resolveExpensePolicy", () => {
     expect(policyError(() => resolveExpensePolicy({ ...card, cardSequence: 1, currency: "EUR", taxMode: "nonTax", classificationVAT: "" }, [], "invoice")).code).toBe("FOREIGN_THRESHOLD_NEEDS_CZK");
   });
 
+  describe("Datum splatnosti", () => {
+    it("writes the source due date, else the original issue date, for received invoices and commitments", () => {
+      const printed = resolveExpensePolicy({ ...taxable, dateDue: "2026-08-20" }, [], "invoice");
+      expect(printed).toMatchObject({ dateDue: "2026-08-20", sourceDueDate: "2026-08-20", _expensePolicy: { dueDateRule: "source", original: { dueDate: "2026-08-20" } } });
+      const missing = resolveExpensePolicy(taxable, [], "invoice");
+      expect(missing).toMatchObject({ dateDue: "2026-08-03", _expensePolicy: { dueDateRule: "issue-date" } });
+      expect(missing.sourceDueDate).toBeUndefined();
+      // A late document moves its VAT dates to day one of the period; the due date stays the original one.
+      const late = resolveExpensePolicy({ ...taxable, type: "commitment", vatPeriod: "2026-09" }, [], "invoice");
+      expect(late).toMatchObject({ date: "2026-09-01", dateDue: "2026-08-03", _expensePolicy: { lateSource: true, dueDateRule: "issue-date" } });
+      const card = resolveExpensePolicy({ ...taxable, type: "commitment", cardPayment: true, cardSequence: 3 }, [], "invoice");
+      expect(card).toMatchObject({ dateDue: "2026-08-03", originalDocument: "K3" });
+    });
+
+    it("is idempotent and never lets a derived due date become a source fact", () => {
+      const once = resolveExpensePolicy(taxable, [], "invoice");
+      const twice = resolveExpensePolicy({ ...once, sourceIssueDate: "2026-08-05" }, [], "invoice");
+      expect(twice).toMatchObject({ dateDue: "2026-08-05", _expensePolicy: { dueDateRule: "issue-date" } });
+      const printed = resolveExpensePolicy({ ...taxable, sourceDueDate: "2026-08-31", dateDue: "2026-08-10" }, [], "invoice");
+      expect(resolveExpensePolicy(printed, [], "invoice")).toMatchObject({ dateDue: "2026-08-31", sourceDueDate: "2026-08-31" });
+    });
+
+    it("never sends a due date for a cash expense (vch:voucherHeader has none) and rejects an invalid one", () => {
+      const cash = resolveExpensePolicy({ ...taxable, type: "expense", dateDue: "2026-08-20", datePayment: "2026-08-03", roundingAmount: 0 }, [], "voucher");
+      expect(cash.dateDue).toBeUndefined();
+      expect(cash).toMatchObject({ sourceDueDate: "2026-08-20", _expensePolicy: { dueDateRule: "not-supported" } });
+      expect(policyError(() => resolveExpensePolicy({ ...taxable, dateDue: "20.08.2026" }, [], "invoice"))).toMatchObject({ code: "DATE_INVALID", field: "sourceDueDate" });
+    });
+  });
+
+  it("routes a card receipt to Ostatní závazky, never Pokladna, while a card-paid received invoice stays an invoice", () => {
+    const cash = { ...taxable, type: "expense", datePayment: "2026-08-03", roundingAmount: 0 };
+    for (const card of [{ paymentType: "creditcard" }, { paymentType: "card" }, { cardPayment: true, cardSequence: 1 }]) {
+      expect(policyError(() => resolveExpensePolicy({ ...cash, ...card }, [], "voucher"))).toMatchObject({ code: "CARD_RECEIPT_IN_CASH", field: "paymentType", needsReview: true });
+    }
+    expect(resolveExpensePolicy({ ...taxable, paymentType: "creditcard" }, [], "invoice")).toMatchObject({ paymentType: "creditcard", originalDocument: "FA-1" });
+  });
+
   describe("received invoice variable symbol", () => {
     const received = { ...taxable, originalDocument: "FV-2026/0007" };
 

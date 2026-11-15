@@ -4,15 +4,22 @@ import { readFile } from 'node:fs/promises';
 import type { PohodaClient, WriteBatchOperation } from '../pohoda/client.js';
 import type { TransportOptions } from '../pohoda/transport.js';
 import { toMinorUnits, moneyValue, sumHomeCurrency, sumHomeCurrencyMinor, homeSummaryFields } from '../pohoda/money.js';
-import { SETTLEMENT_AGENDAS, findLiveAccountingUnit, sourceVatBuckets, statementMonthNumber, validateBankHeaderText, type AccountingMode, type SettlementAgenda } from '../pohoda/bank-settlement.js';
+import { SETTLEMENT_AGENDAS, composeLiquidationText, documentPurpose, findLiveAccountingUnit, followsLiquidationText, learnLiquidationConvention, partnerDifferences, partnerIdentityOf, sourceVatBuckets, statementMonthNumber, validateBankHeaderText, type AccountingMode, type LiquidationTextConvention, type SettlementAgenda } from '../pohoda/bank-settlement.js';
 import { recordsIn, scanExpenseAgendas } from './expense-import.js';
 import { loadStatementPdf, markSettledPayments, type StatementMark } from './bank-statement-pdf.js';
 
 type Fields = Record<string, any>;
+/**
+ * movement is the statement's own movement number: kept internally for matching,
+ * markers, PDF rows and reports, but never written to bnk:numberMovement.
+ * text is the statement's description; it is validated but never becomes the bank
+ * text, which always comes from the settled document.
+ */
 export type StatementPayment = {
   movement: number; date: string; amount: number | string; direction: 'expense' | 'receipt';
   variableSymbol?: string | undefined; text?: string | undefined; mark: StatementMark;
 };
+export type FieldDifference = { field: string; expected: string; stored: string };
 export type StatementInput = {
   databaseId: string; sourcePdfPath: string; statementPeriod: string; dateStatement: string;
   accountNumber?: string | undefined; bankCode?: string | undefined; iban?: string | undefined;
@@ -285,29 +292,43 @@ export class BankStatementService {
     const bankRows = snapshot.get('bank|') || [];
     const { documents, unknown, issues } = await this.classifyDocuments(snapshot, target);
     const documentIndex = new Map(documents.map(d => [key(d), d]));
-    const bankIndex = new Map<string, Fields[]>(), legacy: Fields[] = [];
-    for (const raw of bankRows) {
-      const h = header(raw);
-      if (Number(h.account?.id) !== Number(account.id) && text(h.account?.ids) !== text(account.ids)) continue;
-      if (!/^MCP-BANK:/m.test(text(h.intNote))) legacy.push(raw);
-      const indexKey = `${text(h.dateStatement).slice(0, 4)}|${text(h.statementNumber?.statementNumber)}|${Number(h.statementNumber?.numberMovement)}`;
-      const list = bankIndex.get(indexKey) || []; list.push(raw); bankIndex.set(indexKey, list);
+    // The unit's own generated liquidation text ("Úhrada FP c. <číslo>") is learned from its bank items.
+    const convention = learnLiquidationConvention(bankRows, [...documents, ...unknown]);
+    const accountRows = bankRows.filter(raw => { const h = header(raw); return Number(h.account?.id) === Number(account.id) || text(h.account?.ids) === text(account.ids); });
+    // Existing records are found by their per-movement marker. New records leave
+    // bnk:numberMovement blank; the positional index only catches legacy/manual
+    // records that still carry a movement number.
+    const byMarker = new Map<string, Fields[]>(), bySlot = new Map<string, Fields[]>();
+    for (const raw of accountRows) {
+      const h = header(raw), markers = new Set(text(h.intNote).split(/\r?\n/).map(line => /^(MCP-BANK:[0-9a-f]{32})\|/.exec(line)?.[1]).filter((m): m is string => !!m));
+      for (const m of markers) byMarker.set(m, [...(byMarker.get(m) || []), raw]);
+      const movement = text(h.statementNumber?.numberMovement);
+      if (movement) { const slot = `${text(h.dateStatement).slice(0, 4)}|${text(h.statementNumber?.statementNumber)}|${Number(movement)}`; bySlot.set(slot, [...(bySlot.get(slot) || []), raw]); }
     }
+    const expectedMarkers = new Map(input.payments.map(p => [p.movement, this.marker(input, p, account.id)]));
+    const claimed = new Set<number>();
+    for (const m of expectedMarkers.values()) for (const raw of byMarker.get(m) || []) claimed.add(Number(header(raw).id));
     const rows: Fields[] = [], fresh: StatementPayment[] = [];
     for (const payment of input.payments) {
-      const matches = bankIndex.get(`${input.statementPeriod.slice(0, 4)}|${statementNumber}|${payment.movement}`) || [];
-      if (matches.length > 1) throw new Error(`Movement ${payment.movement} has duplicate bank records; nothing was written.`);
-      if (!matches.length) {
-        // A manually entered or homebanking movement may use other numbering.
-        // Same facts without our marker must be reviewed, never duplicated.
-        const same = legacy.find(raw => this.sameMovementFacts(raw, input, payment));
+      const expectedMarker = expectedMarkers.get(payment.movement)!, hits = byMarker.get(expectedMarker) || [];
+      if (hits.length > 1) {
+        rows.push({ movement: payment.movement, status: 'needs_review', bankId: Number(header(hits[0]!).id), bankIds: hits.map(raw => Number(header(raw).id)), doNotRetry: true, reason: `Pohyb má ${hits.length} bankovní záznamy se stejnou značkou; nic se znovu nezapisuje.` });
+        continue;
+      }
+      if (!hits.length) {
+        const unclaimed = (raw: Fields) => !claimed.has(Number(header(raw).id));
+        const slot = (bySlot.get(`${input.statementPeriod.slice(0, 4)}|${statementNumber}|${payment.movement}`) || []).filter(unclaimed);
+        if (slot.length) { rows.push({ movement: payment.movement, status: 'needs_review', bankId: Number(header(slot[0]!).id), doNotRetry: true, reason: 'Bankovní pohyb se stejným číslem výpisu a pohybu již existuje; bez ověřené vazby jej nelze znovu zapsat.' }); continue; }
+        // A manually entered, homebanking or renumbered movement: same facts are
+        // reviewed, never duplicated (records claimed by this statement excluded).
+        const same = accountRows.find(raw => unclaimed(raw) && this.sameMovementFacts(raw, input, payment));
         if (same) rows.push({ movement: payment.movement, status: 'needs_review', bankId: Number(header(same).id), doNotRetry: true, reason: 'V účtu již existuje stejný bankovní pohyb bez ověřené vazby; nezapisuje se znovu.' });
         else fresh.push(payment);
         continue;
       }
-      const raw = matches[0]!, h = header(raw), expectedMarker = this.marker(input, payment, account.id);
-      const marker = text(h.intNote).split(/\r?\n/).find(line => line.startsWith(`${expectedMarker}|`));
-      if (!marker || !this.bankFactsMatch(raw, input, payment, account)) {
+      const raw = hits[0]!, h = header(raw);
+      const marker = text(h.intNote).split(/\r?\n/).find(line => line.startsWith(`${expectedMarker}|`))!;
+      if (!this.bankFactsMatch(raw, input, payment, account)) {
         rows.push({ movement: payment.movement, status: 'needs_review', bankId: Number(h.id), doNotRetry: true, reason: 'Bankovní pohyb již existuje; bez ověřené vazby jej nelze znovu zapsat.' });
         continue;
       }
@@ -320,6 +341,7 @@ export class BankStatementService {
       if ('problem' in split) { row.status = 'needs_review'; row.reason = split.problem; }
       else row.vat = split.buckets;
     }
+    for (const row of rows.filter(r => r.status === 'matched')) planBankFields(row, row.document.raw, convention);
     for (const issue of issues) {
       const movements = rows.filter(r => r.blockedBy?.some((b: DocumentRef) => b.agenda === issue.agenda && b.id === issue.id && b.number === issue.number)).map(r => r.movement);
       if (movements.length) issue.movements = movements;
@@ -330,7 +352,7 @@ export class BankStatementService {
     const diagnostics = publicDiagnostics(issues);
     if (!input.execute) {
       const review = rows.filter(r => r.status === 'needs_review').length;
-      return { ok: true, state: 'planned', accountingUnit, account: { id: account.id, ids: account.ids }, statementNumber, matched: toWrite.length, unmatched: rows.filter(r => r.status === 'unmatched').length, needsReview: review, rows: rows.map(publicRow), ...(diagnostics ? { diagnostics } : {}),
+      return { ok: true, state: 'planned', accountingUnit, account: { id: account.id, ids: account.ids }, statementNumber, bankTextConvention: convention, matched: toWrite.length, unmatched: rows.filter(r => r.status === 'unmatched').length, needsReview: review, rows: rows.map(publicRow), ...(diagnostics ? { diagnostics } : {}),
         message: `Náhled: likvidace zatím nebyla provedena. Zapsat lze jen ${toWrite.length} pohybů se stavem matched; nespárované a needs_review se nezapisují.${diagnostics ? ` ${diagnostics.unresolvedCount} dokladů má neověřený stav likvidace; blokují jen pohyby uvedené v blockedBy, ostatní plán zůstává platný.` : ''} execute=true jen v rámci pokynu uživatele zpracovat výpis a případného schválení hostitelem; zamítnutý zápis neobcházet.${unit.accountingMode ? '' : ` Typ účetní jednotky nelze ověřit (${unit.problem}); execute=true bude odmítnut před zápisem.`}` };
     }
     if (checksum(await readFile(input.sourcePdfPath)) !== pdf.sha256) throw new Error('Source statement changed; nothing was written.');
@@ -351,10 +373,14 @@ export class BankStatementService {
           const split = sourceVatBuckets(raw!, row.payment.amount);
           if ('problem' in split || JSON.stringify(split.buckets) !== JSON.stringify(row.vat)) throw new Error(`Rozpis DPH dokladu ${row.document.number} se změnil; zopakujte náhled. Nic nebylo zapsáno.`);
         }
+        // Text and partner come from the freshly read document, never from the statement.
+        if (!planBankFields(row, raw!, convention)) throw new Error(`${row.reason} Nic nebylo zapsáno.`);
       }
       const operations: Extract<WriteBatchOperation, { tool: 'create_bank_document' }>[] = toWrite.map(row => ({
         tool: 'create_bank_document', requestId: `movement-${row.movement}`, header: {
-          type: row.payment.direction, account: String(account.ids), statementPeriod: input.statementPeriod, numberMovement: String(row.movement), dateStatement: input.dateStatement, datePayment: row.payment.date, symVar: row.payment.variableSymbol || '', text: row.payment.text || `Úhrada ${row.document.number}`,
+          // No numberMovement: the movement field stays blank in POHODA; row.movement lives on in the marker.
+          type: row.payment.direction, account: String(account.ids), statementPeriod: input.statementPeriod, dateStatement: input.dateStatement, datePayment: row.payment.date, symVar: row.payment.variableSymbol || '', text: row.bankText,
+          ...(row.partner ? { partnerIdentity: row.partner } : {}),
           intNote: `${this.marker(input, row.payment, account.id)}|${key(row.document)}`,
           accountingMode: unit.accountingMode!, ...(input.currency !== 'CZK' ? { currency: input.currency } : {}), liquidations: [{ agenda: row.document.agenda, id: row.document.id, amount: row.payment.amount, ...(row.vat ? { vat: row.vat } : {}) }]
         }, items: []
@@ -384,11 +410,15 @@ export class BankStatementService {
           const expectedMarker = `${this.marker(input, row.payment, account.id)}|${key(row.document)}`;
           const state = raw && classifySettlementDocument(raw, row.document.agenda, true);
           const valid = state?.kind === 'known' && state.document.currency === input.currency && state.document.remaining === 0 && links.length > 0 && linkAmount === minor(row.payment.amount) && links.every(link => text(link.date) === row.payment.date) && !!bank && this.bankFactsMatch(bank, input, row.payment, account) && text(header(bank).intNote).split(/\r?\n/).includes(expectedMarker);
+          // Text, partner and the blank movement field are verified against the settled document as stored.
+          const differences = valid ? storedFieldDifferences(bank!, raw!, row, convention) : [];
+          if (differences.length) row.fieldDifferences = differences;
           // A record POHODA reported as failed (or found only by read-back) stays a review case even when verified.
-          const settledOk = valid && !row.responseConflict;
+          const settledOk = valid && !differences.length && !row.responseConflict;
           row.status = settledOk ? 'settled' : 'needs_review'; row.verified = valid; row.doNotRetry = !settledOk;
           if (!valid) row.reason = 'Likvidace nebo uložené údaje nebyly potvrzeny; platbu znovu nezapisovat.';
-          else if (!settledOk) row.reason = 'Bankovní záznam a likvidace jsou ověřeny čtením, ale odpověď POHODA hlásila chybu nebo chyběla; zkontrolujte importErrors, znovu nezapisovat.';
+          else if (differences.length) row.reason = `Likvidace je ověřena, ale uložené údaje bankovního záznamu se liší od likvidovaného dokladu (${differences.map(d => d.field).join(', ')}); viz fieldDifferences. Záznam se znovu nezapisuje ani nepřepisuje; opravte jej v POHODA ručně.`;
+          else if (row.responseConflict) row.reason = 'Bankovní záznam a likvidace jsou ověřeny čtením, ale odpověď POHODA hlásila chybu nebo chyběla; zkontrolujte importErrors, znovu nezapisovat.';
         }
       } catch (error) {
         for (const row of verify) { row.status = 'needs_review'; row.doNotRetry = true; row.reason = (error as Error).message; }
@@ -402,7 +432,7 @@ export class BankStatementService {
     try { annotated = await markSettledPayments(pdf, input.sourcePdfPath, output, settled.map(r => r.payment.mark)); }
     catch (error) { annotated = { error: (error as Error).message }; }
     const rejected = rows.filter(r => r.status === 'rejected').length, uncertain = rows.filter(r => r.status === 'write_uncertain').length;
-    return { ok: !rows.some(r => ['needs_review', 'write_uncertain', 'rejected'].includes(r.status)) && !annotated.error, state: 'processed', accountingUnit, account: { id: account.id, ids: account.ids }, statementNumber, settled: settled.length, unmatched: rows.filter(r => r.status === 'unmatched').length, needsReview: rows.filter(r => r.status === 'needs_review').length, rejected, writeUncertain: uncertain, createdIds: [...reportedIds], rows: rows.map(publicRow), ...(writeSummary ? { write: writeSummary } : {}), ...(diagnostics ? { diagnostics } : {}), annotatedPdf: annotated,
+    return { ok: !rows.some(r => ['needs_review', 'write_uncertain', 'rejected'].includes(r.status)) && !annotated.error, state: 'processed', accountingUnit, account: { id: account.id, ids: account.ids }, statementNumber, bankTextConvention: convention, settled: settled.length, unmatched: rows.filter(r => r.status === 'unmatched').length, needsReview: rows.filter(r => r.status === 'needs_review').length, rejected, writeUncertain: uncertain, createdIds: [...reportedIds], rows: rows.map(publicRow), ...(writeSummary ? { write: writeSummary } : {}), ...(diagnostics ? { diagnostics } : {}), annotatedPdf: annotated,
       ...(writeSummary ? { message: writeMessage(writeSummary, settled.length) } : {}) };
   }
   /** One fresh listAccountingUnit read per run; a missing, ambiguous or unknown type never defaults to double-entry. */
@@ -455,7 +485,7 @@ export class BankStatementService {
     try {
       const h = header(raw), foreign = raw.bankSummary?.foreignCurrency;
       const amount = foreign ? moneyValue(foreign.priceSum) : sumHomeCurrency(raw.bankSummary?.homeCurrency || {});
-      return (text(foreign?.currency?.ids) || 'CZK') === input.currency && minor(amount) === minor(payment.amount) && Number(h.account?.id) === Number(account.id) && text(h.statementNumber?.statementNumber) === statementMonthNumber(input.statementPeriod) && Number(h.statementNumber?.numberMovement) === payment.movement && text(h.dateStatement) === input.dateStatement && text(h.datePayment) === payment.date && text(h.bankType) === payment.direction && normalizeSymbol(h.symVar) === normalizeSymbol(payment.variableSymbol);
+      return (text(foreign?.currency?.ids) || 'CZK') === input.currency && minor(amount) === minor(payment.amount) && Number(h.account?.id) === Number(account.id) && text(h.statementNumber?.statementNumber) === statementMonthNumber(input.statementPeriod) && movementCompatible(h, payment) && text(h.dateStatement) === input.dateStatement && text(h.datePayment) === payment.date && text(h.bankType) === payment.direction && normalizeSymbol(h.symVar) === normalizeSymbol(payment.variableSymbol);
     } catch { return false; }
   }
   /** Account is pre-filtered. A missing VS on either side is treated as compatible. */
@@ -519,8 +549,54 @@ export class BankStatementService {
     return map;
   }
 }
+/** Blank (current rule) or, for a record written by an older version, the statement's own movement number. */
+function movementCompatible(h: Fields, payment: StatementPayment): boolean {
+  const stored = text(h.statementNumber?.numberMovement);
+  return stored === '' || (/^\d+$/.test(stored) && Number(stored) === payment.movement);
+}
+/**
+ * Bank text and partner of a matched row, from the settled document only:
+ * "<POHODA generated text>, <document purpose>" and its partnerIdentity (ID + inline).
+ * Returns false (row moved to needs_review) when the text cannot be composed.
+ */
+function planBankFields(row: Fields, raw: Fields, convention: LiquidationTextConvention): boolean {
+  const number = text(header(raw).number?.numberRequested) || row.document.number;
+  try {
+    if (!number) throw new Error('Likvidovaný doklad nemá číslo; text úhrady nelze sestavit.');
+    const { text: bankText, truncated } = composeLiquidationText(`${convention.prefixes[row.document.agenda as SettlementAgenda]}${number}`, documentPurpose(raw));
+    Object.assign(row, { bankText, textTruncated: truncated, partner: partnerIdentityOf(raw) });
+    return true;
+  } catch (error) {
+    Object.assign(row, { status: 'needs_review', reason: (error as Error).message, doNotRetry: false });
+    return false;
+  }
+}
+/**
+ * Stored text, partner and movement field of a verified bank record against the
+ * settled document. The text must follow the rule for that document (any
+ * generated-prefix variant, so older runs stay verifiable); a header that does
+ * not use POHODA's own generated item text is reported as a warning only.
+ */
+function storedFieldDifferences(bank: Fields, doc: Fields, row: Fields, convention: LiquidationTextConvention): FieldDifference[] {
+  const h = header(bank), diffs: FieldDifference[] = [], agenda = row.document.agenda as SettlementAgenda;
+  const movement = text(h.statementNumber?.numberMovement);
+  if (movement) diffs.push({ field: 'statementNumber.numberMovement', expected: '', stored: movement });
+  const number = text(header(doc).number?.numberRequested), purpose = documentPurpose(doc);
+  const items = asArray<Fields>(bank.bankDetail?.bankItem).map(i => text(i?.text)).filter(Boolean);
+  const generated = items.length && items.every(t => t === items[0]) ? items[0]! : '';
+  const compose = (head: string) => { try { return composeLiquidationText(head, purpose).text; } catch { return ''; } };
+  const fromPohoda = generated ? compose(generated) : '', predicted = number ? compose(`${convention.prefixes[agenda]}${number}`) : '';
+  const stored = text(h.text);
+  if (!followsLiquidationText(stored, agenda, number, purpose)) diffs.push({ field: 'text', expected: fromPohoda || predicted, stored });
+  else if (fromPohoda && stored !== fromPohoda) row.warnings = [...(row.warnings || []), `Text hlavičky nepoužívá text položky vygenerovaný POHODA ('${generated}'); typ, číslo i účel dokladu obsahuje.`];
+  diffs.push(...partnerDifferences(partnerIdentityOf(doc), partnerIdentityOf(bank)));
+  return diffs;
+}
 function publicRow(row: Fields): Fields {
-  return { movement: row.movement, status: row.status, reason: row.reason, bankId: row.bankId, verified: row.verified, doNotRetry: row.doNotRetry, document: row.document ? { id: row.document.id, agenda: row.document.agenda, number: row.document.number } : undefined, ...(row.blockedBy ? { blockedBy: row.blockedBy } : {}),
+  const partner = row.partner ? { ...(row.partner.id ? { id: row.partner.id } : {}), ...(row.partner.address?.company ? { company: row.partner.address.company } : {}) } : undefined;
+  return { movement: row.movement, status: row.status, reason: row.reason, bankId: row.bankId, ...(row.bankIds ? { bankIds: row.bankIds } : {}), verified: row.verified, doNotRetry: row.doNotRetry, document: row.document ? { id: row.document.id, agenda: row.document.agenda, number: row.document.number } : undefined, ...(row.blockedBy ? { blockedBy: row.blockedBy } : {}),
+    ...(row.bankText ? { bankText: row.bankText, ...(row.textTruncated ? { textTruncated: true } : {}), partner: partner ?? null } : {}),
+    ...(row.fieldDifferences ? { fieldDifferences: row.fieldDifferences } : {}), ...(row.warnings?.length ? { warnings: row.warnings } : {}),
     ...(row.writeOutcome ? { write: { outcome: row.writeOutcome, responseItemId: row.responseItemId, itemState: row.itemState, documentState: row.documentState, ...(row.importErrors?.length ? { importErrors: row.importErrors } : {}), ...(row.importWarnings?.length ? { importWarnings: row.importWarnings } : {}), ...(row.reconciliation ? { reconciliation: row.reconciliation } : {}) } } : {}) };
 }
 

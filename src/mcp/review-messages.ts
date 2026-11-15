@@ -59,6 +59,7 @@ const ISSUES: Record<string, (p: Params) => string> = {
   DATE_PERIOD_MISMATCH: () => "Datum DPH je mimo období DPH nebo před datem dokladu.",
   DATE_INVALID: () => "Neplatné datum.",
   CARD_NOT_COMMITMENT: () => "Číslování platby kartou (řada PK) platí jen pro Ostatní závazek.",
+  CARD_RECEIPT_IN_CASH: () => CARD_RECEIPT_IN_CASH_TEXT,
   CARD_PAYMENT_TYPE_CONFLICT: () => "Platba kartou odporuje Formě úhrady.",
   FOREIGN_TAXABLE_SPLIT_UNSUPPORTED: () => "Doklad v cizí měně s DPH nelze přesně zapsat souhrnnými částkami; vyžaduje ruční kontrolu.",
   FOREIGN_ROUNDING_UNSUPPORTED: () => "Doklad v cizí měně nemůže mít samostatné zaokrouhlení; vyžaduje ruční kontrolu.",
@@ -80,6 +81,9 @@ const NOTICES: Record<string, (p: Params) => string> = {
   FOREIGN_RATE_UNKNOWN: () => "Cizí měna: částku v CZK určí kurz nastavený v POHODĚ.",
   PARTNER_VAT_COUNTRY_DIFFERS: (p) => `DIČ ${p.dic ?? ""} je registrace ${p.dicCountry ?? ""}, země dodavatele je ${p.country ?? ""}; ověřte zemi a režim DPH.`
 };
+
+/** Client convention: a card receipt is an Ostatní závazek (Kartou, řada PK), never Pokladna. */
+export const CARD_RECEIPT_IN_CASH_TEXT = "Účtenka placená kartou patří do Ostatních závazků (Forma úhrady Kartou, číslování řady PK), ne do Pokladny jako hotovostní výdej. Připravte ji znovu jako Ostatní závazek; skutečná přijatá faktura placená kartou zůstává Přijatou fakturou.";
 
 const GENERIC_ISSUE = "Zdrojové údaje nejsou úplné nebo si odporují; ověřte doklad.";
 

@@ -60,6 +60,10 @@ describe("Canonical MCP operator guide", () => {
       expect(guide.defaultExpenseWorkflow.presentation).toContain("only values the import writes to POHODA");
       expect(guide.defaultExpenseWorkflow.presentation).toContain("never silently replaced");
       expect(guide.expensePolicy.numbering).toContain("paymentType");
+      expect(guide.expensePolicy.sourcePdfs).toContain("only its sourcePages");
+      expect(guide.defaultExpenseWorkflow.descriptions).toContain("PHM benzín + olej");
+      expect(guide.expensePolicy.dates).toContain("original issue date when no due date is printed");
+      expect(guide.defaultExpenseWorkflow.presentation).toContain("blank for cash vouchers");
       expect(tools.tools.find((tool) => tool.name === "prepare_expense_review")?.description).toContain("even if all documents already exist");
 
       // Bank statements: preview-first, no expense workbook, no approval bypass, data errors are not "wait for POHODA".
@@ -74,6 +78,9 @@ describe("Canonical MCP operator guide", () => {
       expect(guide.bankStatements.writeResults).toContain("write.causes");
       expect(guide.bankStatements.writeResults).toContain("still outstanding debt");
       expect(guide.bankStatements.accountingUnit).toContain("execute=true is refused before any write");
+      expect(guide.bankStatements.numbering).toContain("movement-number field in POHODA stays blank");
+      expect(guide.bankStatements.documentFields).toContain("Copy partnerIdentity from the matched document");
+      expect(guide.bankStatements.completion).toContain("far right");
       expect(guide.xmlTransport.batching).toContain("never bypasses expense review, bank-statement preview or a rejected/unapproved write");
       const bank = tools.tools.find((tool) => tool.name === "process_bank_statement")!;
       expect(bank.description).toContain("Always call execute=false first");

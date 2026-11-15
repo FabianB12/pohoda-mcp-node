@@ -1,5 +1,26 @@
-import { describe, expect, it } from "vitest";
+import { copyFile, mkdtemp, readdir, readFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { ExpenseImporter, RETRY_SCAN_PAGE_SIZE, classifyImportDetails, retryMarker, retryMarkersIn, withRetryMarker } from "../src/mcp/expense-import.js";
+import { PdfArchive } from "../src/pohoda/pdf-archive.js";
+import { fixturePages, sha256, writePagedPdf } from "./support/pdf-fixtures.js";
+
+let work: string;
+beforeEach(async () => { work = await mkdtemp(path.join(tmpdir(), "expense-import-")); });
+afterEach(async () => { await rm(work, { recursive: true, force: true }); });
+
+/** Real archive in a temporary root that records every stored source. */
+function recordingArchive() {
+  const real = new PdfArchive({ rootDir: path.join(work, "archive") });
+  const calls: string[] = [];
+  return { calls, root: real.rootDir, archive: async (source: string, context: any) => { calls.push(source); return real.archive(source, context); } };
+}
+async function archivedFiles(root: string): Promise<string[]> {
+  try { return (await readdir(root, { recursive: true, withFileTypes: true })).filter((e) => e.isFile()).map((e) => path.join(e.parentPath, e.name)).sort(); }
+  catch { return []; }
+}
+const linkOf = (doc: any): string => doc.attachments?.shortcut?.target;
 
 const result = (items: any[]) => ({ isOk: () => true, items, toArray: () => ({ state: "ok", items }) });
 const docHeader = (doc: any) => doc.invoiceHeader ?? doc.voucherHeader;
@@ -195,30 +216,79 @@ describe("Expense import orchestration", () => {
     expect(client.writes).toHaveLength(0);
   });
 
-  it("archives one multi-document PDF once and verifies both links", async () => {
-    const client = new FakeClient(); let copies = 0;
-    const archived = { path: 'C:\\Účetnictví\\PDF DOKLADY KLIENTŮ Z POHODY\\test.pdf', sha256: 'a'.repeat(64), bytes: 25, reused: false };
-    const archive = { archive: async () => { copies++; return archived; } };
+  it("links each document of a multi-document PDF to a PDF with only its own pages and keeps the original", async () => {
+    const client = new FakeClient();
+    const source = path.join(work, "in", "batch.pdf");
+    const original = await writePagedPdf(source, 5, "batch");
+    const archive = recordingArchive();
     const importer = new ExpenseImporter(client as any, null, archive);
-    const output = await importer.run([1, 2].map((page) => ({ tool: "create_invoice" as const, header: base({ sourceType: "pdf", sourcePdfPath: "/input/all.pdf", sourcePages: [page], sourceDocumentNumber: `DOC-${page}` }), items: [] })), "with-pdf", {});
+    const docs = [[1], [2, 4, 3], [5]];
+    const output = await importer.run(docs.map((pages, i) => ({ tool: "create_invoice" as const, header: base({ sourceType: "pdf", sourcePdfPath: source, sourcePages: pages, sourceDocumentNumber: `DOC-${i}` }), items: [] })), "with-pdf", {});
     expect(output.ok).toBe(true);
-    expect(copies).toBe(1);
-    expect(output.results.map((row: any) => row.pdf.path)).toEqual([archived.path, archived.path]);
-    expect(client.documents.every((row) => row.attachments.shortcut.target === archived.path)).toBe(true);
+    const links = client.documents.map(linkOf);
+    expect(new Set(links).size).toBe(3);
+    expect(await Promise.all(links.map(fixturePages))).toEqual([[1], [2, 3, 4], [5]]);
+    expect(output.results.map((row: any) => row.pdf.pageRanges)).toEqual(["1", "2-4", "5"]);
+    expect(output.results.every((row: any) => row.differences.length === 0 && row.pdf.source.sha256 === sha256(original))).toBe(true);
+    // The original is archived exactly once, byte-identical, beside the three subsets; the source is untouched.
+    const originalPath = output.results[0].pdf.source.path;
+    expect(archive.calls.filter((call) => call === source)).toHaveLength(1);
+    expect((await readFile(originalPath)).equals(original)).toBe(true);
+    expect((await readFile(source)).equals(original)).toBe(true);
+    expect(links).not.toContain(originalPath);
+    expect(await archivedFiles(archive.root)).toEqual([originalPath, ...links].sort());
+  });
+
+  it("links the original itself when a document covers every page", async () => {
+    const client = new FakeClient();
+    const source = path.join(work, "in", "single.pdf");
+    const original = await writePagedPdf(source, 2, "single");
+    const archive = recordingArchive();
+    const output = await new ExpenseImporter(client as any, null, archive).run([{ tool: "create_invoice", header: base({ sourceType: "pdf", sourcePdfPath: source, sourcePages: [2, 1] }), items: [] }], "whole", {});
+    expect(output.ok).toBe(true);
+    expect(output.results[0].pdf).toMatchObject({ wholeSource: true, pages: [1, 2], sha256: sha256(original) });
+    expect(linkOf(client.documents[0])).toBe(output.results[0].pdf.source.path);
+    expect(await archivedFiles(archive.root)).toEqual([output.results[0].pdf.source.path]);
+  });
+
+  it("stops before any archive or POHODA write when a document's pages exceed the source", async () => {
+    const client = new FakeClient();
+    const source = path.join(work, "in", "short.pdf");
+    await writePagedPdf(source, 3);
+    const archive = recordingArchive();
+    await expect(new ExpenseImporter(client as any, null, archive).run([
+      { tool: "create_invoice", header: base({ sourceType: "pdf", sourcePdfPath: source, sourcePages: [1], sourceDocumentNumber: "OK-1" }), items: [] },
+      { tool: "create_invoice", header: base({ sourceType: "pdf", sourcePdfPath: source, sourcePages: [3, 4], sourceDocumentNumber: "BAD-2" }), items: [] }
+    ], "out-of-range", {})).rejects.toMatchObject({ code: "PAGES_OUT_OF_RANGE", message: expect.stringMatching(/sourcePages 4 .*3 pages/) });
+    expect(archive.calls).toEqual([]);
+    expect(await archivedFiles(archive.root)).toEqual([]);
+    expect(client.writes).toHaveLength(0);
+  });
+
+  it("rejects an unreadable PDF before any archive or POHODA write", async () => {
+    const client = new FakeClient();
+    const source = path.join(work, "broken.pdf");
+    await import("node:fs/promises").then((fs) => fs.writeFile(source, "%PDF-1.7\nnot really a pdf"));
+    const archive = recordingArchive();
+    await expect(new ExpenseImporter(client as any, null, archive).run([{ tool: "create_invoice", header: base({ sourceType: "pdf", sourcePdfPath: source, sourcePages: [1] }), items: [] }], "broken", {}))
+      .rejects.toMatchObject({ code: "SOURCE_UNREADABLE" });
+    expect(archive.calls).toEqual([]);
+    expect(client.writes).toHaveLength(0);
   });
 
   it("reports a created document as incomplete when its PDF link was not stored", async () => {
     const client = new FakeClient(); client.omitPdfLink = true;
-    const archive = { archive: async () => ({ path: 'C:\\archive\\source.pdf', sha256: 'b'.repeat(64), bytes: 25, reused: false }) };
-    const output = await new ExpenseImporter(client as any, null, archive).run([{ tool: "create_invoice", header: base({ sourceType: "pdf", sourcePdfPath: "/input/a.pdf", sourcePages: [1] }), items: [] }], "missing-link", {});
+    const source = path.join(work, "a.pdf"); await writePagedPdf(source, 2);
+    const output = await new ExpenseImporter(client as any, null, recordingArchive()).run([{ tool: "create_invoice", header: base({ sourceType: "pdf", sourcePdfPath: source, sourcePages: [1] }), items: [] }], "missing-link", {});
     expect(output.results[0]).toMatchObject({ created: true, verified: false, doNotRetry: true });
     expect(output.results[0].differences.some((diff: any) => diff.field === "sourcePdfAttachment")).toBe(true);
   });
 
   it("does not create accounting records when copying the PDF fails", async () => {
     const client = new FakeClient();
+    const source = path.join(work, "a.pdf"); await writePagedPdf(source, 2);
     const archive = { archive: async () => { throw new Error("disk full"); } };
-    await expect(new ExpenseImporter(client as any, null, archive).run([{ tool: "create_invoice", header: base({ sourceType: "pdf", sourcePdfPath: "/input/a.pdf", sourcePages: [1] }), items: [] }], "copy-fail", {})).rejects.toThrow("disk full");
+    await expect(new ExpenseImporter(client as any, null, archive).run([{ tool: "create_invoice", header: base({ sourceType: "pdf", sourcePdfPath: source, sourcePages: [1] }), items: [] }], "copy-fail", {})).rejects.toThrow("disk full");
     expect(client.writes).toHaveLength(0);
   });
 
@@ -246,9 +316,9 @@ describe("Expense import orchestration", () => {
   it("keeps PDF identity stable when supplier IČO becomes known later", async () => {
     const client = new FakeClient();
     delete client.contact.addressbookHeader.identity.address.ico;
-    const archive = { archive: async () => ({ path: 'C:\\archive\\same.pdf', sha256: 'c'.repeat(64), bytes: 25, reused: true }) };
-    const importer = new ExpenseImporter(client as any, null, archive);
-    const header = base({ sourceType: "pdf", sourcePdfPath: "/input/a.pdf", sourcePages: [2, 1, 2], taxMode: "nonTax", classificationVAT: "", sourceDocumentNumber: "", originalDocument: "", partnerDic: "CZ25596641" });
+    const source = path.join(work, "a.pdf"); await writePagedPdf(source, 3);
+    const importer = new ExpenseImporter(client as any, null, recordingArchive());
+    const header = base({ sourceType: "pdf", sourcePdfPath: source, sourcePages: [2, 1, 2], taxMode: "nonTax", classificationVAT: "", sourceDocumentNumber: "", originalDocument: "", partnerDic: "CZ25596641" });
     const first = await importer.run([{ tool: "create_invoice", header, items: [] }], "no-ico", {});
     expect(first.ok).toBe(true);
     expect(client.documents[0].invoiceSummary.homeCurrency).toEqual({ priceNone: 1210 });
@@ -336,15 +406,40 @@ describe("Expense import orchestration", () => {
 
     it("does not duplicate a retried PDF import identified only by file hash and pages", async () => {
       const client = new FakeClient();
-      const archive = { archive: async () => ({ path: "C:\\archive\\scan.pdf", sha256: "d".repeat(64), bytes: 25, reused: true }) };
+      const source = path.join(work, "in", "scan.pdf"), renamed = path.join(work, "elsewhere", "renamed.pdf");
+      await writePagedPdf(source, 4, "scan");
+      await import("node:fs/promises").then((fs) => fs.mkdir(path.dirname(renamed), { recursive: true }));
+      await copyFile(source, renamed);
+      const archive = recordingArchive();
       const importer = new ExpenseImporter(client as any, null, archive);
-      const header = base({ sourceType: "pdf", sourcePdfPath: "/input/scan.pdf", sourcePages: [3], sourceDocumentNumber: "", originalDocument: "", taxMode: "nonTax", classificationVAT: "" });
+      const header = base({ sourceType: "pdf", sourcePdfPath: source, sourcePages: [3, 2], sourceDocumentNumber: "", originalDocument: "", taxMode: "nonTax", classificationVAT: "" });
       const first = await importer.run([{ tool: "create_invoice", header, items: [] }], "pdf-1", {});
-      const second = await importer.run([{ tool: "create_invoice", header: { ...header, sourcePdfPath: "/elsewhere/renamed.pdf" }, items: [] }], "pdf-2", {});
+      const stored = await archivedFiles(archive.root);
+      const second = await importer.run([{ tool: "create_invoice", header: { ...header, sourcePdfPath: renamed }, items: [] }], "pdf-2", {});
       expect(first.ok).toBe(true);
       expect(second.ok).toBe(true);
-      expect(second.results[0]).toMatchObject({ state: "already_exists", matchedBy: "retryMarker", retryMarker: markerOf(first) });
+      expect(second.results[0]).toMatchObject({ state: "already_exists", matchedBy: "retryMarker", retryMarker: markerOf(first), verified: true, differences: [] });
+      // Same original hash + pages: same marker, same deterministic subset, nothing new archived.
+      expect(second.results[0].pdf.path).toBe(first.results[0].pdf.path);
+      expect(await fixturePages(second.results[0].pdf.path)).toEqual([2, 3]);
+      expect(await archivedFiles(archive.root)).toEqual(stored);
       expect(client.documents).toHaveLength(1);
+    });
+
+    it("recognizes an earlier import that linked the whole source PDF without creating a duplicate", async () => {
+      const client = new FakeClient();
+      const source = path.join(work, "legacy.pdf");
+      await writePagedPdf(source, 3, "legacy");
+      const importer = new ExpenseImporter(client as any, null, recordingArchive());
+      const header = base({ sourceType: "pdf", sourcePdfPath: source, sourcePages: [2] });
+      const first = await importer.run([{ tool: "create_invoice", header, items: [] }], "legacy-1", {});
+      // Imports before per-document PDFs stored the same marker but linked the whole original.
+      client.documents[0].attachments.shortcut.target = first.results[0].pdf.source.path;
+      const second = await importer.run([{ tool: "create_invoice", header, items: [] }], "legacy-2", {});
+      expect(client.documents).toHaveLength(1);
+      expect(second.results[0]).toMatchObject({ state: "already_exists", created: false, verified: true, ok: false, differences: [], doNotRetry: true,
+        reviewRequired: [{ code: "PDF_LINK_FULL_SOURCE", documentPdf: first.results[0].pdf.path, linked: [first.results[0].pdf.source.path] }] });
+      expect(second.state).toBe("needs_review");
     });
 
     it("ignores unrelated records with near-miss markers, foreign systems or other suppliers", async () => {
