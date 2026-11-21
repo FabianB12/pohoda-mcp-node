@@ -13,6 +13,7 @@ export type PreparePdfPagesOptions = {
   jpegQuality?: number | undefined;
   firstPage?: number | undefined;
   lastPage?: number | undefined;
+  pages?: number[] | undefined;
   maxPages?: number | undefined;
   maxFileMb?: number | undefined;
   concurrency?: number | undefined;
@@ -83,8 +84,10 @@ export async function preparePdfPages(options: PreparePdfPagesOptions): Promise<
   let document: Awaited<typeof loadingTask.promise> | undefined;
   try {
     document = await loadingTask.promise;
-    const firstPage = options.firstPage ?? 1;
-    const lastPage = options.lastPage && options.lastPage > 0 ? options.lastPage : document.numPages;
+    const explicit = options.pages?.length ? [...new Set(options.pages)].sort((a, b) => a - b) : undefined;
+    if (explicit?.some(page => !Number.isInteger(page) || page < 1 || page > document!.numPages)) throw new Error("pages must contain existing positive PDF page numbers.");
+    const firstPage = explicit?.[0] ?? options.firstPage ?? 1;
+    const lastPage = explicit?.at(-1) ?? (options.lastPage && options.lastPage > 0 ? options.lastPage : document.numPages);
     if (firstPage > document.numPages) {
       throw new Error(`firstPage ${firstPage} exceeds the PDF page count (${document.numPages}).`);
     }
@@ -95,7 +98,8 @@ export async function preparePdfPages(options: PreparePdfPagesOptions): Promise<
       throw new Error("lastPage must be greater than or equal to firstPage.");
     }
 
-    const selectedPageCount = lastPage - firstPage + 1;
+    const pageNumbers = explicit ?? Array.from({ length: lastPage - firstPage + 1 }, (_, index) => firstPage + index);
+    const selectedPageCount = pageNumbers.length;
     const maxPages = options.maxPages ?? DEFAULT_MAX_PAGES;
     if (selectedPageCount > maxPages) {
       throw new Error(
@@ -114,7 +118,8 @@ export async function preparePdfPages(options: PreparePdfPagesOptions): Promise<
       dpi,
       jpegQuality,
       firstPage,
-      lastPage
+      lastPage,
+      pages: explicit
     })).digest("hex").slice(0, 16);
     const safeName = sanitizeName(basename(pdfPath, extname(pdfPath)));
     const outputRoot = resolve(options.outputDirectory
@@ -143,7 +148,6 @@ export async function preparePdfPages(options: PreparePdfPagesOptions): Promise<
 
     const render = (async (): Promise<PreparedPdfPages> => {
       await mkdir(outputDirectory, { recursive: true });
-      const pageNumbers = Array.from({ length: selectedPageCount }, (_, index) => firstPage + index);
       const pages = await mapConcurrent(pageNumbers, options.concurrency ?? DEFAULT_CONCURRENCY, async (pageNumber) => {
         const page = await document!.getPage(pageNumber);
         try {

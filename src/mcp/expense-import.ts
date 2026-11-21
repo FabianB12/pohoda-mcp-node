@@ -4,6 +4,8 @@ import type { TransportOptions } from "../pohoda/transport.js";
 import { PdfArchive, PdfDocumentArchiver, normalizeSourcePages, shortcutTargetsMatch, verifyPdfAttachmentLink } from "../pohoda/pdf-archive.js";
 import { resolveExpensePolicy } from "../pohoda/expense-policy.js";
 import { toMinorUnits, sumHomeCurrency, moneyValue } from "../pohoda/money.js";
+import { classifyExpenseWriteResponse } from "./expense-write-response.js";
+import { readAddressBook, resolveSupplier, supplierEvidence, SupplierIdentityError, dicKey, type AddressBookLookup, type AddressRecord } from "./supplier-identity.js";
 import { CzechRegistryClient, companyKey, classifyVat, mapAresAddress, matchSubjects, normalizeDic, normalizeIco, adisCandidates, decideNonPayerTreatment, type AresSubject } from "../registry/czech-registry.js";
 
 type Fields = Record<string, any>;
@@ -242,11 +244,17 @@ export class ExpenseImporter {
     const tail = previous.catch(() => {}).then(() => gate);
     queues.set(key, tail);
     await previous.catch(() => {});
-    try { return await this.execute(operations, dataPackId, target); }
+    const progress = { writeAttempted: false };
+    try { return await this.execute(operations, dataPackId, target, progress); }
+    catch (error) {
+      const failure = error instanceof Error && Object.isExtensible(error) ? error : new Error(String(error));
+      if (!("writeAttempted" in failure)) Object.assign(failure, { writeAttempted: progress.writeAttempted });
+      throw failure;
+    }
     finally { release(); if (queues.get(key) === tail) queues.delete(key); }
   }
 
-  private async execute(input: WriteBatchOperation[], dataPackId: string, target: TransportOptions): Promise<Fields> {
+  private async execute(input: WriteBatchOperation[], dataPackId: string, target: TransportOptions, progress: { writeAttempted: boolean }): Promise<Fields> {
     const ops = structuredClone(input);
     const expenses = ops.filter(isExpenseOperation);
     for (const op of expenses) {
@@ -261,7 +269,6 @@ export class ExpenseImporter {
     }
     const warnings: Fields[] = [];
     const suppliedContacts = new Map<WriteBatchOperation, ExpenseOperation>();
-    const contacts = new Map<string, Fields>();
     for (const op of expenses) {
       if (op.tool === "create_other_liability") op.header.type = "commitment";
       const h = op.header;
@@ -307,38 +314,60 @@ export class ExpenseImporter {
         h._suppliedAddress = { ...(h._suppliedAddress ?? {}), ...candidate.data };
         for (const [field, value] of Object.entries({ partnerName: candidate.data.company, partnerDic: candidate.data.dic, partnerStreet: candidate.data.street, partnerCity: candidate.data.city, partnerZip: candidate.data.zip, partnerCountry: candidate.data.country })) if (!h[field]) h[field] = value;
       }
-      const contactKey = Number(h.partnerId) > 0 ? `id:${h.partnerId}` : h.partnerIco ? `ico:${text(h.partnerIco).replace(/\s/g, "")}` : h.partnerDic ? `dic:${text(h.partnerDic).toUpperCase()}` : "";
-      if (!contactKey) throw new Error("Supplier requires an address-book ID, IČO or DIČ; ARES did not uniquely identify the supplier.");
-      if (!h.partnerName && !h.partnerId) throw new Error("Supplier name is required before creating a contact.");
-      const prior = [...contacts.values()].find((plan) => plan.key === contactKey
-        || (h.partnerIco && plan.header.partnerIco === h.partnerIco)
-        || (h.partnerDic && normalizeDic(plan.header.partnerDic)?.normalized === normalizeDic(h.partnerDic)?.normalized)
-        || (Number(h.partnerId) > 0 && Number(plan.header.partnerId) === Number(h.partnerId)));
-      if (prior) {
-        assertSameSupplier(prior.header, h);
-        for (const field of ["partnerIco", "partnerDic", "partnerId", "partnerName", "partnerStreet", "partnerCity", "partnerZip", "partnerCountry"]) {
-          if (!prior.header[field] && h[field]) prior.header[field] = h[field];
-          if (!h[field] && prior.header[field]) h[field] = prior.header[field];
+    }
+    // Supplier identity, before any write: one batched address-book read for the whole
+    // batch. A caller's partnerId is only a claim and must match the document's IČO/DIČ
+    // (else exact name) on a real record; IČO/DIČ resolving to several records is never
+    // picked. Every affected row is reported together; nothing is written.
+    const contacts = new Map<string, Fields>();
+    if (expenses.length) {
+      let book: AddressBookLookup;
+      try { book = await readAddressBook(this.client, expenses.map((op) => op.header), target); }
+      catch { throw Object.assign(new Error("Supplier lookup failed; no records were created."), { writeAttempted: false }); }
+      const issues: Fields[] = [];
+      expenses.forEach((op, index) => {
+        const h = op.header, rowId = text(op.requestId) || `#${index + 1}`;
+        const resolution = resolveSupplier(h, book);
+        if (resolution.status === "verified" || resolution.status === "resolved") {
+          h._addressRecord = resolution.record;
+          h.partnerId = resolution.record!.id;
+        } else if (resolution.status === "new") {
+          delete h.partnerId;
+          if (h._requireExistingSupplier) issues.push({ ...supplierEvidence(rowId, h, resolution), code: "SUPPLIER_NOT_FOUND", message: "Dodavatel není v adresáři POHODY a zakládání adres je vypnuto (createAddress=false)." });
+          else if (!h.partnerName) issues.push({ ...supplierEvidence(rowId, h, resolution), code: "SUPPLIER_NAME_REQUIRED", message: "Dodavatel není v adresáři POHODY a pro založení adresy chybí jeho název." });
+        } else issues.push(supplierEvidence(rowId, h, resolution));
+      });
+      if (issues.length) throw new SupplierIdentityError(issues);
+      for (const op of expenses) {
+        const h = op.header;
+        const contactKey = h._addressRecord ? `id:${h._addressRecord.id}` : h.partnerIco ? `ico:${h.partnerIco}` : `dic:${dicKey(h.partnerDic)}`;
+        // New contacts sharing IČO or DIČ become one contact; existing records are keyed by their verified ID.
+        const prior = contacts.get(contactKey) ?? (h._addressRecord ? undefined : [...contacts.values()].find((plan) => !plan.record
+          && ((h.partnerIco && plan.header.partnerIco === h.partnerIco) || (h.partnerDic && dicKey(plan.header.partnerDic) === dicKey(h.partnerDic)))));
+        if (prior) {
+          assertSameSupplier(prior.header, h);
+          for (const field of ["partnerIco", "partnerDic", "partnerName", "partnerStreet", "partnerCity", "partnerZip", "partnerCountry"]) {
+            if (!prior.header[field] && h[field]) prior.header[field] = h[field];
+            if (!h[field] && prior.header[field]) h[field] = prior.header[field];
+          }
+          h._contactKey = prior.key;
+        } else {
+          contacts.set(contactKey, { header: h, key: contactKey, record: h._addressRecord });
+          h._contactKey = contactKey;
         }
-        h._contactKey = prior.key;
-      } else {
-        contacts.set(contactKey, { header: h, key: contactKey });
-        h._contactKey = contactKey;
       }
     }
-    // A later row can bridge two earlier incomplete identities (IČO-only and
+    // A later row can bridge two earlier incomplete new identities (IČO-only and
     // DIČ-only). Merge the whole connected set before creating either contact.
     let merged = true;
     while (merged) {
       merged = false;
-      const plans = [...contacts.values()];
+      const plans = [...contacts.values()].filter((plan) => !plan.record);
       for (let a = 0; a < plans.length && !merged; a++) for (let b = a + 1; b < plans.length; b++) {
         const left = plans[a]!, right = plans[b]!, x = left.header, y = right.header;
-        if (!((x.partnerIco && x.partnerIco === y.partnerIco)
-          || (x.partnerDic && normalizeDic(x.partnerDic)?.normalized === normalizeDic(y.partnerDic)?.normalized)
-          || (Number(x.partnerId) > 0 && Number(x.partnerId) === Number(y.partnerId)))) continue;
+        if (!((x.partnerIco && x.partnerIco === y.partnerIco) || (x.partnerDic && dicKey(x.partnerDic) === dicKey(y.partnerDic)))) continue;
         assertSameSupplier(x, y);
-        for (const field of ["partnerIco", "partnerDic", "partnerId", "partnerName", "partnerStreet", "partnerCity", "partnerZip", "partnerCountry"]) if (!x[field] && y[field]) x[field] = y[field];
+        for (const field of ["partnerIco", "partnerDic", "partnerName", "partnerStreet", "partnerCity", "partnerZip", "partnerCountry"]) if (!x[field] && y[field]) x[field] = y[field];
         x._suppliedAddress = { ...(y._suppliedAddress ?? {}), ...(x._suppliedAddress ?? {}) };
         for (const op of expenses) if (op.header._contactKey === right.key) op.header._contactKey = left.key;
         contacts.delete(right.key);
@@ -346,49 +375,28 @@ export class ExpenseImporter {
         break;
       }
     }
-    for (const op of expenses) {
-      const canonical = contacts.get(op.header._contactKey)!.header;
-      for (const field of ["partnerIco", "partnerDic", "partnerId", "partnerName"]) if (!op.header[field] && canonical[field]) op.header[field] = canonical[field];
-    }
     const contactPlans = [...contacts.values()];
-    if (contactPlans.length) {
-      const response = await this.client.listRecordsBatch(contactPlans.map(({ header: h }) => ({ agenda: "addressbook", filter: h.partnerId ? { id: h.partnerId } : h.partnerIco ? { ico: h.partnerIco } : { dic: h.partnerDic }, options: { count: 100 } })), "", target);
-      if (!response.isOk()) throw new Error("Supplier lookup failed; no records were created.");
-      for (let index = 0; index < response.items.length; index++) {
-        const plan = contactPlans[index]; if (!plan) continue;
-        let rows = recordsIn(response.items[index]!.data);
-        if (!rows.length && plan.header.partnerIco && plan.header.partnerDic) {
-          const fallback = await this.client.listRecords("addressbook", { dic: plan.header.partnerDic }, "", { ...target, count: 100 });
-          if (!fallback.isOk()) throw new Error("Supplier DIČ lookup failed; no records were created.");
-          rows = fallback.items.flatMap((item) => recordsIn(item.data));
-        }
-        if (rows.length > 1) throw new Error(`Ambiguous supplier ${plan.key}: ${rows.length} address-book matches.`);
-        if (rows.length) {
-          const row = rows[0]!, h = headerOf(row), addr = addressOf(row), expected = plan.header;
-          const storedIco = normalizeIco(addr.ico);
-          const sourceIco = normalizeIco(expected.partnerIco);
-          if (expected.partnerIco && addr.ico && (storedIco.ok ? storedIco.ico : text(addr.ico)) !== (sourceIco.ok ? sourceIco.ico : text(expected.partnerIco))) throw new Error("Existing supplier IČO conflicts with source.");
-          if (expected.partnerDic && addr.dic && normalizeDic(addr.dic)?.normalized !== normalizeDic(expected.partnerDic)?.normalized) throw new Error("Existing supplier DIČ conflicts with source.");
-          plan.storedHeader = h;
-          plan.id = Number(h.id); plan.isSupplier = text(h.p1) === "true" || h.p1 === true;
-          plan.patch = plan.isSupplier ? {} : { p1: true };
-          for (const [field, source] of Object.entries({ company: "partnerName", ico: "partnerIco", dic: "partnerDic", street: "partnerStreet", city: "partnerCity", zip: "partnerZip" })) {
-            if (!addr[field] && expected[source]) plan.patch[field] = expected[source];
-            if (!expected[source] && addr[field]) expected[source] = field === "ico" && storedIco.ok ? storedIco.ico : addr[field];
-          }
-          for (const field of ["phone", "email"]) {
-            if (!h[field] && expected._suppliedAddress?.[field]) plan.patch[field] = expected._suppliedAddress[field];
-          }
-          if (!plan.id) throw new Error("Supplier export is missing its numeric ID.");
-        } else if (plan.header.partnerId) throw new Error(`Supplier ID ${plan.header.partnerId} was not found.`);
-        else if (plan.header._requireExistingSupplier) throw new Error("Supplier not found and createAddress=false; no records were created.");
+    for (const plan of contactPlans) {
+      const record: AddressRecord | undefined = plan.record;
+      if (!record) continue;
+      const h = record.header, addr = (h.identity ?? {}).address ?? {}, expected = plan.header;
+      const storedIco = normalizeIco(addr.ico);
+      plan.storedHeader = h;
+      plan.id = record.id; plan.isSupplier = record.isSupplier;
+      plan.patch = plan.isSupplier ? {} : { p1: true };
+      // Only empty fields of the verified record are completed; its identity is never overwritten.
+      for (const [field, source] of Object.entries({ company: "partnerName", ico: "partnerIco", dic: "partnerDic", street: "partnerStreet", city: "partnerCity", zip: "partnerZip" })) {
+        if (!addr[field] && expected[source]) plan.patch[field] = expected[source];
+        if (!expected[source] && addr[field]) expected[source] = field === "ico" && storedIco.ok ? storedIco.ico : addr[field];
       }
-      for (const op of expenses) {
-        const plan = contacts.get(op.header._contactKey)!;
-        for (const field of ["partnerIco", "partnerDic", "partnerName", "partnerStreet", "partnerCity", "partnerZip"]) if (!op.header[field] && plan.header[field]) op.header[field] = plan.header[field];
-        op.header._supplierIdentity = op.header.partnerIco ? `ico:${op.header.partnerIco}` : op.header.partnerDic ? `dic:${normalizeDic(op.header.partnerDic)?.normalized || op.header.partnerDic}` : `id:${plan.id}`;
+      for (const field of ["phone", "email"]) {
+        if (!h[field] && expected._suppliedAddress?.[field]) plan.patch[field] = expected._suppliedAddress[field];
       }
-      if (response.items.length !== contactPlans.length) throw new Error("Incomplete supplier lookup; no records were created.");
+    }
+    for (const op of expenses) {
+      const plan = contacts.get(op.header._contactKey)!;
+      for (const field of ["partnerIco", "partnerDic", "partnerName", "partnerStreet", "partnerCity", "partnerZip"]) if (!op.header[field] && plan.header[field]) op.header[field] = plan.header[field];
+      op.header._supplierIdentity = op.header.partnerIco ? `ico:${op.header.partnerIco}` : op.header.partnerDic ? `dic:${normalizeDic(op.header.partnerDic)?.normalized || op.header.partnerDic}` : `id:${plan.id}`;
     }
 
     // Reconcile explicitly supplied contacts again after resolving IDs/ARES aliases.
@@ -554,6 +562,7 @@ export class ExpenseImporter {
     const stableId = dataPackId || `expense-${createHash("sha256").update(JSON.stringify(expenses.map((op) => op.header.extId))).digest("hex").slice(0, 32)}`;
     const subsetId = (kind: string, payload: unknown) => `${stableId.slice(0, 32)}-${kind}-${createHash("sha256").update(JSON.stringify(payload)).digest("hex").slice(0, 16)}`;
     if (setup.length) {
+      progress.writeAttempted = true;
       const response = await this.client.writeBatch(setup, subsetId("contacts", setup), target);
       if (!response.isOk()) return { ok: false, state: "supplier_failed", database: target.databaseOverride || this.client.getDatabase(), dataPackId: stableId, warnings, supplierResponse: response.toArray(), results: [], message: "Supplier setup failed; no expense documents were submitted." };
       const read = await this.client.listRecordsBatch(contactPlans.map(({ header: h }) => ({ agenda: "addressbook", filter: h.partnerId ? { id: h.partnerId } : h.partnerIco ? { ico: h.partnerIco } : { dic: h.partnerDic }, options: { count: 2 } })), "", target);
@@ -566,9 +575,11 @@ export class ExpenseImporter {
     }
     for (const op of expenses) op.header.partnerId = contacts.get(op.header._contactKey)!.id;
     const pending = ops.filter((op) => !existing.has(op) && !suppliedContacts.has(op));
+    const pendingPackId = subsetId("docs", pending.map((op) => isExpenseOperation(op) ? op.header.extId : op));
     let response;
     try {
-      response = pending.length ? await this.client.writeBatch(pending, subsetId("docs", pending.map((op) => isExpenseOperation(op) ? op.header.extId : op)), target) : undefined;
+      if (pending.length) progress.writeAttempted = true;
+      response = pending.length ? await this.client.writeBatch(pending, pendingPackId, target) : undefined;
     } catch {
       return { ok: false, state: "write_uncertain", database: target.databaseOverride || this.client.getDatabase(), dataPackId: stableId, warnings,
         results: ops.map((op) => ({ requestId: op.requestId, tool: op.tool, ok: false, created: "unknown", doNotRetry: true,
@@ -576,6 +587,7 @@ export class ExpenseImporter {
         message: "POHODA did not return a complete write response. Inspect POHODA for these retry markers (intNote) before resubmitting; a resubmission of the same documents first scans for the markers and does not recreate documents it finds." };
     }
     const output = response?.toArray();
+    const outcomes = classifyExpenseWriteResponse(response, pendingPackId, pending.length);
     const results: Fields[] = [];
     const verifyRequests: Array<{ op: ExpenseOperation; id: number; result: Fields }> = [];
     let offset = 0;
@@ -591,17 +603,21 @@ export class ExpenseImporter {
         results.push({ requestId: op.requestId, tool: op.tool, registry: op.header._registry, pdf: pdfResult(op.header), ok: diffs.length === 0 && legacy.length === 0, state: "already_exists", created: false, id: headerOf(old).id, matchedBy: matchedBy.get(op), retryMarker: op.header._retryMarker, verified: diffs.length === 0, differences: diffs, ...(legacy.length ? { reviewRequired: legacy } : {}), doNotRetry: true });
         continue;
       }
-      const item = output?.items[offset++];
-      const result: Fields = { requestId: op.requestId, tool: op.tool, ...(isExpenseOperation(op) ? { registry: op.header._registry, pdf: pdfResult(op.header) } : {}), ok: item?.state === "ok" && response?.items[offset - 1]?.isOk(), state: item?.state ?? "missing", producedDetails: item?.data.producedDetails, importDetails: item?.data.importDetails };
+      const outcome = outcomes[offset++]!;
+      const item = outcome.item;
+      const result: Fields = { requestId: op.requestId, tool: op.tool, ...(isExpenseOperation(op) ? { registry: op.header._registry, pdf: pdfResult(op.header) } : {}), ok: outcome.outcome === "created", outcome: outcome.outcome, responseItemId: outcome.expectedItemId, state: item?.state ?? (outcome.outcome === "rejected" ? "error" : "missing"), producedDetails: item?.data.producedDetails, importDetails: item?.data.importDetails };
       results.push(result);
       if (isExpenseOperation(op)) {
-        const id = Number(item?.data.producedDetails?.id);
-        result.created = Boolean(id); result.id = id || undefined; result.doNotRetry = true; result.retryMarker = op.header._retryMarker;
+        const id = outcome.id;
+        const rejected = outcome.outcome === "rejected";
+        result.created = id ? true : rejected ? false : "unknown"; result.id = id; result.doNotRetry = !rejected; result.retryMarker = op.header._retryMarker;
         const details = classifyImportDetails(item?.data);
         if (details.warnings.length) result.importWarnings = details.warnings;
         if (details.review.length) { result.reviewRequired = details.review; result.ok = false; }
         if (id) verifyRequests.push({ op, id, result });
-        else { result.ok = false; result.verified = false; result.message = "No created ID available; inspect import response before retrying."; }
+        else { result.ok = false; result.verified = false; result.message = rejected
+          ? "POHODA doklad odmítla a nevrátila ID. Po opravě, nové kontrole sešitu a novém výslovném pokynu lze zopakovat oficiální import."
+          : "POHODA nevrátila použitelný výsledek pro tento doklad. Mohl vzniknout; nejprve ověřte retryMarker, zápis neopakujte naslepo."; }
       }
     }
     if (verifyRequests.length) {
@@ -618,7 +634,7 @@ export class ExpenseImporter {
         });
       } catch (error) { for (const { result } of verifyRequests) { result.ok = false; result.verified = false; result.message = `Created; verification failed: ${(error as Error).message}. Do not re-import.`; } }
     }
-    return { ok: results.every((r) => r.ok), state: results.every((r) => r.ok) ? "ok" : "needs_review", database: target.databaseOverride || this.client.getDatabase(), dataPackId: stableId, operationCount: ops.length, transport: output?.transport, warnings, results };
+    return { ok: results.every((r) => r.ok), state: results.some((r) => r.created === "unknown") ? "write_uncertain" : results.every((r) => r.ok) ? "ok" : "needs_review", database: target.databaseOverride || this.client.getDatabase(), dataPackId: stableId, operationCount: ops.length, transport: output?.transport, warnings, results };
   }
 
   /**

@@ -89,11 +89,38 @@ class FakeClient {
       if (this.wrappedVAT) home.priceHighVAT = { "#text": home.priceHighVAT, rate: "21" };
       this.documents.push({ [voucher ? "voucherHeader" : "invoiceHeader"]: { ...h, id, number: { numberRequested: h.number }, extId: { ids: h.extId, exSystemName: h.extSystemName }, partnerIdentity: { id: h.partnerId, address: this.contact.addressbookHeader.identity.address }, classificationVAT: { ids: h.classificationVAT }, paymentType: h.paymentType ? { paymentType: h.paymentType } : undefined }, [voucher ? "voucherSummary" : "invoiceSummary"]: { homeCurrency: home }, attachments: !this.omitPdfLink && h.sourcePdfArchivePath ? { shortcut: { target: h.sourcePdfArchivePath } } : undefined });
       return item({ producedDetails: { id: String(id) }, ...(this.importDetails ? { importDetails: this.importDetails } : {}) });
-    }));
+    }).map((response, index) => ({ ...response, id: `${packId}-${index + 1}` })));
   }
 }
 
 describe("Expense import orchestration", () => {
+  it("maps reordered write responses back to the correct source rows", async () => {
+    const client = new FakeClient();
+    const write = client.writeBatch.bind(client);
+    client.writeBatch = async (ops, packId) => {
+      const response = await write(ops, packId);
+      return result([...response.items].reverse());
+    };
+    const operations = ["A", "B", "C"].map(source => ({ tool: "create_invoice" as const, requestId: source, header: base({ sourceDocumentNumber: source }), items: [] }));
+    const out = await new ExpenseImporter(client as any, null).run(operations, "reordered", {});
+    expect(out.ok).toBe(true);
+    expect(out.results.map((row: any) => [row.requestId, row.id, row.verified])).toEqual([["A", 1, true], ["B", 2, true], ["C", 3, true]]);
+  });
+
+  it("keeps a missing middle response uncertain without assigning the next row's ID", async () => {
+    const client = new FakeClient();
+    const write = client.writeBatch.bind(client);
+    client.writeBatch = async (ops, packId) => {
+      const response = await write(ops, packId);
+      return result(response.items.filter(row => !row.id.endsWith("-2")));
+    };
+    const operations = ["A", "B", "C"].map(source => ({ tool: "create_invoice" as const, requestId: source, header: base({ sourceDocumentNumber: source }), items: [] }));
+    const out = await new ExpenseImporter(client as any, null).run(operations, "missing-middle", {});
+    expect(out.state).toBe("write_uncertain");
+    expect(out.results.map((row: any) => [row.requestId, row.id, row.created])).toEqual([["A", 1, true], ["B", undefined, "unknown"], ["C", 3, true]]);
+    expect(client.documents).toHaveLength(3);
+  });
+
   it("normalizes a late invoice and verifies the stored result", async () => {
     const client = new FakeClient();
     const importer = new ExpenseImporter(client as any, null);

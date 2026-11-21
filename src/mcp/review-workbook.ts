@@ -79,6 +79,11 @@ export type ReviewColumn = {
 const col = (key: string, label: string, kind: ReviewColumnKind, group: ColumnGroup, width: number, note?: string): ReviewColumn =>
   note === undefined ? { key, label, kind, group, width } : { key, label, kind, group, width, note };
 
+/** Read-only verified address-book ID (see expense-review SUPPLIER_ID_FIELD). */
+export const SUPPLIER_ID_LABEL = "ID adresy v POHODĚ (jen pro kontrolu)";
+/** Data columns that may be absent (read-only; older or user-trimmed workbooks). */
+const OPTIONAL_DATA_COLUMNS = new Set(["partnerId"]);
+
 const TARGET_NOTE = "Hodnota, kterou import zapíše do POHODY (podle sdílených pravidel importu). Úprava se při kontrole převede na zdrojový údaj a znovu přepočítá; pokud ji pravidla nedovolí (např. pozdní doklad, číslování PK), import ji odmítne s vysvětlením.";
 
 /**
@@ -101,7 +106,7 @@ export const REVIEW_COLUMNS: readonly ReviewColumn[] = [
   col("partnerStreet", "Ulice dodavatele", "text", "target", 24),
   col("partnerCity", "Obec dodavatele", "text", "target", 20),
   col("partnerZip", "PSČ dodavatele", "id", "target", 10),
-  col("partnerId", "ID adresy v POHODĚ", "integer", "target", 11),
+  col("partnerId", SUPPLIER_ID_LABEL, "integer", "target", 12, "Jen pro kontrolu. Příprava sem doplní jen adresu ověřenou v adresáři POHODY podle IČO, DIČ nebo názvu dodavatele z dokladu. Číslo nepište ani neměňte: dodavatele opravte ve sloupcích Dodavatel, IČO, DIČ a import adresu dohledá znovu. Vymazání buňky propojení zruší."),
   col("targetDocument", "Doklad v POHODĚ", "targetText", "target", 15, `${TARGET_NOTE} Hotovost do 10 000 Kč: prázdné. Karta do 10 000 Kč: číslo přidělí import z řady PK.`),
   col("targetSymVar", "VS v POHODĚ", "targetText", "target", 13, TARGET_NOTE),
   col("targetDate", "Datum dokladu", "targetDate", "target", 12, `${TARGET_NOTE} Pozdní doklad: 1. den období DPH; původní data zůstávají v interní poznámce.`),
@@ -548,7 +553,7 @@ function writeMainSheet(workbook: ExcelJS.Workbook, input: ReviewWorkbook): void
       if (c.kind === "rowId") { cell.fill = FILL("FFF1F5F9"); cell.font = { color: { argb: "FF475569" } }; }
       if (c.kind === "reviewNotes" && note) cell.fill = FILL("FFFFF7ED");
       if (c.key === "targetTotal") cell.font = { bold: true };
-      if (DISPLAY_KINDS.has(c.kind)) { cell.fill = FILL("FFF3F4F6"); cell.font = { italic: true, color: { argb: "FF4B5563" }, size: 9 }; }
+      if (DISPLAY_KINDS.has(c.kind) || OPTIONAL_DATA_COLUMNS.has(c.key)) { cell.fill = FILL("FFF3F4F6"); cell.font = { italic: true, color: { argb: "FF4B5563" }, size: 9 }; }
     });
     applyReviewHighlights(excelRow, new Map(REVIEW_COLUMNS.map((c, i) => [c.key, i + 1])), row.duplicateCheck, row.action, row, input.vatPeriod);
   });
@@ -808,7 +813,8 @@ async function writeGuideSheet(workbook: ExcelJS.Workbook, input: ReviewWorkbook
     ["13. Řádky", "Řádky lze řadit, filtrovat i mazat. Neměňte ID řádku. Nové řádky s neznámým ID budou odmítnuty."],
     ["14. Uložení", "Uložte soubor ve formátu .xlsx (ne .xls, .xlsm ani .csv)."],
     ["15. Podobné doklady", "List Podobne doklady obsahuje jen vzory z této účetní jednotky pro porovnání; neimportuje se."],
-    ["16. Barvy", "Růžová = možná duplicita (odkaz v poznámce). Žlutá = pole k ověření. Šedá = vynecháno. Zelená akce = připraveno k importu. Kontrola duplicit se opakuje při importu."]
+    ["16. Barvy", "Růžová = možná duplicita (odkaz v poznámce). Žlutá = pole k ověření. Šedá = vynecháno. Zelená akce = připraveno k importu. Kontrola duplicit se opakuje při importu."],
+    ["17. Dodavatel", "Dodavatele určují údaje z dokladu (Dodavatel, IČO, DIČ). ID adresy v POHODĚ je jen pro kontrolu: doplní se jen po ověření v adresáři POHODY a nezadává se ručně. Po opravě IČO/DIČ/názvu se adresa při importu dohledá znovu. Více adres jednoho dodavatele import nevybírá; opravte je v POHODĚ."]
   ];
   lines.forEach(([a, b], index) => {
     const row = ws.getRow(index + 1);
@@ -1025,6 +1031,7 @@ const normalizeHeader = (value: string): string => value.normalize("NFC").replac
   // Labels of earlier layouts.
   .replace(/^(doklad v pohodě|vs v pohodě) \(vypočteno\)$/, "$1")
   .replace(/^datum splatnosti \(zdroj\)$/, "datum splatnosti")
+  .replace(/^id adresy v pohodě$/, "id adresy v pohodě (jen pro kontrolu)")
   .replace("poznámka ke kontrole (neimportuje se)", "poznámka (neimportuje se)")
   .replace("text dokladu v pohodě (krátký, max. 240 znaků)", "text dokladu v pohodě");
 
@@ -1059,7 +1066,7 @@ function readMainSheet(ws: ExcelJS.Worksheet, issues: ReviewWorkbookIssue[]): Re
     positions.set(column.key, colNumber);
   });
   for (const column of REVIEW_COLUMNS) {
-    if (!DISPLAY_KINDS.has(column.kind) && !TARGET_KINDS.has(column.kind) && !positions.has(column.key)) {
+    if (!DISPLAY_KINDS.has(column.kind) && !TARGET_KINDS.has(column.kind) && !OPTIONAL_DATA_COLUMNS.has(column.key) && !positions.has(column.key)) {
       issues.push({ code: "MISSING_COLUMN", message: `Required column "${column.label}" (${column.key}) is missing.`, sheet: REVIEW_SHEET_NAME });
     }
   }

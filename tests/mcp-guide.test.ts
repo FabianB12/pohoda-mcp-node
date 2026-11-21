@@ -69,7 +69,13 @@ describe("Canonical MCP operator guide", () => {
       // Bank statements: preview-first, no expense workbook, no approval bypass, data errors are not "wait for POHODA".
       expect(client.getInstructions()).toContain("never the expense XLSX workflow");
       expect(client.getInstructions()).toContain("execute=false first");
-      expect(client.getInstructions()).toMatch(/rejected, do not retry it or bypass it with raw XML/);
+      expect(client.getInstructions()).toContain("Never bypass a rejected or unapproved write");
+      expect(guide.defaultExpenseWorkflow.retry).toContain("not a permanent import ban");
+      expect(guide.defaultExpenseWorkflow.retry).toContain("fresh explicit import instruction");
+      expect(guide.defaultExpenseWorkflow.retry).toContain("uncertain write must be reconciled");
+      expect(guide.bankStatements.workflow).toContain("extract_pdf_text");
+      expect(guide.scannedDocuments.textExtraction).toContain("pdftotext installation is not required");
+      expect(tools.tools.find(tool => tool.name === "extract_pdf_text")?.annotations?.readOnlyHint).toBe(true);
       expect(guide.bankStatements.workflow).toContain("Always call process_bank_statement with execute=false first");
       expect(guide.bankStatements.workflow).toContain("never use or promise the expense XLSX");
       expect(guide.bankStatements.approval).toContain("never route around it with raw_xml_batch");

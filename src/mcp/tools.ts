@@ -22,6 +22,7 @@ import type { XmlDatabase, XmlDatabaseRegistry } from "../pohoda/database-regist
 import type { PohodaResponse } from "../pohoda/response.js";
 import { ExportStore, type CurrencyTotal, type ExportRecord, type ExportSnapshot, summarizeRecords } from "./export-store.js";
 import { preparePdfPages } from "./pdf-pages.js";
+import { extractPdfText, renderPdfText } from "./pdf-text.js";
 import type { PdfArchive } from "../pohoda/pdf-archive.js";
 import { BankStatementService } from "./bank-statement.js";
 import { BANK_TEXT_MAX_LENGTH, BANK_SYMBOL_MAX_LENGTH } from "../pohoda/bank-settlement.js";
@@ -681,6 +682,7 @@ const databaseIdSchema = z.string().default("").describe(
 
 const prepareScannedPdfSchema = z.object({
   pdfPath: z.string().min(1).describe("Absolute path, or path relative to the MCP working directory, of the source PDF accessible to this MCP server."),
+  pages: z.array(z.number().int().positive()).max(200).optional().describe("Only these pages are rendered, in original order. Overrides firstPage/lastPage; use visualInspectionPages from extract_pdf_text."),
   outputDirectory: z.string().default("").describe("Optional output root. A content-specific subdirectory is created inside it. Defaults to POHODA_DOCUMENT_IMAGE_DIR or var/document-pages."),
   format: z.enum(["jpeg", "png"]).default("jpeg"),
   dpi: z.number().int().min(96).max(300).default(180),
@@ -832,6 +834,26 @@ export function registerPohodaTools(server: McpServer, context: PohodaServerCont
       }, ...inlineContent],
       structuredContent
     };
+  });
+
+  server.registerTool("extract_pdf_text", {
+    title: "Read a PDF's text layer (read-only, no OCR)",
+    description: "Fast read-only extraction of the existing PDF text layer with bundled pdf.js; no external tools, no OCR, no files written, original untouched. Returns per-page lines in reading order with y (vertical centre as a fraction of the displayed page from the top, usable as process_bank_statement mark.y), page count and quality flags. Use it first for digital PDFs such as bank statements. Pages with needsVisualInspection=true (no, sparse or unreliable text, or a page-sized scan image) must be rendered with prepare_scanned_pdf and read visually; missing text never means a blank page. Bank statement PDFs then use process_bank_statement, never the expense XLSX workflow.",
+    inputSchema: {
+      pdfPath: z.string().min(1).describe("Absolute path, or path relative to the MCP working directory, of the source PDF accessible to this MCP server."),
+      pages: z.array(z.number().int().min(1)).max(500).default([]).describe("Specific 1-based pages, returned in page order. Overrides firstPage/lastPage."),
+      firstPage: z.number().int().min(1).default(1),
+      lastPage: z.number().int().min(0).default(0).describe("Inclusive last page; 0 means the final PDF page."),
+      maxPages: z.number().int().min(1).max(500).default(100),
+      maxCharsPerPage: z.number().int().min(1_000).max(200_000).default(20_000),
+      maxTotalChars: z.number().int().min(1_000).max(1_000_000).default(150_000).describe("Response text budget. Later pages keep their flags but omit text; continue from continueFromPage."),
+      maxFileMb: z.number().int().min(1).max(1_000).default(250),
+      password: z.string().default("")
+    },
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false }
+  }, async ({ pages, password, ...options }) => {
+    const extracted = await extractPdfText({ ...options, pages: pages.length ? pages : undefined, password: password || undefined });
+    return { content: [{ type: "text" as const, text: renderPdfText(extracted) }], structuredContent: extracted };
   });
 
   server.registerTool("status", {

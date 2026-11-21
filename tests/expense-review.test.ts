@@ -86,13 +86,15 @@ describe("ExpenseReviewService.prepare", () => {
   it("lists similar documents on the explicit unit before writing the workbook and never writes to POHODA", async () => {
     client.history = [historyInvoice(3), historyInvoice(4)];
     const out = await service.prepare({ databaseId: DB, vatPeriod: "2026-11", target: TARGET, documents: [doc({ requestId: "A", accounting: undefined }), { ...doc({ sourceDocumentNumber: "FV-2", sourcePdfPath: pdfB }), requestId: "B" }] });
-    expect(events).toEqual(["list", "writeWorkbook"]);
+    expect(events).toEqual(["list", "list", "writeWorkbook"]);
     expect(importer.runs).toHaveLength(0);
     expect(client.writes).toBe(0);
-    // One batched snapshot for duplicates and history, on the explicit unit.
-    expect(client.calls).toHaveLength(1);
+    // One batched supplier address-book read, then one snapshot for duplicates and history, on the explicit unit.
+    expect(client.calls).toHaveLength(2);
     expect(client.calls[0].options).toEqual(TARGET);
-    expect(client.calls[0].requests).toEqual([
+    expect(client.calls[0].requests).toEqual([{ agenda: "addressbook", filter: { ico: "25596641" }, options: { count: 100 } }]);
+    expect(client.calls[1].options).toEqual(TARGET);
+    expect(client.calls[1].requests).toEqual([
       { agenda: "invoice", subType: "receivedInvoice", filter: {}, options: { count: 2000 } },
       { agenda: "invoice", subType: "commitment", filter: {}, options: { count: 2000 } },
       { agenda: "voucher", subType: "", filter: {}, options: { count: 2000 } }

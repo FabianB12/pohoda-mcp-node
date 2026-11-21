@@ -139,7 +139,8 @@ describe("Read-only preview duplicate checks", () => {
     client.rows = [record(72)];
     const again = await service.prepare(args);
     expect(again).toMatchObject({ reused: true, status: "requiresReview" });
-    expect(client.calls).toHaveLength(2);
+    // First prepare: supplier address-book read + duplicate snapshot; the refresh re-reads only the snapshot.
+    expect(client.calls).toHaveLength(3);
     const refreshed = new ExcelJS.Workbook(); await refreshed.xlsx.readFile(first.workbookPath);
     const updated = refreshed.getWorksheet("Doklady")!;
     expect(updated.getCell(3, textColumn).text).toBe("Opravený text");
@@ -181,7 +182,8 @@ describe("Read-only preview duplicate checks", () => {
     // The source discrepancy is preserved and named, never replaced by a computed POHODA total.
     expect(sheet.getCell(3, totalColumn).value).toBe(121.48);
     expect(sheet.getCell(3, notesColumn).text).toContain("121,48");
-    expect(client.calls).toHaveLength(1);
+    // One batched supplier address-book read and one duplicate snapshot for all 88 rows.
+    expect(client.calls).toHaveLength(2);
     const again = await service.prepare({ databaseId: target.databaseOverride, target, vatPeriod: "2026-11", documents });
     expect(again).toMatchObject({ ok: true, status: "requiresReview", reused: true, nextAction: "deliver_workbook", workbookPath: result.workbookPath });
   });

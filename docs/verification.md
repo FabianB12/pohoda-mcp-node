@@ -268,3 +268,27 @@ Only rows with status settled receive right-margin checks. Offline rendered-pixe
 tests cover all four page rotations and cropped pages. Existing settled records
 with differing partner/text/movement fields are reported for manual review and
 never rewritten. Partners with extra phone/email fields have not been tested live.
+
+### PDF text, supplier IDs and corrected import retries
+
+`extract_pdf_text` reads digital PDF text with bundled pdf.js; it does not require
+an external pdftotext installation. Tests cover Czech text, page/line order,
+rotation coordinates, scans/OCR-image flags, bounded responses and cache reuse.
+`prepare_scanned_pdf.pages` renders only selected pages needing visual inspection.
+The flags are heuristics, not an OCR guarantee; suspicious source data still needs
+visual checking.
+
+Supplier validation is now shared by preparation and import. Caller IDs are checked
+against the selected unit's address book and IČO/DIČ/name, and only verified IDs are
+shown in the optional read-only column. Tests reproduce conflicting IDs, ignored
+filters, country scoping, genuine duplicate contacts, stale links after supplier
+edits, and preservation of edited amounts/skipped rows. The reported client workbook
+was not supplied, so its exact rows were not independently replayed.
+
+A corrected, explicitly reapproved workbook can use the official import after a
+pre-write failure or definite POHODA rejection. `rejected_before_write` reports
+`writeAttempted=false`; ambiguous responses remain `write_uncertain`. Expense
+responses are matched by item ID, with tests for missing/reordered/duplicate items
+and rejection versus created-ID conflicts. The review retains the uncertain-write
+lock and prevents changes to the source identity of already-created rows during a
+retry. No client accounting records were written for these changes.

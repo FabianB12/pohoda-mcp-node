@@ -20,6 +20,7 @@ import * as workbookCodec from "./review-workbook.js";
 import { companyKey, decideNonPayerTreatment, normalizeDic, normalizeIco } from "../registry/czech-registry.js";
 import { checkPreviewDuplicates, duplicateReviewNote } from "./expense-duplicates.js";
 import { isStandardPaymentMethod, PAYMENT_METHOD_LABELS, reconcilePaymentMethod } from "./payment-method.js";
+import { describeRecord, OK_STATUSES, readAddressBook, resolveSupplier, supplierEvidence, supplierLabel, type SupplierResolution } from "./supplier-identity.js";
 
 type Fields = Record<string, any>;
 
@@ -43,11 +44,15 @@ export type ExpenseReviewOptions = {
 
 export type PrepareDocument = { requestId?: string; tool: ReviewTool; data: Fields; reviewNotes?: string };
 
-/** Workbook columns that may change POHODA data. Everything else comes from the manifest. */
+/**
+ * Workbook columns that may change POHODA data. Everything else comes from the manifest.
+ * The address-book ID is not one of them: preparation resolves it from the supplier facts
+ * and verifies it in POHODA; the workbook shows it read-only (see SUPPLIER_ID_FIELD).
+ */
 export const REVIEW_EDITABLE_FIELDS = [
   "text", "note", "accounting", "classificationVAT", "classificationKVDPH", "centre", "activity", "contract",
   "paymentType", "cashAccount", "accountIds", "paymentAccountNumber", "paymentBankCode", "taxMode", "sourceChargesVat",
-  "partnerId", "partnerName", "partnerIco", "partnerDic", "partnerStreet", "partnerCity", "partnerZip", "partnerCountry",
+  "partnerName", "partnerIco", "partnerDic", "partnerStreet", "partnerCity", "partnerZip", "partnerCountry",
   "partnerVatStatus", "vatStatusEvidence",
   "sourceIssueDate", "sourceTaxDate", "sourcePaymentDate", "sourceDocumentNumber", "sourceSymVar", "sourceDueDate",
   "date", "dateTax", "dateAccounting", "dateKHDPH", "datePayment", "dateDue", "originalDocument", "symVar",
@@ -57,6 +62,10 @@ export const REVIEW_EDITABLE_FIELDS = [
   "sourcePdfPath", "sourcePages"
 ] as const;
 const EDITABLE = new Set<string>(REVIEW_EDITABLE_FIELDS);
+/** Read-only verified address-book ID column; a caller value is only a claim to verify. */
+const SUPPLIER_ID_FIELD = "partnerId";
+/** Editing any of these makes the resolved address-book ID stale. */
+const SUPPLIER_IDENTITY_FIELDS = ["partnerIco", "partnerDic", "partnerName", "partnerCountry"];
 /** Never sent to POHODA from a review row, whatever the workbook or caller contains. */
 const REVIEW_ONLY_KEYS = ["rowId", "action", "reviewNotes", "requestId", "items", "databaseId", "dataPackId"];
 const TOOLS: ReviewTool[] = ["create_invoice", "create_other_liability", "create_cash_voucher"];
@@ -71,6 +80,23 @@ const LIST_BATCH = 25;
 const REVIEW_ID = /^rv-[0-9a-f]{16}$/;
 const ROW_ID = /^[A-Za-z0-9._:-]{1,64}$/;
 const locks = new Map<string, Promise<unknown>>();
+
+/** Protect already-created rows even when their supplier/source edits would change the import marker. */
+function reviewRowIdentity(tool: ReviewTool, data: Fields): string {
+  const ico = text(data.partnerIco).replace(/\s+/g, "");
+  const dic = text(data.partnerDic).replace(/\s+/g, "").toUpperCase();
+  const supplier = ico ? ["ico", text(data.partnerCountry).toUpperCase(), ico] : dic ? ["dic", dic] : Number(data.partnerId) > 0 ? ["id", Number(data.partnerId)] : ["name", companyKey(text(data.partnerName))];
+  const pages = Array.isArray(data.sourcePages) ? [...new Set(data.sourcePages)].sort((a: any, b: any) => Number(a) - Number(b)) : text(data.sourcePages);
+  return JSON.stringify([tool, supplier, text(data.sourceDocumentNumber || data.originalDocument), text(data.sourcePdfPath), pages]);
+}
+
+function priorWrittenIdentity(manifest: Fields, rowId: string, original: Fields): string | undefined {
+  for (const entry of [...(manifest.imports ?? [])].reverse()) {
+    const written = entry.result?.results?.find((row: Fields) => row.requestId === rowId && Number(row.id) > 0 && (row.created === true || row.state === "already_exists" || row.outcome === "conflict"));
+    if (written) return entry.rowIdentities?.[rowId] ?? reviewRowIdentity(original.tool, original.data);
+  }
+  return undefined;
+}
 /**
  * Manifest marker: target cells of rows the import rejects show the policy projection.
  * Older workbooks left every target cell of such rows blank; those blanks are not edits.
@@ -123,7 +149,7 @@ export class ExpenseReviewService {
       if (!ROW_ID.test(rowId)) throw new Error(`Document ${index + 1}: requestId "${rowId}" must match ${ROW_ID}.`);
       if (seen.has(rowId)) throw new Error(`Duplicate requestId/rowId ${rowId}.`);
       seen.add(rowId);
-      return { rowId, tool: doc.tool, ...draftData(doc.tool, doc.data ?? {}, vatPeriod), callerNotes: text(doc.reviewNotes) };
+      return { rowId, tool: doc.tool, ...draftData(doc.tool, doc.data ?? {}, vatPeriod), callerNotes: text(doc.reviewNotes), supplier: undefined as Fields | undefined };
     });
 
     const reviewId = `rv-${sha256(JSON.stringify({ duplicateCheckVersion: 1, databaseId, target, vatPeriod, rows: drafts.map(({ rowId, tool, data }) => ({ rowId, tool, data })) })).slice(0, 16)}`;
@@ -159,7 +185,6 @@ export class ExpenseReviewService {
       const lookups = new Map<string, Promise<Fields>>();
       for (const draft of drafts) {
         const h = draft.data;
-        if (Number(h.partnerId) > 0 && ["taxable", "nonTax"].includes(h.taxMode)) continue;
         const input = { ico: h.partnerIco, dic: h.partnerDic, name: h.partnerName, street: h.partnerStreet, city: h.partnerCity, zip: h.partnerZip, country: h.partnerCountry };
         const key = JSON.stringify(input);
         let request = lookups.get(key);
@@ -195,6 +220,9 @@ export class ExpenseReviewService {
         } else if (lookup.status === "unavailable") { draft.notes.push(REVIEW_TEXT.registryUnavailable); draft.issues.push({ code: "REGISTRY_UNAVAILABLE", message: REVIEW_TEXT.registryUnavailable, detail: text(lookup.message) }); }
       }
     }
+    // A caller's address-book ID is only a claim: verify it (and resolve IDs for the
+    // other rows) against real POHODA records before duplicates/history use it.
+    await this.resolveSuppliers(drafts, target);
     // History is read before any workbook is written, scoped to the explicit unit.
     // Duplicate detection has its own complete snapshot; recent examples are not
     // evidence of absence. This never archives PDFs or writes accounting data.
@@ -252,7 +280,7 @@ export class ExpenseReviewService {
       const reviewNotes = [draft.callerNotes, ...notes].filter(Boolean).join("\n");
       rows.push({ rowId: draft.rowId, tool: draft.tool, data, action: blocking ? "review" : "import", reviewNotes, duplicateCheck: duplicates });
       rowIssueCodes.set(draft.rowId, issues.map(({ code, field, detail }) => ({ code, ...(field ? { field } : {}), ...(detail ? { detail } : {}) })));
-      sources[draft.rowId] = { query: found?.key, exampleIds: found?.records.map((r) => r.id) ?? [], suggestions, registryFilled: data._registryFilled ?? [] };
+      sources[draft.rowId] = { query: found?.key, exampleIds: found?.records.map((r) => r.id) ?? [], suggestions, registryFilled: data._registryFilled ?? [], ...(draft.supplier ? { supplier: draft.supplier } : {}) };
     }
 
     const workbookPath = join(folder, `${reviewId}.xlsx`);
@@ -335,15 +363,20 @@ export class ExpenseReviewService {
       }));
       const dataPackId = `${reviewId}-${evaluation.workbookSha256.slice(0, 12)}`;
       const operations = evaluation.selected.map((row) => ({ requestId: row.rowId, tool: row.tool, header: toolHeader(row.tool, row.data), items: [] }) as WriteBatchOperation);
-      const report: Fields = { at: new Date().toISOString(), workbookPath: evaluation.workbookPath, workbookSha256: evaluation.workbookSha256, dataPackId, rowIds, skippedRowIds: evaluation.skipped, omittedRowIds: evaluation.omitted, currentState, historyWarnings: current.warnings };
+      const report: Fields = { at: new Date().toISOString(), workbookPath: evaluation.workbookPath, workbookSha256: evaluation.workbookSha256, dataPackId, rowIds, rowIdentities: Object.fromEntries(evaluation.selected.map(row => [row.rowId, reviewRowIdentity(row.tool, row.data)])), skippedRowIds: evaluation.skipped, omittedRowIds: evaluation.omitted, currentState, historyWarnings: current.warnings };
       let result: Fields;
       try {
         result = await this.importer.run(operations, dataPackId, target);
       } catch (error) {
-        Object.assign(report, { ok: false, state: "import_failed", error: (error as Error).message });
+        const supplierIssues: Fields[] | undefined = Array.isArray((error as Fields).issues) ? (error as Fields).issues : undefined;
+        const writeAttempted = (error as Fields)?.writeAttempted !== false;
+        const state = writeAttempted ? "import_failed" : "rejected_before_write";
+        Object.assign(report, { ok: false, state, writeAttempted, error: (error as Error).message, ...(supplierIssues ? { supplierIssues } : {}) });
         manifest.imports.push(report);
         await writeJsonAtomic(join(this.directory, reviewId, "manifest.json"), manifest);
-        return { ok: false, status: "requiresReview", reviewId, databaseId: manifest.databaseId, dataPackId, workbookSha256: evaluation.workbookSha256, error: (error as Error).message, currentState, message: "Import stopped; inspect the error. A retry re-checks existing documents by external ID." };
+        return { ok: false, status: "requiresReview", state, writeAttempted, reviewId, databaseId: manifest.databaseId, dataPackId, workbookSha256: evaluation.workbookSha256, error: (error as Error).message, ...(supplierIssues ? { supplierIssues } : {}), currentState, message: writeAttempted
+          ? "Import se zastavil po možném zápisu do POHODY. Ověřte chybu a aktuální stav dokladů i adresáře. Další import vyžaduje opravu, novou kontrolu sešitu a nový výslovný pokyn."
+          : "Import se zastavil před zápisem. Do POHODY se nic nezapsalo. Opravte uvedené řádky, znovu zkontrolujte sešit a po novém výslovném pokynu použijte oficiální import; existující doklady se znovu ověří a nebudou vytvořeny podruhé." };
       }
       Object.assign(report, { ok: result.ok === true, state: result.state, result });
       manifest.imports.push(report);
@@ -396,13 +429,66 @@ export class ExpenseReviewService {
       if (pdf && pdf !== text(original.data.sourcePdfPath) && !allowedPdfs.has(pdf)) { errors.push(`row ${rowId} sourcePdfPath ${pdf} is not one of the prepared source PDFs`); continue; }
       if (action === "skip") { skipped.push(rowId); report.push({ rowId, action, changedFields: merged.changed }); continue; }
       if (action === "review") unresolved.push(rowId);
-      const check = preflight(original.tool, merged.data);
+      let check = preflight(original.tool, merged.data);
+      const writtenIdentity = priorWrittenIdentity(manifest, rowId, original);
+      if (writtenIdentity !== undefined && writtenIdentity !== reviewRowIdentity(original.tool, merged.data)) {
+        check = { ok: false, code: "CREATED_ROW_IDENTITY_CHANGED", error: "Tento řádek už má doklad v POHODĚ. Při opakování nelze změnit dodavatele, číslo zdrojového dokladu ani zdrojové stránky; ověřte a opravte existující doklad, nezakládejte jej znovu." };
+      }
       if (!check.ok && action === "import") invalid.push({ rowId, error: check.error, errorCode: check.code });
       if (action === "import") selected.push({ rowId, tool: original.tool, data: merged.data });
-      report.push({ rowId, tool: original.tool, action, valid: check.ok, error: check.error, ...(check.code ? { errorCode: check.code } : {}), changedFields: merged.changed, preview: check.preview });
+      report.push({ rowId, tool: original.tool, action, valid: check.ok, error: check.error, ...(check.code ? { errorCode: check.code } : {}), changedFields: merged.changed, supplier: supplierLink(merged.data), preview: check.preview });
     }
     const omitted = [...originals.keys()].filter((id) => !seen.has(id));
     return { workbookPath, workbookSha256, errors, selected, unresolved, skipped, invalid, ignored, omitted, report };
+  }
+
+  /**
+   * Read-only, one batched address-book read. Only a verified or uniquely resolved record
+   * is shown as "ID adresy"; a wrong, missing or ambiguous caller ID blocks the row with
+   * evidence and is never displayed as valid. Real duplicate contacts are never picked.
+   */
+  private async resolveSuppliers(drafts: Array<{ rowId: string; data: Fields; notes: string[]; issues: ReviewIssue[]; blocking: boolean; supplier?: Fields | undefined }>, target: TransportOptions): Promise<void> {
+    const facts: Fields[] = drafts.map((draft) => ({ ...draft.data, partnerId: draft.data._claimedPartnerId }));
+    if (!facts.some((f) => f.partnerId || !empty(f.partnerIco) || !empty(f.partnerDic) || !empty(f.partnerName))) return;
+    let book: Awaited<ReturnType<typeof readAddressBook>>;
+    try { book = await readAddressBook(this.client, facts, target, { allowNameMatch: true }); }
+    catch (error) {
+      for (const draft of drafts) {
+        const claimed = draft.data._claimedPartnerId;
+        if (!claimed) { draft.notes.push(SUPPLIER_TEXT.bookUnavailable); continue; }
+        draft.blocking = true;
+        draft.notes.push(SUPPLIER_TEXT.claimUnavailable(claimed));
+        draft.issues.push({ code: "SUPPLIER_LOOKUP_UNAVAILABLE", message: SUPPLIER_TEXT.claimUnavailable(claimed), detail: text((error as Error).message) });
+      }
+      return;
+    }
+    drafts.forEach((draft, index) => {
+      const data = draft.data, resolution = resolveSupplier(facts[index]!, book, { allowNameMatch: true });
+      const link = (r: SupplierResolution) => {
+        data.partnerId = r.record!.id;
+        data._partnerIdSource = { via: r.via, checkedAt: book.checkedAt, record: { id: r.record!.id, company: r.record!.company || r.record!.name, ico: r.record!.ico, dic: r.record!.dic }, ...(data._claimedPartnerId ? { claimedId: data._claimedPartnerId } : {}) };
+      };
+      draft.supplier = supplierEvidence(draft.rowId, facts[index]!, resolution);
+      if (resolution.status === "verified" || resolution.status === "resolved") {
+        link(resolution);
+        if (resolution.nameDiffers) draft.notes.push(SUPPLIER_TEXT.nameDiffers(resolution.record!.company || resolution.record!.name, text(data.partnerName)));
+        return;
+      }
+      if (resolution.status === "new") return;
+      draft.blocking = true;
+      draft.notes.push(resolution.message);
+      draft.issues.push({ code: resolution.code, message: resolution.message });
+      // The document facts, not the rejected ID, decide the supplier; shown for review.
+      const alternative = resolution.alternative;
+      if (alternative && (alternative.status === "verified" || alternative.status === "resolved")) {
+        link(alternative);
+        draft.notes.push(SUPPLIER_TEXT.replaced(supplierLabel(alternative.via), describeRecord(alternative.record!)));
+      } else if (alternative?.status === "new") draft.notes.push(SUPPLIER_TEXT.willCreate);
+      else if (alternative && !OK_STATUSES.has(alternative.status) && alternative.message && alternative.message !== resolution.message) {
+        draft.notes.push(alternative.message);
+        draft.issues.push({ code: alternative.code, message: alternative.message });
+      }
+    });
   }
 
   /** Batched, deduplicated, bounded read of same-supplier documents on the explicit unit. */
@@ -468,6 +554,28 @@ export class ExpenseReviewService {
   }
 }
 
+/** Czech reviewer text for supplier identity (kept with the logic that decides it). */
+const SUPPLIER_TEXT = {
+  bookUnavailable: "Adresář POHODY nebyl dostupný; dodavatel se ověří při importu.",
+  claimUnavailable: (id: number) => `ID adresy ${id} nelze ověřit: adresář POHODY nebyl dostupný. Zadané ID se nepoužije; připravte kontrolu znovu.`,
+  invalidClaim: (value: string) => `ID adresy „${value}“ není platné číslo adresy a bylo ignorováno.`,
+  nameDiffers: (stored: string, source: string) => `Název v adresáři POHODY („${stored}“) se liší od dokladu („${source}“); adresa odpovídá podle IČO/DIČ.`,
+  replaced: (by: string, record: string) => `Podle ${by} z dokladu je dodavatel v adresáři POHODY jako ${record}; ve sloupci ID adresy je toto ověřené ID.`,
+  willCreate: "Dodavatel z dokladu v adresáři POHODY není; při importu se založí nová adresa.",
+  idEdited: (value: string) => `ID adresy v POHODĚ (${value}) se nezadává ručně; dohledá se z IČO, DIČ nebo názvu dodavatele. Buňku vraťte nebo vymažte a dodavatele opravte ve sloupcích Dodavatel, IČO, DIČ.`,
+  identifierRequired: "Dodavatel nemá IČO ani DIČ a není propojen s ověřenou adresou v POHODĚ; doplňte IČO nebo DIČ z dokladu.",
+  staleWithoutIdentifier: "Dodavatel byl změněn a nemá IČO ani DIČ, takže původní ID adresy už neplatí; doplňte IČO nebo DIČ z dokladu, nebo připravte novou kontrolu."
+} as const;
+
+/** What the import links: the verified ID (or none = resolve/create from IČO/DIČ at import). */
+function supplierLink(data: Fields): Fields {
+  return {
+    partnerId: empty(data.partnerId) ? null : Number(data.partnerId),
+    ...(data._partnerIdSource ? { verifiedBy: data._partnerIdSource.via, record: data._partnerIdSource.record, checkedAt: data._partnerIdSource.checkedAt } : {}),
+    ...(data._stalePartnerId ? { staleId: data._stalePartnerId, note: "Supplier edited; the import resolves it again from IČO/DIČ." } : {})
+  };
+}
+
 function explicitTarget(target: TransportOptions | undefined): { databaseOverride: string; dataPackIco: string } {
   const databaseOverride = text(target?.databaseOverride), dataPackIco = text(target?.dataPackIco);
   if (!databaseOverride || !dataPackIco) throw new ReviewImportError("An explicit target database and dataPack ICO are required for every review operation.");
@@ -481,6 +589,12 @@ function draftData(tool: ReviewTool, input: Fields, vatPeriod: string): { data: 
   let blocking = false;
   for (const [key, value] of Object.entries(input ?? {})) {
     if (REVIEW_ONLY_KEYS.includes(key) || key.startsWith("_")) continue;
+    if (key === SUPPLIER_ID_FIELD) {
+      // Never shown or imported as given: resolveSuppliers verifies it against POHODA first.
+      if (Number(value) > 0) data._claimedPartnerId = Number(value);
+      else if (!empty(value) && Number(value) !== 0) notes.push(SUPPLIER_TEXT.invalidClaim(text(value)));
+      continue;
+    }
     if (!EDITABLE.has(key) && !["type", "sourceType", "vatPeriod", "intNote"].includes(key)) {
       if (!empty(value)) notes.push(REVIEW_TEXT.unsupportedField(key));
       continue;
@@ -746,6 +860,14 @@ function mergeRow(original: Fields, decoded: Fields): { data: Fields; changed: s
   const data: Fields = structuredClone(original);
   const changed: string[] = [], ignored: string[] = [];
   for (const [key, raw] of Object.entries(decoded ?? {})) {
+    if (key === SUPPLIER_ID_FIELD) {
+      // Read-only: clearing drops the link (the import resolves the supplier again);
+      // a different number is never accepted as an identity.
+      const value = coerce(key, raw);
+      if (empty(value)) { if (!empty(data.partnerId)) { delete data.partnerId; delete data._partnerIdSource; changed.push(key); } }
+      else if (!sameValue(value, original.partnerId, key)) data._partnerIdReviewError = SUPPLIER_TEXT.idEdited(text(value));
+      continue;
+    }
     if (!EDITABLE.has(key)) {
       if (!REVIEW_ONLY_KEYS.includes(key) && !sameValue(raw, original[key])) ignored.push(key);
       continue;
@@ -764,13 +886,21 @@ function mergeRow(original: Fields, decoded: Fields): { data: Fields; changed: s
     sourcePaymentDate: ["datePayment"], sourceDocumentNumber: ["originalDocument"], sourceSymVar: ["symVar"], sourceDueDate: ["dateDue"]
   };
   for (const field of changed) for (const alias of aliases[field] ?? []) delete data[alias];
+  // The ID was resolved from the prepared supplier facts; an edited supplier is resolved
+  // again at import from its edited IČO/DIČ, never linked through the old ID.
+  if (changed.some((field) => SUPPLIER_IDENTITY_FIELDS.includes(field)) && !empty(data.partnerId)) {
+    data._stalePartnerId = data.partnerId;
+    delete data.partnerId;
+    delete data._partnerIdSource;
+    if (!changed.includes(SUPPLIER_ID_FIELD)) changed.push(SUPPLIER_ID_FIELD);
+  }
   return { data, changed, ignored };
 }
 
 /** Registry/VAT evidence belongs to the reviewed identity and amounts; re-decided after all edits. */
 function recheckRegistry(merged: { data: Fields; changed: string[] }, original: Fields): void {
   const { data, changed } = merged;
-  const identityChanged = changed.some((field) => ["partnerIco", "partnerDic", "partnerId", "partnerCountry"].includes(field));
+  const identityChanged = changed.some((field) => ["partnerIco", "partnerDic", "partnerCountry"].includes(field));
   if (identityChanged) {
     // Registry evidence belongs to the reviewed identity. It cannot automatically
     // establish the VAT status of a replacement supplier.
@@ -843,7 +973,9 @@ function preflight(tool: ReviewTool, data: Fields): { ok: boolean; error?: strin
     if (data._registryReviewError) reject("VAT_TREATMENT_REVIEW", data._registryReviewError);
     if (data._paymentReviewError) reject("PAYMENT_METHOD_REVIEW", data._paymentReviewError);
     if (data._targetReviewError) reject("TARGET_EDIT_REJECTED", data._targetReviewError);
+    if (data._partnerIdReviewError) reject("SUPPLIER_ID_EDIT", data._partnerIdReviewError);
     if (data._supplierChanged && !data.partnerName) reject("SUPPLIER_CHANGED", REVIEW_TEXT.supplierChanged);
+    if (empty(data.partnerId) && empty(data.partnerIco) && empty(data.partnerDic)) reject("SUPPLIER_IDENTIFIER_REQUIRED", data._stalePartnerId ? SUPPLIER_TEXT.staleWithoutIdentifier : SUPPLIER_TEXT.identifierRequired);
     if (data.partnerIco && (!data.partnerCountry || data.partnerCountry === "CZ") && !normalizeIco(data.partnerIco).ok) reject("PARTNER_ICO_INVALID", REVIEW_TEXT.invalidIco);
     const header = toolHeader(tool, data);
     if (tool === "create_invoice" && !["receivedInvoice", "commitment"].includes(text(header.type))) reject("INVOICE_TYPE_INVALID", REVIEW_TEXT.invoiceType);

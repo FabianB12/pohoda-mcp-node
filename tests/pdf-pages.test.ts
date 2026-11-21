@@ -70,6 +70,21 @@ describe("preparePdfPages", () => {
     expect([...bytes.subarray(0, 8)]).toEqual([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
   });
 
+  it("renders only the flagged scattered pages and keeps their cache separate from a full range", async () => {
+    const dir = await temporaryDirectory();
+    const pdfPath = join(dir, "mixed.pdf");
+    await writeFile(pdfPath, minimalPdf(["One", "Two", "Three"]));
+    const options = { pdfPath, outputDirectory: join(dir, "pages"), dpi: 96, pages: [3, 1, 3], maxPages: 2 };
+    const selected = await preparePdfPages(options);
+    expect(selected.pages.map(page => page.page)).toEqual([1, 3]);
+    expect(selected.selectedPageCount).toBe(2);
+    expect((await preparePdfPages(options)).cached).toBe(true);
+    const whole = await preparePdfPages({ ...options, pages: undefined, maxPages: 3 });
+    expect(whole.outputDirectory).not.toBe(selected.outputDirectory);
+    expect(whole.pages.map(page => page.page)).toEqual([1, 2, 3]);
+    await expect(preparePdfPages({ ...options, pages: [4] })).rejects.toThrow(/existing positive PDF page/);
+  });
+
   it("coalesces simultaneous requests for the same PDF and render settings", async () => {
     const dir = await temporaryDirectory();
     const pdfPath = join(dir, "concurrent.pdf");

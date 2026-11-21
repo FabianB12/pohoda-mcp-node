@@ -49,7 +49,9 @@ describe("Real XLSX reviewed-import integration", () => {
     const { prepared, edit, submit, runs, reads } = await setup();
     expect(prepared.status).toBe("readyForReview");
     expect(runs).toHaveLength(0);
-    expect(reads).toHaveLength(1);
+    // One batched supplier address-book read, then one duplicate/history snapshot.
+    expect(reads).toHaveLength(2);
+    expect(reads[0].every((r: any) => r.agenda === "addressbook")).toBe(true);
     await edit({ text: "Oprava", targetPriceHigh: "200,00", targetPriceHighVAT: 42, targetTotal: 242, accounting: null, reviewNotes: "PRIVATE REVIEW NOTE", action: "Importovat" });
     expect((await submit()).ok).toBe(true);
     expect(runs).toHaveLength(1);
